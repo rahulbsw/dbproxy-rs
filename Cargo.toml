@@ -1,0 +1,49 @@
+[package]
+name = "dbproxy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "An async, health-aware MySQL, PostgreSQL/TimescaleDB, and Redis/Valkey proxy written in Rust"
+repository = "https://github.com/rahulbsw/dbproxy-rs"
+homepage = "https://github.com/rahulbsw/dbproxy-rs"
+readme = "README.md"
+keywords = ["database", "mysql", "postgresql", "redis", "proxy"]
+categories = ["database", "network-programming"]
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+bytes = "1.10"
+clap = { version = "4.5", features = ["derive", "env"] }
+futures-util = "0.3"
+memchr = "2.7"
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
+nanoid = "0.5"
+opensrv-mysql = "0.7"
+rustls-pemfile = "2.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
+sha2 = "0.10"
+sqlparser = "0.62"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["full"] }
+tokio-rustls = "0.25"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+[dev-dependencies]
+criterion = "0.7"
+tempfile = "3.20"
+tokio-postgres = "0.7.18"
+
+[[bench]]
+name = "routing"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,131 @@
+[proxy]
+listen = "0.0.0.0:6033"
+auth_plugin = "caching_sha2_password"
+max_connections = 256
+client_io_timeout_seconds = 300
+backend_connect_timeout_seconds = 5
+backend_query_timeout_seconds = 30
+shutdown_grace_seconds = 10
+max_query_bytes = 1048576
+max_result_rows = 100000
+max_result_bytes = 67108864
+result_mode = "buffered"
+max_prepared_statements_per_connection = 1024
+
+[proxy.tls]
+mode = "disabled"
+
+[admin]
+listen = "0.0.0.0:6071"
+max_connections = 32
+request_timeout_seconds = 5
+
+[postgres]
+enabled = true
+read_write_listen = "0.0.0.0:6432"
+read_only_listen = "0.0.0.0:6433"
+max_connections = 128
+connect_timeout_seconds = 5
+shutdown_grace_seconds = 10
+fallback_to_primary = true
+relay_buffer_bytes = 32768
+shard_key_parameter = "dbproxy.shard_key"
+
+[postgres.sharding]
+enabled = false
+
+[[postgres_backends]]
+name = "timescale-primary"
+address = "timescale-primary:5432"
+role = "primary"
+weight = 1
+
+[[postgres_backends]]
+name = "timescale-replica"
+address = "timescale-replica:5432"
+role = "replica"
+weight = 1
+
+[redis]
+enabled = true
+routing_mode = "connection"
+hash_algorithm = "stable_fnv"
+read_write_listen = "0.0.0.0:6380"
+read_only_listen = "0.0.0.0:6381"
+max_connections = 128
+connect_timeout_seconds = 5
+shutdown_grace_seconds = 10
+fallback_to_primary = true
+cross_shard_reads = true
+cross_shard_writes = false
+max_fanout_shards = 32
+max_shard_connections_per_client = 64
+max_command_bytes = 67108864
+max_response_bytes = 67108864
+client_idle_timeout_seconds = 300
+backend_response_timeout_seconds = 30
+relay_buffer_bytes = 32768
+shard_command = "DBPROXY.SHARD"
+
+[redis.sharding]
+enabled = false
+
+[[redis_backends]]
+name = "redis-primary"
+address = "redis-primary:6379"
+role = "primary"
+weight = 1
+
+[[redis_backends]]
+name = "redis-replica"
+address = "redis-replica:6379"
+role = "replica"
+weight = 1
+
+[[users]]
+username = "app"
+password = "app-secret"
+
+[[backends]]
+name = "primary"
+address = "mysql-primary:3306"
+role = "primary"
+username = "proxy"
+password = "proxy-secret"
+database = "app"
+
+[backends.pool]
+min = 1
+max = 16
+connection_ttl_seconds = 300
+inactive_ttl_seconds = 60
+
+[[backends]]
+name = "replica"
+address = "mysql-replica:3306"
+role = "replica"
+weight = 1
+username = "proxy"
+password = "proxy-secret"
+database = "app"
+
+[backends.pool]
+min = 1
+max = 16
+connection_ttl_seconds = 300
+inactive_ttl_seconds = 60
+
+[routing]
+read_write_split = true
+fallback_to_primary = true
+read_after_write_seconds = 2
+reject_multi_statements = true
+
+[health_check]
+interval_seconds = 2
+timeout_seconds = 1
+unhealthy_after_failures = 2
+
+[logging]
+filter = "dbproxy=debug"
+json = false

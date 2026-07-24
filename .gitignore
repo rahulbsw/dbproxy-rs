@@ -1,0 +1,13 @@
+/target
+/dump.rdb
+/appendonly.aof
+/appendonlydir
+/config/dbproxy.toml
+*.log
+.DS_Store
+.env
+.idea/
+.vscode/
+*.pem
+*.key
+*.crt

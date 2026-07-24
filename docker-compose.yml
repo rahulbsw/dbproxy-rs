@@ -1,0 +1,125 @@
+services:
+  mysql-primary:
+    image: mysql:8.0.36
+    environment:
+      MYSQL_ROOT_PASSWORD: root-secret
+    command: ["--default-authentication-plugin=mysql_native_password"]
+    volumes:
+      - ./docker/mysql-init/001-schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+      - ./docker/mysql-init/010-primary.sql:/docker-entrypoint-initdb.d/010-backend.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-proot-secret"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  mysql-replica:
+    image: mysql:8.0.36
+    environment:
+      MYSQL_ROOT_PASSWORD: root-secret
+    command: ["--default-authentication-plugin=mysql_native_password"]
+    volumes:
+      - ./docker/mysql-init/001-schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+      - ./docker/mysql-init/010-replica.sql:/docker-entrypoint-initdb.d/010-backend.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-proot-secret"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  timescale-primary:
+    image: timescale/timescaledb:2.28.2-pg17
+    environment:
+      POSTGRES_USER: proxy
+      POSTGRES_PASSWORD: proxy-secret
+      POSTGRES_DB: app
+      TIMESCALEDB_TELEMETRY: "off"
+    volumes:
+      - ./docker/postgres-init/001-schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+      - ./docker/postgres-init/010-primary.sql:/docker-entrypoint-initdb.d/010-backend.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username=proxy --dbname=app"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  timescale-replica:
+    image: timescale/timescaledb:2.28.2-pg17
+    environment:
+      POSTGRES_USER: proxy
+      POSTGRES_PASSWORD: proxy-secret
+      POSTGRES_DB: app
+      TIMESCALEDB_TELEMETRY: "off"
+    volumes:
+      - ./docker/postgres-init/001-schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+      - ./docker/postgres-init/010-replica.sql:/docker-entrypoint-initdb.d/010-backend.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username=proxy --dbname=app"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis-primary:
+    image: redis:7.4.2-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "no"
+      - --requirepass
+      - redis-secret
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis-secret", "PING"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis-replica:
+    image: redis:7.4.2-alpine
+    command:
+      - redis-server
+      - --replicaof
+      - redis-primary
+      - "6379"
+      - --masterauth
+      - redis-secret
+      - --requirepass
+      - redis-secret
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis-secret", "PING"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  dbproxy:
+    build: .
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      mysql-primary:
+        condition: service_healthy
+      mysql-replica:
+        condition: service_healthy
+      timescale-primary:
+        condition: service_healthy
+      timescale-replica:
+        condition: service_healthy
+      redis-primary:
+        condition: service_healthy
+      redis-replica:
+        condition: service_healthy
+    ports:
+      - "6033:6033"
+      - "127.0.0.1:6071:6071"
+      - "6432:6432"
+      - "6433:6433"
+      - "6380:6380"
+      - "6381:6381"
+    volumes:
+      - ./config/dbproxy.docker.toml:/etc/dbproxy/dbproxy.toml:ro

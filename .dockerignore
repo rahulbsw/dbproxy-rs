@@ -1,0 +1,13 @@
+.git
+.github
+target
+dump.rdb
+appendonly.aof
+appendonlydir
+config/dbproxy.toml
+.env
+*.log
+*.pem
+*.key
+*.crt
+.DS_Store

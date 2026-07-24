@@ -1,0 +1,169 @@
+[proxy]
+listen = "0.0.0.0:6033"
+auth_plugin = "caching_sha2_password"
+max_connections = 1024
+client_io_timeout_seconds = 300
+backend_connect_timeout_seconds = 5
+backend_query_timeout_seconds = 30
+shutdown_grace_seconds = 10
+max_query_bytes = 1048576
+max_result_rows = 100000
+max_result_bytes = 67108864
+result_mode = "buffered"
+max_prepared_statements_per_connection = 1024
+
+[proxy.tls]
+mode = "disabled"
+# cert_path = "/etc/dbproxy/tls/server-chain.pem"
+# key_path = "/etc/dbproxy/tls/server-key.pem"
+
+[admin]
+listen = "127.0.0.1:6071"
+max_connections = 32
+request_timeout_seconds = 5
+
+[postgres]
+enabled = false
+read_write_listen = "0.0.0.0:6432"
+read_only_listen = "0.0.0.0:6433"
+max_connections = 1024
+connect_timeout_seconds = 5
+shutdown_grace_seconds = 10
+fallback_to_primary = true
+relay_buffer_bytes = 32768
+
+[redis]
+enabled = true
+routing_mode = "command"
+hash_algorithm = "redis_crc16"
+read_write_listen = "0.0.0.0:6380"
+read_only_listen = "0.0.0.0:6381"
+max_connections = 1024
+connect_timeout_seconds = 5
+shutdown_grace_seconds = 10
+fallback_to_primary = true
+cross_shard_reads = true
+# Enabling this permits non-atomic cross-shard DEL, UNLINK, and MSET.
+cross_shard_writes = false
+max_fanout_shards = 32
+max_shard_connections_per_client = 64
+max_command_bytes = 67108864
+max_response_bytes = 67108864
+client_idle_timeout_seconds = 300
+backend_response_timeout_seconds = 30
+relay_buffer_bytes = 32768
+
+[redis.sharding]
+enabled = true
+strategy = "hash"
+
+[[redis.sharding.shards]]
+name = "cache-0"
+
+[[redis.sharding.shards]]
+name = "cache-1"
+
+[[redis_backends]]
+name = "cache-0-primary"
+address = "cache-0.internal:6379"
+role = "primary"
+shard = "cache-0"
+
+[[redis_backends]]
+name = "cache-1-primary"
+address = "cache-1.internal:6379"
+role = "primary"
+shard = "cache-1"
+
+[[users]]
+username = "app"
+password = "${DBPROXY_FRONTEND_PASSWORD}"
+
+# Each shard has exactly one primary and may have any number of replicas.
+[[backends]]
+name = "orders-0-primary"
+address = "orders-0-primary.internal:3306"
+role = "primary"
+shard = "orders-0"
+username = "proxy"
+password = "${DBPROXY_BACKEND_PASSWORD}"
+database = "app"
+
+[[backends]]
+name = "orders-0-replica"
+address = "orders-0-replica.internal:3306"
+role = "replica"
+shard = "orders-0"
+weight = 1
+username = "proxy"
+password = "${DBPROXY_BACKEND_PASSWORD}"
+database = "app"
+
+[[backends]]
+name = "orders-1-primary"
+address = "orders-1-primary.internal:3306"
+role = "primary"
+shard = "orders-1"
+username = "proxy"
+password = "${DBPROXY_BACKEND_PASSWORD}"
+database = "app"
+
+[[backends]]
+name = "orders-1-replica"
+address = "orders-1-replica.internal:3306"
+role = "replica"
+shard = "orders-1"
+weight = 1
+username = "proxy"
+password = "${DBPROXY_BACKEND_PASSWORD}"
+database = "app"
+
+# Dedicated second write destination. Do not include this shard in the routing
+# rule below; it receives copies through write fanout.
+[[backends]]
+name = "orders-mirror-primary"
+address = "orders-mirror.internal:3306"
+role = "primary"
+shard = "orders-mirror"
+username = "proxy"
+password = "${DBPROXY_BACKEND_PASSWORD}"
+database = "app"
+
+[routing]
+read_write_split = true
+fallback_to_primary = true
+read_after_write_seconds = 2
+reject_multi_statements = true
+
+[sharding]
+enabled = true
+default_shard = "orders-0"
+missing_key_policy = "reject"
+
+[[sharding.rules]]
+table = "orders"
+column = "tenant_id"
+shards = ["orders-0", "orders-1"]
+strategy = "hash"
+
+[[sharding.rules]]
+table = "order_items"
+column = "tenant_id"
+shards = ["orders-0", "orders-1"]
+strategy = "hash"
+
+[write_fanout]
+enabled = true
+target_shards = ["orders-mirror"]
+tables = ["orders", "order_items"]
+failure_policy = "all"
+max_concurrency = 8
+
+[health_check]
+interval_seconds = 5
+timeout_seconds = 2
+unhealthy_after_failures = 3
+
+[logging]
+filter = "dbproxy=info"
+json = false
