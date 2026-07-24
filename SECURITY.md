@@ -5,6 +5,10 @@
 DBProxy is currently pre-1.0. Security fixes are applied to the latest `main`
 branch until versioned release support is published.
 
+Crates.io publication is intentionally disabled while the project pins an
+official unreleased `opensrv-mysql` Rustls update. Build from this repository so
+Cargo honors the audited source revision in `Cargo.lock`.
+
 ## Reporting a vulnerability
 
 Do not open a public issue containing exploit details, credentials, connection

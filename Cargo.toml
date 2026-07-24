@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
 description = "An async, health-aware MySQL, PostgreSQL/TimescaleDB, and Redis/Valkey proxy written in Rust"
+publish = false
 repository = "https://github.com/rahulbsw/dbproxy-rs"
 homepage = "https://github.com/rahulbsw/dbproxy-rs"
 readme = "README.md"
@@ -20,7 +21,10 @@ futures-util = "0.3"
 memchr = "2.7"
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
 nanoid = "0.5"
-opensrv-mysql = "0.7"
+# crates.io 0.7.0 still uses rustls 0.22. Pin the official, API-compatible
+# rustls 0.23 update until a newer opensrv-mysql release is published. Crates.io
+# publication is disabled above so a packaged build cannot lose this source pin.
+opensrv-mysql = { version = "0.7.0", git = "https://github.com/datafuselabs/opensrv", rev = "3142eb545fab811bc9289091781ce6d771cf0bf7" }
 rustls-pemfile = "2.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -29,7 +33,7 @@ sha2 = "0.10"
 sqlparser = "0.62"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["full"] }
-tokio-rustls = "0.25"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

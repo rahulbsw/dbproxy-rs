@@ -12,6 +12,13 @@ use crate::{
     error::ProxyError,
 };
 
+pub fn install_crypto_provider() {
+    // Transitive MySQL dependencies can enable more than one rustls provider.
+    // Install the provider selected by this crate before any TLS config is built
+    // so rustls never has to guess from unified Cargo features.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+}
+
 pub fn frontend_server_config(
     config: &FrontendTlsConfig,
 ) -> Result<Option<Arc<ServerConfig>>, ProxyError> {

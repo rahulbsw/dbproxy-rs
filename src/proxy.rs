@@ -62,6 +62,7 @@ pub struct Proxy {
 
 impl Proxy {
     pub fn new(config: Config) -> Result<Self, ProxyError> {
+        tls::install_crypto_provider();
         config.validate()?;
         let backends = BackendManager::from_config(&config.backends)?;
         let frontend_tls = tls::frontend_server_config(&config.proxy.tls)?;
