@@ -51,7 +51,8 @@
   CRC16 hash tags and bounded multi-key merge/sum operations, replays safe
   connection state, and rejects unknown or stateful command shapes.
 - PostgreSQL backends can opt into authenticated `SELECT 1` readiness with
-  separately scoped credentials, while retaining TCP-only probes by default.
+  separately scoped credentials and certificate/hostname-verified TLS or mTLS,
+  while retaining TCP-only probes by default.
 - Redis/Valkey command-mode read-only listeners fail closed for writes, unsafe
   scripts, and unknown commands and expose a dedicated rejection counter.
 - A production-oriented Helm chart provides two or more independent replicas,
@@ -70,7 +71,6 @@
 - Runtime configuration changes require restart.
 - PostgreSQL forwarding is connection-pinned and does not yet provide protocol
   termination, transaction pooling, or SQL-level read/write splitting.
-- Authenticated PostgreSQL readiness probes do not yet support backend TLS.
 - PostgreSQL startup sharding cannot coexist with native end-to-end TLS because
   the startup shard selector would be encrypted.
 - Redis/Valkey connection mode preserves Pub/Sub, transactions, scripts, RESP3

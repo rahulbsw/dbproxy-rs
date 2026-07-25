@@ -304,6 +304,30 @@ pub struct PostgresReadinessProbeConfig {
     pub username: String,
     pub password: String,
     pub database: String,
+    #[serde(default)]
+    pub tls: PostgresReadinessTlsConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PostgresReadinessTlsConfig {
+    pub enabled: bool,
+    pub ca_path: Option<PathBuf>,
+    pub client_cert_path: Option<PathBuf>,
+    pub client_key_path: Option<PathBuf>,
+    pub use_webpki_roots: bool,
+}
+
+impl Default for PostgresReadinessTlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ca_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            use_webpki_roots: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -930,6 +954,9 @@ impl Config {
                     backend.name
                 )));
             }
+            if let Some(probe) = &backend.readiness_probe {
+                validate_postgres_readiness_tls(backend, &probe.tls)?;
+            }
         }
         let backend_shards = self
             .postgres_backends
@@ -1173,6 +1200,47 @@ fn validate_backend_tls(backend: &BackendConfig) -> Result<(), ProxyError> {
     }
     if let Some(path) = tls.client_key_path.as_deref() {
         validate_readable_file(path, "backend TLS client_key_path")?;
+    }
+    Ok(())
+}
+
+fn validate_postgres_readiness_tls(
+    backend: &PostgresBackendConfig,
+    tls: &PostgresReadinessTlsConfig,
+) -> Result<(), ProxyError> {
+    if !tls.enabled {
+        if tls.ca_path.is_some()
+            || tls.client_cert_path.is_some()
+            || tls.client_key_path.is_some()
+            || !tls.use_webpki_roots
+        {
+            return Err(ProxyError::Config(format!(
+                "PostgreSQL backend {:?} readiness_probe.tls options require enabled = true",
+                backend.name
+            )));
+        }
+        return Ok(());
+    }
+    if !tls.use_webpki_roots && tls.ca_path.is_none() {
+        return Err(ProxyError::Config(format!(
+            "PostgreSQL backend {:?} readiness_probe.tls requires ca_path when WebPKI roots are disabled",
+            backend.name
+        )));
+    }
+    if tls.client_cert_path.is_some() != tls.client_key_path.is_some() {
+        return Err(ProxyError::Config(format!(
+            "PostgreSQL backend {:?} readiness_probe.tls client_cert_path and client_key_path must be configured together",
+            backend.name
+        )));
+    }
+    if let Some(path) = tls.ca_path.as_deref() {
+        validate_readable_file(path, "PostgreSQL readiness TLS ca_path")?;
+    }
+    if let Some(path) = tls.client_cert_path.as_deref() {
+        validate_readable_file(path, "PostgreSQL readiness TLS client_cert_path")?;
+    }
+    if let Some(path) = tls.client_key_path.as_deref() {
+        validate_readable_file(path, "PostgreSQL readiness TLS client_key_path")?;
     }
     Ok(())
 }
@@ -1581,7 +1649,7 @@ mod tests {
             password = ""
             database = "app"
         "#;
-        let config: Config = toml::from_str(raw).unwrap();
+        let mut config: Config = toml::from_str(raw).unwrap();
         assert!(
             config
                 .validate()
@@ -1589,6 +1657,14 @@ mod tests {
                 .to_string()
                 .contains("readiness_probe")
         );
+        let probe = config.postgres_backends[0]
+            .readiness_probe
+            .as_mut()
+            .expect("readiness probe");
+        probe.password = "secret".to_owned();
+        probe.tls.use_webpki_roots = false;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("readiness_probe.tls"), "{error}");
     }
 
     #[test]

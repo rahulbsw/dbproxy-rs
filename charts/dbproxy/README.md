@@ -3,7 +3,20 @@
 This chart runs DBProxy as independent active-active data-plane replicas. It
 does not add consensus, shared session state, or distributed transactions.
 
-Create the credentials Secret expected by the default values, then install:
+The repository deployer creates or checks the credentials Secret and performs
+an atomic Helm upgrade in one command. Supply a private values file containing
+real backend addresses and production settings:
+
+```bash
+DBPROXY_FRONTEND_PASSWORD='replace-me' \
+DBPROXY_BACKEND_PASSWORD='replace-me' \
+./deploy.sh kubernetes --values ./my-dbproxy-values.yaml
+```
+
+See the [deployment guide](../../docs/deployment.md) for image overrides,
+external Secrets, dry runs, and uninstall behavior.
+
+The equivalent manual installation is:
 
 ```bash
 kubectl create namespace database

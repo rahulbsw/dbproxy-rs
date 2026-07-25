@@ -2,8 +2,8 @@
 
 This document defines the safety contract for features that cross backend or
 shard boundaries. A configuration option must not be exposed as production
-ready until its acceptance gates are implemented and exercised against real
-MySQL servers.
+ready until its acceptance gates are implemented and exercised against the
+matching real database protocol.
 
 ## Current milestone
 
@@ -17,8 +17,8 @@ Completed:
   primary writes, prepared statements, health, and metrics
 - transparent PostgreSQL/TimescaleDB read-write and read-only listeners with
   weighted backend selection, COPY/extended-protocol preservation, cancellation
-  broadcast, unsharded end-to-end TLS, optional authenticated SQL readiness,
-  transport health, and metrics
+  broadcast, unsharded end-to-end TLS, optional authenticated SQL readiness
+  with verified TLS or mTLS, transport health, and metrics
 - transparent Redis read-write and read-only listeners with RESP2/RESP3
   preservation, weighted replica selection, end-to-end AUTH/ACL and unsharded TLS,
   graceful draining, transport health, and metrics

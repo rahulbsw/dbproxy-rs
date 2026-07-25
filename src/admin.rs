@@ -10,7 +10,7 @@ use tokio::{
 use tracing::{debug, warn};
 
 use crate::{
-    backend::BackendManager, config::AdminConfig, metrics::Metrics,
+    backend::BackendManager, capabilities, config::AdminConfig, metrics::Metrics,
     postgres::PostgresBackendManager, redis::RedisBackendManager,
 };
 
@@ -162,8 +162,14 @@ async fn handle(
                         .unwrap_or_else(|| "[]".to_owned())
                 ),
             ),
+            "/capabilities" => (
+                "200 OK",
+                "application/json",
+                format!("{}\n", capabilities::json()),
+            ),
             "/metrics" => ("200 OK", "text/plain; version=0.0.4", {
                 let mut output = metrics.encode_prometheus();
+                capabilities::encode_prometheus(&mut output);
                 backends.encode_prometheus(&mut output);
                 if let Some(manager) = &postgres_backends {
                     manager.encode_prometheus(&mut output);

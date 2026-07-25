@@ -26,7 +26,7 @@ use crate::{
     data_sharding::ProtocolShardRouter,
     error::ProxyError,
     metrics::Metrics,
-    operation_id,
+    operation_id, tls,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +42,7 @@ struct PostgresBackend {
     weight: u32,
     shard: String,
     readiness_probe: Option<PostgresReadinessProbeConfig>,
+    readiness_transport: Option<PostgresReadinessTransport>,
     healthy: AtomicBool,
     transport_healthy: AtomicBool,
     sql_healthy: AtomicBool,
@@ -57,9 +58,26 @@ struct PostgresBackend {
     active_connections: AtomicI64,
 }
 
+#[derive(Clone)]
+enum PostgresReadinessTransport {
+    Plaintext,
+    Tls(tokio_postgres_rustls::MakeRustlsConnect),
+}
+
 impl PostgresBackend {
     fn from_config(config: &PostgresBackendConfig) -> Result<Self, ProxyError> {
         parse_backend_address(&config.address)?;
+        let readiness_transport = config
+            .readiness_probe
+            .as_ref()
+            .map(|probe| {
+                if probe.tls.enabled {
+                    tls::postgres_probe_connector(&probe.tls).map(PostgresReadinessTransport::Tls)
+                } else {
+                    Ok(PostgresReadinessTransport::Plaintext)
+                }
+            })
+            .transpose()?;
         Ok(Self {
             name: config.name.clone(),
             address: config.address.clone(),
@@ -67,6 +85,7 @@ impl PostgresBackend {
             weight: config.weight,
             shard: config.shard.clone(),
             readiness_probe: config.readiness_probe.clone(),
+            readiness_transport,
             healthy: AtomicBool::new(false),
             transport_healthy: AtomicBool::new(false),
             sql_healthy: AtomicBool::new(false),
@@ -180,22 +199,32 @@ impl PostgresBackend {
             .application_name("dbproxy-readiness")
             .connect_timeout(timeout);
 
-        time::timeout(timeout, async {
-            let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
-            let driver = tokio::spawn(connection);
-            let result = client.simple_query("SELECT 1").await;
-            driver.abort();
-            result.map(|_| ())
-        })
-        .await
-        .is_ok_and(|result| result.is_ok())
+        config.ssl_mode(match self.readiness_transport {
+            Some(PostgresReadinessTransport::Tls(_)) => tokio_postgres::config::SslMode::Require,
+            _ => tokio_postgres::config::SslMode::Disable,
+        });
+        match self.readiness_transport.as_ref() {
+            Some(PostgresReadinessTransport::Tls(connector)) => time::timeout(timeout, async {
+                let (client, connection) = config.connect(connector.clone()).await?;
+                execute_postgres_readiness_query(client, connection).await
+            })
+            .await
+            .is_ok_and(|result| result.is_ok()),
+            Some(PostgresReadinessTransport::Plaintext) => time::timeout(timeout, async {
+                let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
+                execute_postgres_readiness_query(client, connection).await
+            })
+            .await
+            .is_ok_and(|result| result.is_ok()),
+            None => false,
+        }
     }
 
     fn probe_mode(&self) -> &'static str {
-        if self.readiness_probe.is_some() {
-            "sql"
-        } else {
-            "tcp"
+        match self.readiness_transport {
+            Some(PostgresReadinessTransport::Tls(_)) => "sql_tls",
+            Some(PostgresReadinessTransport::Plaintext) => "sql",
+            None => "tcp",
         }
     }
 
@@ -205,6 +234,19 @@ impl PostgresBackend {
             BackendRole::Replica => "replica",
         }
     }
+}
+
+async fn execute_postgres_readiness_query<C>(
+    client: tokio_postgres::Client,
+    connection: C,
+) -> Result<(), tokio_postgres::Error>
+where
+    C: std::future::Future<Output = Result<(), tokio_postgres::Error>> + Send + 'static,
+{
+    let driver = tokio::spawn(connection);
+    let result = client.simple_query("SELECT 1").await;
+    driver.abort();
+    result.map(|_| ())
 }
 
 pub struct PostgresBackendManager {

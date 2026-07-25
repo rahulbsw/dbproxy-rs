@@ -30,6 +30,15 @@ if [[ "${ready}" != "1" ]]; then
 fi
 
 metrics="$(curl --fail --silent http://127.0.0.1:6071/metrics)"
+capabilities="$(curl --fail --silent http://127.0.0.1:6071/capabilities)"
+if ! grep -Eq '"name":"postgres_readiness_tls","status":"available"' <<<"${capabilities}"; then
+  echo "capability endpoint did not report PostgreSQL readiness TLS as available" >&2
+  exit 1
+fi
+if ! grep -Eq 'dbproxy_capability_info\{capability="distributed_atomic_fanout",status="planned"\} 1' <<<"${metrics}"; then
+  echo "capability metrics did not report distributed atomic fanout as planned" >&2
+  exit 1
+fi
 if ! grep -Eq 'dbproxy_postgres_backend_sql_healthy\{backend="timescale-primary",role="primary",shard="default"\} 1' <<<"${metrics}"; then
   echo "authenticated PostgreSQL readiness metric did not report a healthy primary" >&2
   exit 1

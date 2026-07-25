@@ -60,6 +60,14 @@ strategy = "hash"
 # username = "dbproxy_health"
 # password = "${DBPROXY_POSTGRES_HEALTH_PASSWORD}"
 # database = "app"
+#
+# [postgres_backends.readiness_probe.tls]
+# enabled = true
+# use_webpki_roots = false
+# ca_path = "/etc/dbproxy/tls/postgres-ca.pem"
+# Optional mutual TLS:
+# client_cert_path = "/etc/dbproxy/tls/postgres-client.pem"
+# client_key_path = "/etc/dbproxy/tls/postgres-client-key.pem"
 
 # [[postgres_backends]]
 # name = "timescale-replica"

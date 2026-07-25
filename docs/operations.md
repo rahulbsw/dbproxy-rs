@@ -24,7 +24,9 @@ per-backend `readiness_probe` authenticates with a dedicated role and executes
 `SELECT 1`; its password can be supplied through environment expansion.
 `/postgres/backends` reports the probe mode, effective readiness, TCP transport,
 optional SQL readiness, and connection counters. SQL probes currently use
-plaintext PostgreSQL and should run only over a trusted backend network.
+plaintext PostgreSQL unless `readiness_probe.tls.enabled = true`. TLS probes
+verify both the trust chain and hostname and can use an explicit CA and client
+identity.
 
 When Redis is enabled, readiness also requires TCP transport health to its
 every configured shard primary. `/redis/backends` reports Redis/Valkey transport state and
@@ -45,6 +47,7 @@ validate replication role, or measure replica lag.
 | Backend | `dbproxy_backend_healthy`, `dbproxy_backend_consecutive_failures`, `dbproxy_backend_health_checks_total{outcome}`, `dbproxy_backend_last_health_check_timestamp_seconds`, `dbproxy_backend_last_success_timestamp_seconds`, backend connection/query totals and duration sums |
 | Pools | `dbproxy_backend_pool_connections`, `dbproxy_backend_pool_idle_connections`, `dbproxy_backend_pool_connections_in_use`, `dbproxy_backend_pool_waiters`, and pool failure/reset/discard counters |
 | Admin/shutdown | `dbproxy_admin_active_connections`, `dbproxy_admin_requests_total`, `dbproxy_admin_rejected_connections_total`, `dbproxy_forced_shutdowns_total` |
+| Capabilities | `dbproxy_capability_info{capability,status}`; the same contracts are available from `/capabilities` |
 | PostgreSQL clients | `dbproxy_postgres_active_clients`, accepted/rejected/error totals, directional forwarded bytes, connection failures, replica fallbacks, shard routes, and shard-routing failures |
 | PostgreSQL backends | `dbproxy_postgres_backend_healthy{mode}`, `dbproxy_postgres_backend_transport_healthy`, `dbproxy_postgres_backend_sql_healthy`, `dbproxy_postgres_backend_sql_health_checks_total{outcome}`, connection totals and failures |
 | Redis/Valkey clients | `dbproxy_redis_active_clients`, accepted/rejected/error totals, directional forwarded bytes, connection failures, replica fallbacks, shard routes, command totals, read-only rejections, cross-shard commands, routing failures, generated fanout subcommands, partial-write failures |

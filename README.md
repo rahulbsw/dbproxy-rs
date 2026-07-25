@@ -16,6 +16,13 @@ copying their GPL-licensed source code.
 > parity with mature proxies. Review [current boundaries](#current-boundaries)
 > and validate failure behavior against your topology before production use.
 
+DBProxy targets the stage between a single database and a full distributed
+database platform. It is a lightweight routing layer over an existing,
+relatively stable topology—not a replacement for Vitess fleet automation,
+Multigres' planned PostgreSQL control plane, or native Redis Cluster topology.
+See [product positioning](docs/product-positioning.md) for the selection and
+graduation criteria.
+
 ## Protocol and connection model
 
 | Protocol | Proxy behavior | Read/write routing | Sharding | Backend connection model |
@@ -64,6 +71,8 @@ flowchart LR
 | Guide | Contents |
 | --- | --- |
 | [Documentation index](docs/README.md) | Map of guides and configuration examples |
+| [Product positioning](docs/product-positioning.md) | DBProxy's scope, alternatives, and graduation to a distributed platform |
+| [Deployment](docs/deployment.md) | One-command local and Kubernetes deployment |
 | [Architecture](docs/architecture.md) | Data paths, routing, consistency, failure, and security model |
 | [Operations and metrics](docs/operations.md) | Readiness, Prometheus metrics, alerts, and capacity tuning |
 | [Protocol sharding](docs/protocol-sharding.md) | PostgreSQL, TimescaleDB, Redis, and Valkey routing contracts |
@@ -122,6 +131,19 @@ flowchart LR
   routing logs
 
 ## Quick start
+
+Start the complete disposable MySQL, TimescaleDB, Redis, and DBProxy demo with
+one command. A running Podman Compose or Docker Compose implementation is
+required:
+
+```bash
+./deploy.sh
+```
+
+See the [deployment guide](docs/deployment.md) for Kubernetes, runtime
+overrides, dry runs, and uninstall behavior.
+
+To build and configure DBProxy directly instead:
 
 Requirements:
 
@@ -260,6 +282,11 @@ username = "dbproxy_health"
 password = "${DBPROXY_POSTGRES_HEALTH_PASSWORD}"
 database = "app"
 
+[postgres_backends.readiness_probe.tls]
+enabled = true
+use_webpki_roots = false
+ca_path = "/etc/dbproxy/tls/postgres-ca.pem"
+
 [[postgres_backends]]
 name = "timescale-replica"
 address = "timescale-replica.internal:5432"
@@ -275,7 +302,9 @@ external TLS termination because DBProxy must read the selector. PostgreSQL
 client credentials and private keys are not stored by DBProxy. An optional
 per-backend `readiness_probe` uses a separate least-privilege role to
 authenticate and execute `SELECT 1`; omit it to retain TCP-only health checks.
-SQL probes currently require a plaintext trusted backend hop.
+Readiness TLS verifies the certificate chain and the hostname from the backend
+address, supports public WebPKI or an explicit CA, and can present a client
+certificate for mTLS.
 
 Optional sharding selects a backend shard from `dbproxy.shard_key` in the
 StartupMessage or from libpq `options=-c dbproxy.shard_key=<value>`. The private
@@ -461,6 +490,7 @@ GET /readyz    primary-backend readiness
 GET /backends  backend role and health state
 GET /postgres/backends  PostgreSQL transport and configured SQL readiness
 GET /redis/backends  Redis backend transport health
+GET /capabilities  machine-readable feature status and safety contracts
 GET /metrics   Prometheus text exposition
 ```
 
@@ -525,9 +555,9 @@ recommendations.
 - PostgreSQL/TimescaleDB sharding is connection-level. End-to-end PostgreSQL TLS
   hides startup shard metadata, so sharded mode requires a plaintext trusted hop
   or external TLS termination
-- PostgreSQL readiness defaults to TCP transport. Optional authenticated SQL
-  probes use plaintext on the backend hop; backend TLS for probes is not
-  implemented yet
+- PostgreSQL readiness defaults to TCP transport. Authenticated SQL probes can
+  use certificate/hostname-verified TLS or mTLS; plaintext probes remain an
+  explicit trusted-network option
 - Redis/Valkey connection sharding requires `DBPROXY.SHARD` before AUTH/HELLO.
   Command mode supports a documented safe command subset, but transactions,
   Pub/Sub, blocking commands, unknown modules, RESP streaming, and payloads
@@ -551,6 +581,8 @@ See [docs/advanced-features.md](docs/advanced-features.md) for the XA,
 scatter/gather, and online-resharding safety plan and acceptance gates.
 See [docs/protocol-sharding.md](docs/protocol-sharding.md) for PostgreSQL,
 TimescaleDB, Redis, and Valkey sharding configuration and client requirements.
+See [docs/boundary-closure.md](docs/boundary-closure.md) for the delivery phases,
+acceptance gates, and protocol invariants behind every remaining boundary.
 
 ## Kubernetes deployment
 
