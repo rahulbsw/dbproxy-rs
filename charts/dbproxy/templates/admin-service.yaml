@@ -1,0 +1,21 @@
+{{- if .Values.adminService.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dbproxy.fullname" . }}-admin
+  labels:
+    {{- include "dbproxy.labels" . | nindent 4 }}
+  {{- with .Values.adminService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.adminService.type }}
+  selector:
+    {{- include "dbproxy.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: admin
+      port: {{ .Values.adminService.port }}
+      targetPort: admin
+      protocol: TCP
+{{- end }}

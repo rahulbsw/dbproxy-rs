@@ -255,6 +255,11 @@ address = "timescale-primary.internal:5432"
 role = "primary"
 weight = 1
 
+[postgres_backends.readiness_probe]
+username = "dbproxy_health"
+password = "${DBPROXY_POSTGRES_HEALTH_PASSWORD}"
+database = "app"
+
 [[postgres_backends]]
 name = "timescale-replica"
 address = "timescale-replica.internal:5432"
@@ -267,7 +272,10 @@ on the read-only listener are distributed across healthy replicas, falling back
 to the primary only when configured. Authentication remains end to end.
 Unsharded mode also preserves native end-to-end TLS; startup-sharded mode needs
 external TLS termination because DBProxy must read the selector. PostgreSQL
-credentials and private keys are not stored by DBProxy.
+client credentials and private keys are not stored by DBProxy. An optional
+per-backend `readiness_probe` uses a separate least-privilege role to
+authenticate and execute `SELECT 1`; omit it to retain TCP-only health checks.
+SQL probes currently require a plaintext trusted backend hop.
 
 Optional sharding selects a backend shard from `dbproxy.shard_key` in the
 StartupMessage or from libpq `options=-c dbproxy.shard_key=<value>`. The private
@@ -329,11 +337,15 @@ This mode supports proxy-side CRC16 `{hash-tag}` routing, merges cross-shard
 `MGET`, sums cross-shard `EXISTS`/`TOUCH`, and can split
 `DEL`/`UNLINK`/`MSET` only when non-atomic cross-shard writes are explicitly
 enabled. Commands without a safe built-in key specification are rejected.
+On the read-only listener, command mode allows only an explicit read-safe
+command set plus connection-local authentication/state commands. Writes,
+scripts not declared read-only, and unknown module commands receive a Redis
+`READONLY` error before DBProxy opens a backend route.
 
 This mode targets standalone primary/replica deployments. It does not discover
 Sentinel leaders, rewrite Redis Cluster `MOVED`/`ASK` responses, or hide cluster
-node addresses. The read-only listener does not parse or reject write commands;
-use Redis replica read-only mode and ACLs as the permission boundary.
+node addresses. Connection mode remains byte-transparent and cannot inspect
+writes, so Redis replica read-only mode and ACLs remain its permission boundary.
 
 ## Routing behavior
 
@@ -447,7 +459,7 @@ The admin listener defaults to `127.0.0.1:6071`:
 GET /healthz   process liveness
 GET /readyz    primary-backend readiness
 GET /backends  backend role and health state
-GET /postgres/backends  PostgreSQL backend transport health
+GET /postgres/backends  PostgreSQL transport and configured SQL readiness
 GET /redis/backends  Redis backend transport health
 GET /metrics   Prometheus text exposition
 ```
@@ -477,11 +489,12 @@ query kinds, and outcomes. They include:
 - per-backend pool size, idle/in-use connections, waiters, create failures,
   dirty returns, resets, cleanup errors, and expirations
 - PostgreSQL active/accepted/rejected clients, directional wire bytes,
-  cancellations, replica fallbacks, backend transport health, and active
+  cancellations, replica fallbacks, backend transport/SQL readiness, and active
   connections
 - Redis active/accepted/rejected clients, directional wire bytes, connection
   failures, replica fallbacks, transport health, active connections,
-  command-routing failures, fanout subcommands, and partial-write risk
+  command-routing/read-only rejections, fanout subcommands, and partial-write
+  risk
 - admin connection pressure and forced shutdowns
 
 ## Performance
@@ -512,8 +525,9 @@ recommendations.
 - PostgreSQL/TimescaleDB sharding is connection-level. End-to-end PostgreSQL TLS
   hides startup shard metadata, so sharded mode requires a plaintext trusted hop
   or external TLS termination
-- PostgreSQL health probes currently validate TCP transport, while authenticated
-  SQL readiness remains enforced by the database and integration checks
+- PostgreSQL readiness defaults to TCP transport. Optional authenticated SQL
+  probes use plaintext on the backend hop; backend TLS for probes is not
+  implemented yet
 - Redis/Valkey connection sharding requires `DBPROXY.SHARD` before AUTH/HELLO.
   Command mode supports a documented safe command subset, but transactions,
   Pub/Sub, blocking commands, unknown modules, RESP streaming, and payloads
@@ -538,28 +552,15 @@ scatter/gather, and online-resharding safety plan and acceptance gates.
 See [docs/protocol-sharding.md](docs/protocol-sharding.md) for PostgreSQL,
 TimescaleDB, Redis, and Valkey sharding configuration and client requirements.
 
-## Planned Kubernetes deployment
+## Kubernetes deployment
 
-Create a Helm chart under `charts/dbproxy` for an active-active Kubernetes
-deployment. The chart should include:
-
-- a `Deployment` with at least two replicas, rolling updates, graceful
-  termination, a `PodDisruptionBudget`, and topology spread or anti-affinity
-- TCP `Service` ports for enabled MySQL, PostgreSQL, and Redis listeners and a
-  separately controlled admin/metrics service
-- `/healthz` liveness and `/readyz` readiness probes
-- ConfigMap/Secret-based configuration with checksum annotations so
-  configuration changes trigger a controlled rollout
-- a restricted security context, resource requests/limits, optional
-  `ServiceMonitor`, and documented NetworkPolicy rules
-- validation and documentation for the cluster-wide backend connection budget:
-  `proxy replicas × pool.max_connections × matching backends`
-- Redis command-mode values for frame limits, fanout limits, per-client shard
-  connections, and whether non-atomic cross-shard writes are permitted
-
-The first chart should not imply an internally coordinated DBProxy cluster.
-Instances remain independent and must receive identical sharding and write
-fanout configuration.
+The [Helm chart](charts/dbproxy/README.md) deploys at least two independent
+active-active pods with rolling updates, health probes, disruption protection,
+topology spreading, restricted security contexts, separate data/admin services,
+ConfigMap/Secret integration, and optional `ServiceMonitor` and NetworkPolicy.
+It also documents aggregate backend connection budgeting. The chart does not
+imply an internally coordinated DBProxy cluster: every instance must receive
+the same sharding and write-fanout configuration.
 
 ## Verification
 

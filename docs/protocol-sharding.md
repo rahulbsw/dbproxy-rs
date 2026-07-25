@@ -196,4 +196,5 @@ shard = "tenant-0"
 
 `/postgres/backends`, `/redis/backends`, and per-backend Prometheus labels
 include the shard. Readiness requires the primary transport for every
-configured shard to be healthy.
+configured shard to be healthy, plus authenticated SQL readiness when a
+PostgreSQL backend declares `readiness_probe`.

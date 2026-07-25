@@ -123,6 +123,16 @@ struct RespCommand {
 
 impl CommandSession {
     async fn execute(&mut self, command: RespCommand) -> CommandAction {
+        if self.endpoint == RedisEndpoint::ReadOnly && !is_read_only_safe(&command).unwrap_or(false)
+        {
+            self.metrics.redis_read_only_rejected();
+            return CommandAction {
+                response:
+                    b"-READONLY DBProxy read-only listener rejects commands that may write\r\n"
+                        .to_vec(),
+                close: false,
+            };
+        }
         let result = self.execute_inner(&command).await;
         match result {
             Ok(action) => action,
@@ -206,7 +216,7 @@ impl CommandSession {
                 let indexes = odd_indexes(command.args.len());
                 return self.execute_same_shard(command, &indexes).await.map(action);
             }
-            b"EVAL" | b"EVALSHA" | b"FCALL" | b"FCALL_RO" => {
+            b"EVAL" | b"EVAL_RO" | b"EVALSHA" | b"EVALSHA_RO" | b"FCALL" | b"FCALL_RO" => {
                 let indexes = script_key_indexes(command)?;
                 return self.execute_same_shard(command, &indexes).await.map(action);
             }
@@ -868,6 +878,94 @@ fn is_single_key_command(name: &[u8]) -> bool {
     )
 }
 
+fn is_read_only_safe(command: &RespCommand) -> Result<bool, String> {
+    let name = command_name(command)?;
+    let safe = match name.as_slice() {
+        b"QUIT" | b"AUTH" | b"HELLO" | b"SELECT" | b"PING" | b"ECHO" | b"COMMAND" | b"INFO"
+        | b"TIME" | b"ROLE" | b"LASTSAVE" | b"MGET" | b"EXISTS" | b"SDIFF" | b"SINTER"
+        | b"SUNION" | b"PFCOUNT" | b"ZUNION" | b"ZINTER" | b"ZDIFF" | b"SINTERCARD"
+        | b"EVAL_RO" | b"EVALSHA_RO" | b"FCALL_RO" => true,
+        b"OBJECT" => command.args.get(1).is_some_and(|subcommand| {
+            subcommand.eq_ignore_ascii_case(b"ENCODING")
+                || subcommand.eq_ignore_ascii_case(b"FREQ")
+                || subcommand.eq_ignore_ascii_case(b"IDLETIME")
+                || subcommand.eq_ignore_ascii_case(b"REFCOUNT")
+        }),
+        b"MEMORY" => command
+            .args
+            .get(1)
+            .is_some_and(|subcommand| subcommand.eq_ignore_ascii_case(b"USAGE")),
+        b"CLIENT" => command.args.get(1).is_some_and(|subcommand| {
+            subcommand.eq_ignore_ascii_case(b"SETNAME")
+                || subcommand.eq_ignore_ascii_case(b"SETINFO")
+                || subcommand.eq_ignore_ascii_case(b"GETNAME")
+                || subcommand.eq_ignore_ascii_case(b"ID")
+                || subcommand.eq_ignore_ascii_case(b"INFO")
+                || subcommand.eq_ignore_ascii_case(b"LIST")
+        }),
+        _ => is_single_key_read_command(&name),
+    };
+    Ok(safe)
+}
+
+fn is_single_key_read_command(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"GET"
+            | b"STRLEN"
+            | b"GETRANGE"
+            | b"GETBIT"
+            | b"BITCOUNT"
+            | b"BITPOS"
+            | b"HGET"
+            | b"HMGET"
+            | b"HEXISTS"
+            | b"HGETALL"
+            | b"HKEYS"
+            | b"HLEN"
+            | b"HRANDFIELD"
+            | b"HSCAN"
+            | b"HSTRLEN"
+            | b"HVALS"
+            | b"LLEN"
+            | b"LRANGE"
+            | b"LINDEX"
+            | b"LPOS"
+            | b"SISMEMBER"
+            | b"SMISMEMBER"
+            | b"SMEMBERS"
+            | b"SCARD"
+            | b"SRANDMEMBER"
+            | b"SSCAN"
+            | b"ZSCORE"
+            | b"ZMSCORE"
+            | b"ZCARD"
+            | b"ZCOUNT"
+            | b"ZLEXCOUNT"
+            | b"ZRANGE"
+            | b"ZRANGEBYSCORE"
+            | b"ZRANGEBYLEX"
+            | b"ZRANK"
+            | b"ZREVRANK"
+            | b"ZRANDMEMBER"
+            | b"ZSCAN"
+            | b"EXPIRETIME"
+            | b"PEXPIRETIME"
+            | b"TTL"
+            | b"PTTL"
+            | b"TYPE"
+            | b"DUMP"
+            | b"GEODIST"
+            | b"GEOHASH"
+            | b"GEOPOS"
+            | b"GEOSEARCH"
+            | b"XLEN"
+            | b"XRANGE"
+            | b"XREVRANGE"
+            | b"XPENDING"
+    )
+}
+
 fn odd_indexes(length: usize) -> Vec<usize> {
     (1..length).step_by(2).collect()
 }
@@ -1376,5 +1474,41 @@ mod tests {
             raw: Vec::new(),
         };
         assert_eq!(script_key_indexes(&command).unwrap(), vec![3, 4]);
+    }
+
+    #[test]
+    fn read_only_classifier_allows_reads_and_connection_state() {
+        for args in [
+            vec![b"GET".to_vec(), b"key".to_vec()],
+            vec![b"MGET".to_vec(), b"k1".to_vec(), b"k2".to_vec()],
+            vec![b"AUTH".to_vec(), b"secret".to_vec()],
+            vec![b"CLIENT".to_vec(), b"SETNAME".to_vec(), b"app".to_vec()],
+            vec![
+                b"EVAL_RO".to_vec(),
+                b"return 1".to_vec(),
+                b"1".to_vec(),
+                b"key".to_vec(),
+            ],
+        ] {
+            assert!(is_read_only_safe(&RespCommand { args, raw: vec![] }).unwrap());
+        }
+    }
+
+    #[test]
+    fn read_only_classifier_rejects_writes_unsafe_scripts_and_unknowns() {
+        for args in [
+            vec![b"SET".to_vec(), b"key".to_vec(), b"value".to_vec()],
+            vec![b"TOUCH".to_vec(), b"key".to_vec()],
+            vec![b"MEMORY".to_vec(), b"PURGE".to_vec()],
+            vec![
+                b"EVAL".to_vec(),
+                b"return 1".to_vec(),
+                b"1".to_vec(),
+                b"key".to_vec(),
+            ],
+            vec![b"MODULE.READ".to_vec(), b"key".to_vec()],
+        ] {
+            assert!(!is_read_only_safe(&RespCommand { args, raw: vec![] }).unwrap());
+        }
     }
 }

@@ -40,11 +40,21 @@ address = "timescale-primary:5432"
 role = "primary"
 weight = 1
 
+[postgres_backends.readiness_probe]
+username = "proxy"
+password = "proxy-secret"
+database = "app"
+
 [[postgres_backends]]
 name = "timescale-replica"
 address = "timescale-replica:5432"
 role = "replica"
 weight = 1
+
+[postgres_backends.readiness_probe]
+username = "proxy"
+password = "proxy-secret"
+database = "app"
 
 [redis]
 enabled = true

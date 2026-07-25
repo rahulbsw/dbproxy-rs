@@ -1,0 +1,168 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/rahulbsw/dbproxy-rs
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+config:
+  existingConfigMap: ""
+  key: dbproxy.toml
+  content: |-
+    [proxy]
+    listen = "0.0.0.0:6033"
+    max_connections = 1024
+    backend_connect_timeout_seconds = 5
+    backend_query_timeout_seconds = 30
+    shutdown_grace_seconds = 30
+    client_io_timeout_seconds = 300
+    max_result_rows = 100000
+    max_result_bytes = 67108864
+    result_mode = "streaming"
+    max_prepared_statements_per_connection = 1024
+    max_query_bytes = 1048576
+
+    [proxy.tls]
+    mode = "disabled"
+
+    [admin]
+    listen = "0.0.0.0:6071"
+    max_connections = 32
+    request_timeout_seconds = 5
+
+    [postgres]
+    enabled = false
+
+    [redis]
+    enabled = false
+
+    [[users]]
+    username = "app"
+    password = "${DBPROXY_FRONTEND_PASSWORD}"
+
+    [[backends]]
+    name = "primary"
+    address = "mysql-primary.database.svc.cluster.local:3306"
+    role = "primary"
+    username = "proxy"
+    password = "${DBPROXY_BACKEND_PASSWORD}"
+    database = "app"
+
+    [backends.pool]
+    min = 1
+    max = 16
+    connection_ttl_seconds = 300
+    inactive_ttl_seconds = 60
+
+    [routing]
+    read_write_split = true
+    fallback_to_primary = true
+    reject_multi_statements = true
+
+    [sharding]
+    default_shard = "default"
+
+    [health_check]
+    interval_seconds = 5
+    timeout_seconds = 2
+    unhealthy_after_failures = 3
+
+    [logging]
+    filter = "dbproxy=info"
+    json = true
+
+secret:
+  # Prefer a Secret provisioned by an external secret manager.
+  existingSecret: dbproxy-secrets
+  create: false
+  annotations: {}
+  stringData: {}
+
+service:
+  type: ClusterIP
+  annotations: {}
+  externalTrafficPolicy: ""
+  ports:
+    mysql: {enabled: true, port: 6033}
+    postgresReadWrite: {enabled: false, port: 6432}
+    postgresReadOnly: {enabled: false, port: 6433}
+    redisReadWrite: {enabled: false, port: 6380}
+    redisReadOnly: {enabled: false, port: 6381}
+
+adminService:
+  enabled: true
+  type: ClusterIP
+  port: 6071
+  annotations: {}
+
+resources:
+  requests: {cpu: 100m, memory: 128Mi}
+  limits: {memory: 512Mi}
+
+terminationGracePeriodSeconds: 45
+livenessProbe:
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+readinessProbe:
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 3
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+networkPolicy:
+  enabled: false
+  ingress: {namespaceSelector: {}, podSelector: {}}
+  adminIngress: {namespaceSelector: {}, podSelector: {}}
+  egress: []
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  additionalLabels: {}
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []

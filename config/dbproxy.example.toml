@@ -53,6 +53,13 @@ strategy = "hash"
 # role = "primary"
 # weight = 1
 # shard = "default"
+#
+# Optional authenticated SQL readiness. Without this block DBProxy uses a TCP
+# transport probe. Environment expansion keeps the password out of this file.
+# [postgres_backends.readiness_probe]
+# username = "dbproxy_health"
+# password = "${DBPROXY_POSTGRES_HEALTH_PASSWORD}"
+# database = "app"
 
 # [[postgres_backends]]
 # name = "timescale-replica"
@@ -60,6 +67,10 @@ strategy = "hash"
 # role = "replica"
 # weight = 1
 # shard = "default"
+# [postgres_backends.readiness_probe]
+# username = "dbproxy_health"
+# password = "${DBPROXY_POSTGRES_HEALTH_PASSWORD}"
+# database = "app"
 
 [redis]
 # Transparent RESP2/RESP3 forwarding is disabled in the starter topology.

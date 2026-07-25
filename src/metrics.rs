@@ -75,6 +75,7 @@ pub struct Metrics {
     redis_shard_routes: AtomicU64,
     redis_shard_routing_failures: AtomicU64,
     redis_commands: AtomicU64,
+    redis_read_only_rejections: AtomicU64,
     redis_cross_shard_commands: AtomicU64,
     redis_command_routing_failures: AtomicU64,
     redis_fanout_subcommands: AtomicU64,
@@ -342,6 +343,11 @@ impl Metrics {
 
     pub fn redis_command(&self) {
         self.redis_commands.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn redis_read_only_rejected(&self) {
+        self.redis_read_only_rejections
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn redis_cross_shard_command(&self, subcommands: usize) {
@@ -796,6 +802,13 @@ impl Metrics {
         );
         metric(
             &mut output,
+            "dbproxy_redis_read_only_rejections_total",
+            "counter",
+            "Redis and Valkey commands rejected by command-mode read-only listeners.",
+            self.redis_read_only_rejections.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
             "dbproxy_redis_cross_shard_commands_total",
             "counter",
             "Redis and Valkey commands split across more than one shard.",
@@ -903,6 +916,7 @@ mod tests {
         metrics.redis_shard_routed();
         metrics.redis_shard_routing_failed();
         metrics.redis_command();
+        metrics.redis_read_only_rejected();
         metrics.redis_cross_shard_command(2);
         metrics.redis_command_routing_failed();
         metrics.redis_partial_write_failed();
@@ -921,6 +935,7 @@ mod tests {
         assert!(output.contains("dbproxy_redis_shard_routes_total 1"));
         assert!(output.contains("dbproxy_redis_shard_routing_failures_total 1"));
         assert!(output.contains("dbproxy_redis_commands_total 1"));
+        assert!(output.contains("dbproxy_redis_read_only_rejections_total 1"));
         assert!(output.contains("dbproxy_redis_cross_shard_commands_total 1"));
         assert!(output.contains("dbproxy_redis_command_routing_failures_total 1"));
         assert!(output.contains("dbproxy_redis_fanout_subcommands_total 2"));

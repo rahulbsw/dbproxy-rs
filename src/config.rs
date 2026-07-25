@@ -284,7 +284,7 @@ pub enum BackendRole {
     Replica,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostgresBackendConfig {
     pub name: String,
@@ -294,6 +294,16 @@ pub struct PostgresBackendConfig {
     pub weight: u32,
     #[serde(default = "default_shard")]
     pub shard: String,
+    #[serde(default)]
+    pub readiness_probe: Option<PostgresReadinessProbeConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresReadinessProbeConfig {
+    pub username: String,
+    pub password: String,
+    pub database: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -910,6 +920,16 @@ impl Config {
                 *primaries_by_shard.entry(&backend.shard).or_default() += 1;
             }
             parse_backend_address(&backend.address)?;
+            if let Some(probe) = &backend.readiness_probe
+                && (probe.username.trim().is_empty()
+                    || probe.password.is_empty()
+                    || probe.database.trim().is_empty())
+            {
+                return Err(ProxyError::Config(format!(
+                    "PostgreSQL backend {:?} readiness_probe requires non-empty username, password, and database",
+                    backend.name
+                )));
+            }
         }
         let backend_shards = self
             .postgres_backends
@@ -1526,6 +1546,48 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("conflicts")
+        );
+    }
+
+    #[test]
+    fn postgres_readiness_probe_requires_scoped_credentials_and_database() {
+        let raw = r#"
+            [proxy]
+            listen = "127.0.0.1:3307"
+
+            [postgres]
+            enabled = true
+            read_write_listen = "127.0.0.1:6432"
+            read_only_listen = "127.0.0.1:6433"
+
+            [[users]]
+            username = "app"
+            password = "secret"
+
+            [[backends]]
+            name = "mysql"
+            address = "127.0.0.1:3306"
+            role = "primary"
+            username = "root"
+            password = ""
+
+            [[postgres_backends]]
+            name = "pg-primary"
+            address = "127.0.0.1:5432"
+            role = "primary"
+
+            [postgres_backends.readiness_probe]
+            username = "health"
+            password = ""
+            database = "app"
+        "#;
+        let config: Config = toml::from_str(raw).unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("readiness_probe")
         );
     }
 

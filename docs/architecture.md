@@ -59,7 +59,10 @@ flowchart LR
 
 Each client owns lazy connections to the shards it uses. Replayable connection
 state is applied consistently; commands with unsafe or unknown state semantics
-are rejected. Cross-shard writes are opt-in and explicitly non-atomic.
+are rejected. On the read-only listener, command mode also rejects writes,
+non-read-only scripts, and unknown commands before routing. This enforcement
+does not apply to transparent connection mode. Cross-shard writes are opt-in
+and explicitly non-atomic.
 
 ## Data path
 

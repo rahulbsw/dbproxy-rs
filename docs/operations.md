@@ -18,9 +18,13 @@ failure threshold. Replicas do not gate readiness because reads can fall back to
 their shard primary.
 
 At startup, readiness is false until the first successful primary probes.
-When PostgreSQL is enabled, readiness also requires TCP transport health to its
-every configured shard primary. `/postgres/backends` reports PostgreSQL transport state and
-connection counters.
+When PostgreSQL is enabled, readiness also requires every configured shard
+primary to pass its configured probe. The default is TCP transport. A
+per-backend `readiness_probe` authenticates with a dedicated role and executes
+`SELECT 1`; its password can be supplied through environment expansion.
+`/postgres/backends` reports the probe mode, effective readiness, TCP transport,
+optional SQL readiness, and connection counters. SQL probes currently use
+plaintext PostgreSQL and should run only over a trusted backend network.
 
 When Redis is enabled, readiness also requires TCP transport health to its
 every configured shard primary. `/redis/backends` reports Redis/Valkey transport state and
@@ -42,8 +46,8 @@ validate replication role, or measure replica lag.
 | Pools | `dbproxy_backend_pool_connections`, `dbproxy_backend_pool_idle_connections`, `dbproxy_backend_pool_connections_in_use`, `dbproxy_backend_pool_waiters`, and pool failure/reset/discard counters |
 | Admin/shutdown | `dbproxy_admin_active_connections`, `dbproxy_admin_requests_total`, `dbproxy_admin_rejected_connections_total`, `dbproxy_forced_shutdowns_total` |
 | PostgreSQL clients | `dbproxy_postgres_active_clients`, accepted/rejected/error totals, directional forwarded bytes, connection failures, replica fallbacks, shard routes, and shard-routing failures |
-| PostgreSQL backends | `dbproxy_postgres_backend_transport_healthy`, `dbproxy_postgres_backend_connections_total`, `dbproxy_postgres_backend_connection_failures_total` |
-| Redis/Valkey clients | `dbproxy_redis_active_clients`, accepted/rejected/error totals, directional forwarded bytes, connection failures, replica fallbacks, shard routes, command totals, cross-shard commands, routing failures, generated fanout subcommands, partial-write failures |
+| PostgreSQL backends | `dbproxy_postgres_backend_healthy{mode}`, `dbproxy_postgres_backend_transport_healthy`, `dbproxy_postgres_backend_sql_healthy`, `dbproxy_postgres_backend_sql_health_checks_total{outcome}`, connection totals and failures |
+| Redis/Valkey clients | `dbproxy_redis_active_clients`, accepted/rejected/error totals, directional forwarded bytes, connection failures, replica fallbacks, shard routes, command totals, read-only rejections, cross-shard commands, routing failures, generated fanout subcommands, partial-write failures |
 | Redis backends | `dbproxy_redis_backend_transport_healthy`, `dbproxy_redis_backend_connections_total`, `dbproxy_redis_backend_connection_failures_total`, active connections, health-check outcomes, and health timestamps |
 
 Per-backend metrics use bounded `backend`, `shard`, and `role` labels sourced
@@ -68,6 +72,9 @@ database values are never used as labels.
   undersized downstream consumer.
 - `dbproxy_postgres_backend_transport_healthy{role="primary"} == 0`: the
   PostgreSQL/TimescaleDB primary cannot accept TCP connections.
+- `dbproxy_postgres_backend_healthy{role="primary"} == 0` while transport is
+  healthy: authenticated SQL readiness, credentials, or database selection is
+  failing.
 - Rising `dbproxy_postgres_replica_fallbacks_total`: unavailable replicas or an
   incorrect read-only topology.
 - `dbproxy_redis_backend_transport_healthy{role="primary"} == 0`: the Redis
@@ -83,6 +90,8 @@ database values are never used as labels.
   from the application's source of truth.
 - Rising `dbproxy_redis_command_routing_failures_total`: unsupported command
   shapes, cross-shard operations disabled by policy, or incorrect key counts.
+- Rising `dbproxy_redis_read_only_rejections_total`: clients are sending writes
+  or non-whitelisted commands to a command-mode read-only listener.
 
 Tune thresholds against normal traffic rather than alerting on raw cumulative
 counters.

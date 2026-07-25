@@ -1,0 +1,12 @@
+apiVersion: v2
+name: dbproxy
+description: Active-active deployment of the stateless DBProxy data-plane
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/rahulbsw/dbproxy-rs
+sources:
+  - https://github.com/rahulbsw/dbproxy-rs
+maintainers:
+  - name: DBProxy maintainers

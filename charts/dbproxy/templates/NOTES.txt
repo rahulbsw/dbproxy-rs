@@ -1,0 +1,17 @@
+DBProxy {{ .Chart.AppVersion }} is configured as {{ .Values.replicaCount }} independent active-active pods.
+
+Data-plane service:
+  {{ include "dbproxy.fullname" . }}.{{ .Release.Namespace }}.svc
+
+{{- if .Values.adminService.enabled }}
+Admin and metrics service:
+  {{ include "dbproxy.fullname" . }}-admin.{{ .Release.Namespace }}.svc:{{ .Values.adminService.port }}
+{{- end }}
+
+Before sending traffic, verify:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "dbproxy.fullname" . }}-admin 6071:{{ .Values.adminService.port }}
+  curl -f http://127.0.0.1:6071/readyz
+
+Each pod owns independent pools and routing state. Keep configuration identical
+across replicas and budget backend connections for the total replica count.

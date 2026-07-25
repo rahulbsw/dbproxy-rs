@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 use crate::{
     config::{
         BackendRole, HealthCheckConfig, PostgresBackendConfig, PostgresConfig,
-        parse_backend_address,
+        PostgresReadinessProbeConfig, parse_backend_address,
     },
     data_sharding::ProtocolShardRouter,
     error::ProxyError,
@@ -35,17 +35,21 @@ pub enum PostgresEndpoint {
     ReadOnly,
 }
 
-#[derive(Debug)]
 struct PostgresBackend {
     name: String,
     address: String,
     role: BackendRole,
     weight: u32,
     shard: String,
+    readiness_probe: Option<PostgresReadinessProbeConfig>,
     healthy: AtomicBool,
+    transport_healthy: AtomicBool,
+    sql_healthy: AtomicBool,
     consecutive_failures: AtomicU32,
     health_successes: AtomicU64,
     health_failures: AtomicU64,
+    sql_health_successes: AtomicU64,
+    sql_health_failures: AtomicU64,
     last_health_check: AtomicU64,
     last_health_success: AtomicU64,
     connection_attempts: AtomicU64,
@@ -62,10 +66,15 @@ impl PostgresBackend {
             role: config.role,
             weight: config.weight,
             shard: config.shard.clone(),
+            readiness_probe: config.readiness_probe.clone(),
             healthy: AtomicBool::new(false),
+            transport_healthy: AtomicBool::new(false),
+            sql_healthy: AtomicBool::new(false),
             consecutive_failures: AtomicU32::new(0),
             health_successes: AtomicU64::new(0),
             health_failures: AtomicU64::new(0),
+            sql_health_successes: AtomicU64::new(0),
+            sql_health_failures: AtomicU64::new(0),
             last_health_check: AtomicU64::new(0),
             last_health_success: AtomicU64::new(0),
             connection_attempts: AtomicU64::new(0),
@@ -98,9 +107,32 @@ impl PostgresBackend {
 
     async fn check_health(&self, config: &HealthCheckConfig) {
         let timeout = Duration::from_secs(config.timeout_seconds);
-        let success = time::timeout(timeout, TcpStream::connect(self.address.as_str()))
+        let transport_success = time::timeout(timeout, TcpStream::connect(self.address.as_str()))
             .await
             .is_ok_and(|result| result.is_ok());
+        self.transport_healthy
+            .store(transport_success, Ordering::Release);
+        let sql_success = if transport_success {
+            match &self.readiness_probe {
+                Some(probe) => {
+                    let success = self.check_sql_readiness(probe, timeout).await;
+                    self.sql_healthy.store(success, Ordering::Release);
+                    if success {
+                        self.sql_health_successes.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        self.sql_health_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                    success
+                }
+                None => true,
+            }
+        } else {
+            if self.readiness_probe.is_some() {
+                self.sql_healthy.store(false, Ordering::Release);
+            }
+            false
+        };
+        let success = transport_success && sql_success;
         let now = unix_seconds();
         self.last_health_check.store(now, Ordering::Release);
         if success {
@@ -110,7 +142,8 @@ impl PostgresBackend {
             if !self.healthy.swap(true, Ordering::AcqRel) {
                 info!(
                     backend = self.name,
-                    "PostgreSQL backend transport recovered"
+                    probe = self.probe_mode(),
+                    "PostgreSQL backend readiness recovered"
                 );
             }
         } else {
@@ -121,9 +154,48 @@ impl PostgresBackend {
             {
                 warn!(
                     backend = self.name,
-                    failures, "PostgreSQL backend transport marked unhealthy"
+                    probe = self.probe_mode(),
+                    failures,
+                    "PostgreSQL backend readiness marked unhealthy"
                 );
             }
+        }
+    }
+
+    async fn check_sql_readiness(
+        &self,
+        probe: &PostgresReadinessProbeConfig,
+        timeout: Duration,
+    ) -> bool {
+        let Ok((host, port)) = parse_backend_address(&self.address) else {
+            return false;
+        };
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(host)
+            .port(port)
+            .user(&probe.username)
+            .password(&probe.password)
+            .dbname(&probe.database)
+            .application_name("dbproxy-readiness")
+            .connect_timeout(timeout);
+
+        time::timeout(timeout, async {
+            let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
+            let driver = tokio::spawn(connection);
+            let result = client.simple_query("SELECT 1").await;
+            driver.abort();
+            result.map(|_| ())
+        })
+        .await
+        .is_ok_and(|result| result.is_ok())
+    }
+
+    fn probe_mode(&self) -> &'static str {
+        if self.readiness_probe.is_some() {
+            "sql"
+        } else {
+            "tcp"
         }
     }
 
@@ -135,7 +207,6 @@ impl PostgresBackend {
     }
 }
 
-#[derive(Debug)]
 pub struct PostgresBackendManager {
     shards: HashMap<String, PostgresShard>,
     default_shard: String,
@@ -143,7 +214,6 @@ pub struct PostgresBackendManager {
     health_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
-#[derive(Debug)]
 struct PostgresShard {
     primary: Arc<PostgresBackend>,
     replicas: Vec<Arc<PostgresBackend>>,
@@ -373,7 +443,13 @@ impl PostgresBackendManager {
                 address: backend.address.clone(),
                 role: backend.role_name().to_owned(),
                 shard: backend.shard.clone(),
+                health_check_mode: backend.probe_mode().to_owned(),
                 healthy: backend.healthy.load(Ordering::Acquire),
+                transport_healthy: backend.transport_healthy.load(Ordering::Acquire),
+                sql_healthy: backend
+                    .readiness_probe
+                    .as_ref()
+                    .map(|_| backend.sql_healthy.load(Ordering::Acquire)),
                 consecutive_failures: backend.consecutive_failures.load(Ordering::Relaxed),
                 last_health_check_unix_seconds: backend.last_health_check.load(Ordering::Relaxed),
                 last_health_success_unix_seconds: backend
@@ -394,6 +470,24 @@ impl PostgresBackendManager {
         let _ = writeln!(
             output,
             "# TYPE dbproxy_postgres_backend_transport_healthy gauge"
+        );
+        let _ = writeln!(
+            output,
+            "# HELP dbproxy_postgres_backend_healthy Whether the configured TCP or authenticated SQL readiness probe is healthy."
+        );
+        let _ = writeln!(output, "# TYPE dbproxy_postgres_backend_healthy gauge");
+        let _ = writeln!(
+            output,
+            "# HELP dbproxy_postgres_backend_sql_healthy Whether the authenticated SQL readiness probe is healthy; emitted only when configured."
+        );
+        let _ = writeln!(output, "# TYPE dbproxy_postgres_backend_sql_healthy gauge");
+        let _ = writeln!(
+            output,
+            "# HELP dbproxy_postgres_backend_sql_health_checks_total Authenticated PostgreSQL SQL readiness probes by outcome."
+        );
+        let _ = writeln!(
+            output,
+            "# TYPE dbproxy_postgres_backend_sql_health_checks_total counter"
         );
         let _ = writeln!(
             output,
@@ -421,7 +515,7 @@ impl PostgresBackendManager {
         );
         let _ = writeln!(
             output,
-            "# HELP dbproxy_postgres_backend_consecutive_failures Consecutive PostgreSQL transport health-check failures."
+            "# HELP dbproxy_postgres_backend_consecutive_failures Consecutive failures of the configured PostgreSQL readiness probe."
         );
         let _ = writeln!(
             output,
@@ -429,7 +523,7 @@ impl PostgresBackendManager {
         );
         let _ = writeln!(
             output,
-            "# HELP dbproxy_postgres_backend_health_checks_total PostgreSQL transport health checks by outcome."
+            "# HELP dbproxy_postgres_backend_health_checks_total Configured PostgreSQL readiness checks by outcome."
         );
         let _ = writeln!(
             output,
@@ -437,7 +531,7 @@ impl PostgresBackendManager {
         );
         let _ = writeln!(
             output,
-            "# HELP dbproxy_postgres_backend_last_health_check_timestamp_seconds Unix timestamp of the latest PostgreSQL transport health check."
+            "# HELP dbproxy_postgres_backend_last_health_check_timestamp_seconds Unix timestamp of the latest configured PostgreSQL readiness check."
         );
         let _ = writeln!(
             output,
@@ -445,7 +539,7 @@ impl PostgresBackendManager {
         );
         let _ = writeln!(
             output,
-            "# HELP dbproxy_postgres_backend_last_success_timestamp_seconds Unix timestamp of the latest successful PostgreSQL transport health check."
+            "# HELP dbproxy_postgres_backend_last_success_timestamp_seconds Unix timestamp of the latest successful PostgreSQL readiness check."
         );
         let _ = writeln!(
             output,
@@ -461,8 +555,33 @@ impl PostgresBackendManager {
             let _ = writeln!(
                 output,
                 "dbproxy_postgres_backend_transport_healthy{labels} {}",
+                u8::from(backend.transport_healthy.load(Ordering::Acquire))
+            );
+            let readiness_labels = add_label(&labels, "mode", backend.probe_mode());
+            let _ = writeln!(
+                output,
+                "dbproxy_postgres_backend_healthy{readiness_labels} {}",
                 u8::from(backend.healthy.load(Ordering::Acquire))
             );
+            if backend.readiness_probe.is_some() {
+                let _ = writeln!(
+                    output,
+                    "dbproxy_postgres_backend_sql_healthy{labels} {}",
+                    u8::from(backend.sql_healthy.load(Ordering::Acquire))
+                );
+                let _ = writeln!(
+                    output,
+                    "dbproxy_postgres_backend_sql_health_checks_total{} {}",
+                    add_label(&labels, "outcome", "success"),
+                    backend.sql_health_successes.load(Ordering::Relaxed)
+                );
+                let _ = writeln!(
+                    output,
+                    "dbproxy_postgres_backend_sql_health_checks_total{} {}",
+                    add_label(&labels, "outcome", "failure"),
+                    backend.sql_health_failures.load(Ordering::Relaxed)
+                );
+            }
             let _ = writeln!(
                 output,
                 "dbproxy_postgres_backend_connections_total{labels} {}",
@@ -515,7 +634,11 @@ pub struct PostgresBackendStatus {
     pub address: String,
     pub role: String,
     pub shard: String,
+    pub health_check_mode: String,
     pub healthy: bool,
+    pub transport_healthy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql_healthy: Option<bool>,
     pub consecutive_failures: u32,
     pub last_health_check_unix_seconds: u64,
     pub last_health_success_unix_seconds: u64,
@@ -974,6 +1097,7 @@ mod tests {
             role,
             weight,
             shard: "default".to_owned(),
+            readiness_probe: None,
         }
     }
 

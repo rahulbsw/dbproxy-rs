@@ -50,6 +50,14 @@
 - Redis/Valkey command mode computes key placement inside DBProxy, supports
   CRC16 hash tags and bounded multi-key merge/sum operations, replays safe
   connection state, and rejects unknown or stateful command shapes.
+- PostgreSQL backends can opt into authenticated `SELECT 1` readiness with
+  separately scoped credentials, while retaining TCP-only probes by default.
+- Redis/Valkey command-mode read-only listeners fail closed for writes, unsafe
+  scripts, and unknown commands and expose a dedicated rejection counter.
+- A production-oriented Helm chart provides two or more independent replicas,
+  safe rolling updates, disruption protection, hardened pods, health probes,
+  separate data/admin services, secret/config integration, and optional
+  monitoring and network policy.
 
 ## Intentional production boundaries
 
@@ -61,8 +69,8 @@
   mid-stream failures close the client connection and require application retry.
 - Runtime configuration changes require restart.
 - PostgreSQL forwarding is connection-pinned and does not yet provide protocol
-  termination, transaction pooling, SQL-level read/write splitting, or
-  authenticated health probes.
+  termination, transaction pooling, or SQL-level read/write splitting.
+- Authenticated PostgreSQL readiness probes do not yet support backend TLS.
 - PostgreSQL startup sharding cannot coexist with native end-to-end TLS because
   the startup shard selector would be encrypted.
 - Redis/Valkey connection mode preserves Pub/Sub, transactions, scripts, RESP3

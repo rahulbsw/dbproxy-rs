@@ -17,15 +17,18 @@ Completed:
   primary writes, prepared statements, health, and metrics
 - transparent PostgreSQL/TimescaleDB read-write and read-only listeners with
   weighted backend selection, COPY/extended-protocol preservation, cancellation
-  broadcast, unsharded end-to-end TLS, transport health, and metrics
+  broadcast, unsharded end-to-end TLS, optional authenticated SQL readiness,
+  transport health, and metrics
 - transparent Redis read-write and read-only listeners with RESP2/RESP3
   preservation, weighted replica selection, end-to-end AUTH/ACL and unsharded TLS,
   graceful draining, transport health, and metrics
 - connection-level PostgreSQL/TimescaleDB and Redis/Valkey sharding with shared
   hash, half-open numeric range, and exact-value strategies
 - opt-in Redis/Valkey command sharding with CRC16 hash tags, bounded fanout,
-  ordered `MGET` merge, integer aggregation, and guarded non-atomic writes
+  ordered `MGET` merge, integer aggregation, guarded non-atomic writes, and
+  command-mode read-only enforcement
 - NanoID operation identifiers for bounded-cardinality log correlation
+- a hardened active-active Helm deployment with independent stateless replicas
 
 Run the live protocol and routing suite with Docker Compose or Podman Compose;
 the script auto-detects a running runtime:
