@@ -41,11 +41,13 @@ validate replication role, or measure replica lag.
 | TLS | `dbproxy_frontend_tls_upgrade_attempts_total`, `dbproxy_frontend_plaintext_rejections_total`, `dbproxy_backend_info{tls_mode}` |
 | Queries | `dbproxy_queries_total{kind}`, `dbproxy_queries_primary_total`, `dbproxy_queries_replica_total`, `dbproxy_query_successes_total`, `dbproxy_query_errors_total`, `dbproxy_query_timeouts_total`, `dbproxy_query_duration_seconds_*`, `dbproxy_sql_analysis_duration_seconds_*`, `dbproxy_sql_parse_fallbacks_total` |
 | Results | `dbproxy_rows_returned_total`, `dbproxy_rows_affected_total`, `dbproxy_result_bytes_total`, `dbproxy_streaming_result_sets_total` |
+| Cache | `dbproxy_cache_hits_total`, `dbproxy_cache_misses_total`, `dbproxy_cache_bypasses_total`, `dbproxy_cache_errors_total`, fill/rejection/invalidation/singleflight totals, and `dbproxy_cache_bytes_served_total` |
+| Runtime config | `dbproxy_config_epoch`, `dbproxy_config_reload_successes_total`, `dbproxy_config_reload_failures_total`, `dbproxy_config_poll_failures_total` |
 | Routing | `dbproxy_replica_fallbacks_total`, `dbproxy_shard_routing_failures_total` |
 | Fanout | `dbproxy_write_fanout_attempts_total`, `dbproxy_write_fanout_successes_total`, `dbproxy_write_fanout_failures_total`, `dbproxy_write_fanout_timeouts_total` |
 | Prepared | `dbproxy_prepared_statements_created_total`, `dbproxy_prepared_statement_executions_total`, `dbproxy_prepared_statements_closed_total` |
 | Backend | `dbproxy_backend_healthy`, `dbproxy_backend_consecutive_failures`, `dbproxy_backend_health_checks_total{outcome}`, `dbproxy_backend_last_health_check_timestamp_seconds`, `dbproxy_backend_last_success_timestamp_seconds`, backend connection/query totals and duration sums |
-| Pools | `dbproxy_backend_pool_connections`, `dbproxy_backend_pool_idle_connections`, `dbproxy_backend_pool_connections_in_use`, `dbproxy_backend_pool_waiters`, and pool failure/reset/discard counters |
+| Pools | shared pool connection/idle/in-use/waiter/pressure metrics, `dbproxy_backend_reserved_pool_enabled`, reserved connection/idle/in-use/waiter metrics, and shared pool failure/reset/discard counters |
 | Admin/shutdown | `dbproxy_admin_active_connections`, `dbproxy_admin_requests_total`, `dbproxy_admin_rejected_connections_total`, `dbproxy_forced_shutdowns_total` |
 | Capabilities | `dbproxy_capability_info{capability,status}`; the same contracts are available from `/capabilities` |
 | PostgreSQL clients | `dbproxy_postgres_active_clients`, accepted/rejected/error totals, directional forwarded bytes, connection failures, replica fallbacks, shard routes, and shard-routing failures |
@@ -65,6 +67,9 @@ database values are never used as labels.
   contention, or network loss.
 - `dbproxy_backend_pool_waiters > 0` sustained for several minutes: pool
   pressure; correlate with in-use connections and query latency.
+- `dbproxy_backend_reserved_pool_waiters > 0`: transaction or pinned-session
+  concurrency exceeded the isolated primary reserve; increase it only after
+  checking the database's total connection budget.
 - Any increase in `dbproxy_write_fanout_failures_total` or
   `dbproxy_write_fanout_timeouts_total`: possible cross-database divergence.
 - A rising ratio of `dbproxy_replica_fallbacks_total` to
@@ -95,6 +100,9 @@ database values are never used as labels.
   shapes, cross-shard operations disabled by policy, or incorrect key counts.
 - Rising `dbproxy_redis_read_only_rejections_total`: clients are sending writes
   or non-whitelisted commands to a command-mode read-only listener.
+- Any increase in `dbproxy_cache_invalidation_failures_total`: Redis/Valkey did
+  not advance a committed table/shard generation; stale entries remain bounded
+  by TTL, but investigate cache availability immediately.
 
 Tune thresholds against normal traffic rather than alerting on raw cumulative
 counters.

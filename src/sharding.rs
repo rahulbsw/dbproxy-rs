@@ -21,6 +21,7 @@ use crate::{
 pub struct ShardDecision {
     pub shard: String,
     pub table: Option<String>,
+    pub table_count: usize,
     pub mutating: bool,
 }
 
@@ -108,6 +109,7 @@ impl ShardRouter {
                 return Ok(ShardDecision {
                     shard: self.default_shard.clone(),
                     table: None,
+                    table_count: 0,
                     mutating: false,
                 });
             }
@@ -128,6 +130,7 @@ impl ShardRouter {
                 Ok(ShardDecision {
                     shard: self.default_shard.clone(),
                     table: None,
+                    table_count: 0,
                     mutating: false,
                 })
             };
@@ -137,19 +140,21 @@ impl ShardRouter {
             if !self.valid_shards.contains(&hint) {
                 return Err(ShardRoutingError::UnknownHint(hint));
             }
-            for table in statement_tables(statement) {
-                if let Some(rule) = self.rules.get(&table)
+            let tables = statement_tables(statement);
+            for table in &tables {
+                if let Some(rule) = self.rules.get(table)
                     && modifies_shard_key(statement, &rule.column)
                 {
                     return Err(ShardRoutingError::ShardKeyMutation {
-                        table,
+                        table: table.clone(),
                         column: rule.column.clone(),
                     });
                 }
             }
             return Ok(ShardDecision {
                 shard: hint,
-                table: statement_table(statement),
+                table: tables.first().cloned(),
+                table_count: tables.len(),
                 mutating: matches!(
                     statement,
                     Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
@@ -164,15 +169,16 @@ impl ShardRouter {
             statement,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         );
+        let tables = statement_tables(statement);
         if !self.enabled {
             return Ok(ShardDecision {
                 shard: self.default_shard.clone(),
-                table: statement_table(statement),
+                table: tables.first().cloned(),
+                table_count: tables.len(),
                 mutating,
             });
         }
 
-        let tables = statement_tables(statement);
         let matched = tables
             .iter()
             .filter_map(|table| self.rules.get(table).map(|rule| (table, rule)))
@@ -184,6 +190,7 @@ impl ShardRouter {
             return Ok(ShardDecision {
                 shard: self.default_shard.clone(),
                 table: tables.first().cloned(),
+                table_count: tables.len(),
                 mutating,
             });
         };
@@ -229,6 +236,7 @@ impl ShardRouter {
         Ok(ShardDecision {
             shard,
             table: Some(table.clone()),
+            table_count: tables.len(),
             mutating,
         })
     }
@@ -367,10 +375,6 @@ fn literal(expr: &Expr) -> Option<String> {
         Value::Boolean(value) => Some(value.to_string()),
         _ => None,
     }
-}
-
-fn statement_table(statement: &Statement) -> Option<String> {
-    statement_tables(statement).into_iter().next()
 }
 
 fn statement_tables(statement: &Statement) -> Vec<String> {
@@ -532,6 +536,7 @@ mod tests {
                 database: None,
                 tls: BackendTlsConfig::default(),
                 pool: PoolConfig::default(),
+                reserved_pool: None,
             })
             .collect::<Vec<_>>();
         ShardRouter::new(&config, &backends)

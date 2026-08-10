@@ -31,6 +31,8 @@ pub struct Backend {
     weight: u32,
     tls_mode: BackendTlsMode,
     pool: Pool,
+    reserved_pool: Option<Pool>,
+    pool_max: usize,
     healthy: AtomicBool,
     consecutive_failures: AtomicU32,
     health_checks_successful: AtomicU64,
@@ -52,30 +54,29 @@ pub struct Backend {
 impl Backend {
     fn from_config(config: &BackendConfig) -> Result<Self, ProxyError> {
         let (host, port) = parse_backend_address(&config.address)?;
-        let constraints =
-            PoolConstraints::new(config.pool.min, config.pool.max).ok_or_else(|| {
-                ProxyError::Config(format!("invalid pool constraints for {:?}", config.name))
-            })?;
-        let pool_opts = PoolOpts::default()
-            .with_constraints(constraints)
-            .with_abs_conn_ttl(Some(Duration::from_secs(
-                config.pool.connection_ttl_seconds,
-            )))
-            .with_inactive_connection_ttl(Duration::from_secs(config.pool.inactive_ttl_seconds))
-            .with_reset_connection(true);
-
         let mut opts_builder = OptsBuilder::default()
             .ip_or_hostname(host)
             .tcp_port(port)
             .user(Some(config.username.as_str()))
             .pass(Some(config.password.as_str()))
             .db_name(config.database.as_deref())
-            .pool_opts(pool_opts)
             .tcp_nodelay(true);
         if let Some(ssl_opts) = backend_ssl_opts(&config.tls) {
             opts_builder = opts_builder.ssl_opts(Some(ssl_opts));
         }
-        let opts = Opts::from(opts_builder);
+        let pool = Pool::new(Opts::from(
+            opts_builder
+                .clone()
+                .pool_opts(mysql_pool_options(&config.pool, &config.name)?),
+        ));
+        let reserved_pool = config
+            .reserved_pool
+            .as_ref()
+            .map(|reserved| {
+                mysql_pool_options(reserved, &config.name)
+                    .map(|options| Pool::new(Opts::from(opts_builder.clone().pool_opts(options))))
+            })
+            .transpose()?;
 
         Ok(Self {
             name: config.name.clone(),
@@ -83,7 +84,9 @@ impl Backend {
             shard: config.shard.clone(),
             weight: config.weight,
             tls_mode: config.tls.mode,
-            pool: Pool::new(opts),
+            pool,
+            reserved_pool,
+            pool_max: config.pool.max,
             healthy: AtomicBool::new(false),
             consecutive_failures: AtomicU32::new(0),
             health_checks_successful: AtomicU64::new(0),
@@ -128,9 +131,18 @@ impl Backend {
     }
 
     pub async fn connection(&self) -> mysql_async::Result<Conn> {
+        self.connection_from(&self.pool).await
+    }
+
+    pub async fn reserved_connection(&self) -> mysql_async::Result<Conn> {
+        self.connection_from(self.reserved_pool.as_ref().unwrap_or(&self.pool))
+            .await
+    }
+
+    async fn connection_from(&self, pool: &Pool) -> mysql_async::Result<Conn> {
         self.connection_attempts.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
-        let result = self.pool.get_conn().await;
+        let result = pool.get_conn().await;
         self.connection_latency_micros
             .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         if result.is_ok() {
@@ -139,6 +151,13 @@ impl Backend {
             self.connection_failures.fetch_add(1, Ordering::Relaxed);
         }
         result
+    }
+
+    fn pool_pressure_millis(&self) -> u64 {
+        let metrics = self.pool.metrics();
+        let in_use = metrics.connections_in_use.load(Ordering::Relaxed) as u64;
+        let waiters = metrics.active_wait_requests.load(Ordering::Relaxed) as u64;
+        in_use.saturating_add(waiters).saturating_mul(1_000) / self.pool_max.max(1) as u64
     }
 
     pub fn record_connection_timeout(&self, elapsed: Duration) {
@@ -209,10 +228,29 @@ impl Backend {
     }
 
     async fn disconnect(&self) {
+        if let Some(pool) = &self.reserved_pool
+            && let Err(error) = pool.clone().disconnect().await
+        {
+            warn!(backend = self.name, %error, "failed to cleanly close reserved backend pool");
+        }
         if let Err(error) = self.pool.clone().disconnect().await {
             warn!(backend = self.name, %error, "failed to cleanly close backend pool");
         }
     }
+}
+
+fn mysql_pool_options(
+    config: &crate::config::PoolConfig,
+    backend_name: &str,
+) -> Result<PoolOpts, ProxyError> {
+    let constraints = PoolConstraints::new(config.min, config.max).ok_or_else(|| {
+        ProxyError::Config(format!("invalid pool constraints for {backend_name:?}"))
+    })?;
+    Ok(PoolOpts::default()
+        .with_constraints(constraints)
+        .with_abs_conn_ttl(Some(Duration::from_secs(config.connection_ttl_seconds)))
+        .with_inactive_connection_ttl(Duration::from_secs(config.inactive_ttl_seconds))
+        .with_reset_connection(true))
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -306,10 +344,22 @@ impl BackendManager {
     /// Selects a healthy replica with smooth, deterministic weighted rotation.
     pub fn replica(&self, shard: &str) -> Option<Arc<Backend>> {
         let group = self.shards.get(shard)?;
-        let total_weight = group
+        let minimum_pressure = group
             .replicas
             .iter()
             .filter(|backend| backend.is_healthy())
+            .map(|backend| backend.pool_pressure_millis())
+            .min()?;
+        // Keep deterministic weighted rotation among similarly loaded
+        // replicas, but stop sending new work to a materially more saturated
+        // pool. A 5% band avoids selection flapping on single connections.
+        let pressure_ceiling = minimum_pressure.saturating_add(50);
+        let total_weight = group
+            .replicas
+            .iter()
+            .filter(|backend| {
+                backend.is_healthy() && backend.pool_pressure_millis() <= pressure_ceiling
+            })
             .map(|backend| u64::from(backend.weight()))
             .sum::<u64>();
         if total_weight == 0 {
@@ -318,7 +368,9 @@ impl BackendManager {
 
         let slot = group.replica_cursor.fetch_add(1, Ordering::Relaxed) % total_weight;
         let mut cursor = 0_u64;
-        for backend in group.replicas.iter().filter(|backend| backend.is_healthy()) {
+        for backend in group.replicas.iter().filter(|backend| {
+            backend.is_healthy() && backend.pool_pressure_millis() <= pressure_ceiling
+        }) {
             cursor += u64::from(backend.weight());
             if slot < cursor {
                 return Some(backend.clone());
@@ -360,7 +412,7 @@ impl BackendManager {
     pub fn encode_prometheus(&self, output: &mut String) {
         use std::fmt::Write;
 
-        const METRICS: [(&str, &str, &str); 21] = [
+        const METRICS: [(&str, &str, &str); 27] = [
             (
                 "dbproxy_backend_healthy",
                 "gauge",
@@ -436,6 +488,36 @@ impl BackendManager {
                 "dbproxy_backend_pool_waiters",
                 "gauge",
                 "Active requests waiting for a backend connection.",
+            ),
+            (
+                "dbproxy_backend_pool_pressure_ratio",
+                "gauge",
+                "Backend pool in-use plus waiter pressure relative to configured capacity.",
+            ),
+            (
+                "dbproxy_backend_reserved_pool_enabled",
+                "gauge",
+                "Whether a dedicated transaction/session-affinity pool is configured.",
+            ),
+            (
+                "dbproxy_backend_reserved_pool_connections",
+                "gauge",
+                "Connections currently owned by the reserved backend pool.",
+            ),
+            (
+                "dbproxy_backend_reserved_pool_idle_connections",
+                "gauge",
+                "Connections currently idle in the reserved backend pool.",
+            ),
+            (
+                "dbproxy_backend_reserved_pool_connections_in_use",
+                "gauge",
+                "Reserved backend connections currently checked out.",
+            ),
+            (
+                "dbproxy_backend_reserved_pool_waiters",
+                "gauge",
+                "Requests waiting for a reserved backend connection.",
             ),
             (
                 "dbproxy_backend_pool_create_failures_total",
@@ -596,6 +678,44 @@ impl BackendManager {
                             pool.active_wait_requests.load(Ordering::Relaxed)
                         );
                     }
+                    "dbproxy_backend_pool_pressure_ratio" => {
+                        let _ = writeln!(
+                            output,
+                            "{name}{labels} {:.3}",
+                            backend.pool_pressure_millis() as f64 / 1_000.0
+                        );
+                    }
+                    "dbproxy_backend_reserved_pool_enabled" => {
+                        let _ = writeln!(
+                            output,
+                            "{name}{labels} {}",
+                            u8::from(backend.reserved_pool.is_some())
+                        );
+                    }
+                    "dbproxy_backend_reserved_pool_connections" => {
+                        let value = backend.reserved_pool.as_ref().map_or(0, |pool| {
+                            pool.metrics().connection_count.load(Ordering::Relaxed)
+                        });
+                        let _ = writeln!(output, "{name}{labels} {value}");
+                    }
+                    "dbproxy_backend_reserved_pool_idle_connections" => {
+                        let value = backend.reserved_pool.as_ref().map_or(0, |pool| {
+                            pool.metrics().connections_in_pool.load(Ordering::Relaxed)
+                        });
+                        let _ = writeln!(output, "{name}{labels} {value}");
+                    }
+                    "dbproxy_backend_reserved_pool_connections_in_use" => {
+                        let value = backend.reserved_pool.as_ref().map_or(0, |pool| {
+                            pool.metrics().connections_in_use.load(Ordering::Relaxed)
+                        });
+                        let _ = writeln!(output, "{name}{labels} {value}");
+                    }
+                    "dbproxy_backend_reserved_pool_waiters" => {
+                        let value = backend.reserved_pool.as_ref().map_or(0, |pool| {
+                            pool.metrics().active_wait_requests.load(Ordering::Relaxed)
+                        });
+                        let _ = writeln!(output, "{name}{labels} {value}");
+                    }
                     "dbproxy_backend_pool_create_failures_total" => {
                         let _ = writeln!(
                             output,
@@ -752,6 +872,7 @@ mod tests {
             database: None,
             tls: BackendTlsConfig::default(),
             pool: PoolConfig::default(),
+            reserved_pool: None,
         }])
         .unwrap();
         assert!(!manager.ready());
@@ -764,6 +885,32 @@ mod tests {
             add_label("{backend=\"one\"}", "outcome", "success"),
             "{backend=\"one\",outcome=\"success\"}"
         );
+    }
+
+    #[test]
+    fn reserved_pool_is_exposed_separately() {
+        let manager = BackendManager::from_config(&[BackendConfig {
+            name: "primary".to_owned(),
+            address: "127.0.0.1:3306".to_owned(),
+            role: BackendRole::Primary,
+            shard: "default".to_owned(),
+            weight: 1,
+            username: "proxy".to_owned(),
+            password: "secret".to_owned(),
+            database: None,
+            tls: BackendTlsConfig::default(),
+            pool: PoolConfig::default(),
+            reserved_pool: Some(PoolConfig {
+                min: 0,
+                max: 2,
+                ..PoolConfig::default()
+            }),
+        }])
+        .unwrap();
+        let mut output = String::new();
+        manager.encode_prometheus(&mut output);
+        assert!(output.contains("dbproxy_backend_reserved_pool_enabled"));
+        assert!(output.contains("dbproxy_backend_reserved_pool_enabled{backend=\"primary\""));
     }
 
     #[test]

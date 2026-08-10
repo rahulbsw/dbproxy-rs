@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     io,
     pin::Pin,
@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use mysql_async::{
@@ -38,8 +39,10 @@ use crate::{
     admin,
     auth::{verify_caching_sha2_password, verify_native_password},
     backend::{Backend, BackendManager, BackendQueryOutcome},
+    cache::{CacheManager, CacheScope, CachedResult},
     classifier::{QueryKind, SqlAnalysis, SqlClassifier},
     config::{Config, FanoutFailurePolicy, FrontendTlsMode, ResultMode},
+    control_plane::EtcdControlPlane,
     error::ProxyError,
     metrics::Metrics,
     operation_id,
@@ -58,6 +61,12 @@ pub struct Proxy {
     postgres_backends: Option<Arc<PostgresBackendManager>>,
     redis_backends: Option<Arc<RedisBackendManager>>,
     connection_ids: AtomicU32,
+}
+
+struct MysqlRuntimeSnapshot {
+    epoch: u64,
+    config: Arc<Config>,
+    cache: Option<Arc<CacheManager>>,
 }
 
 impl Proxy {
@@ -80,6 +89,64 @@ impl Proxy {
     }
 
     pub async fn run(self) -> Result<(), ProxyError> {
+        let mut initial_config = self.config.clone();
+        let mut initial_epoch = 0_u64;
+        let control_plane = if self.config.control_plane.enabled {
+            match EtcdControlPlane::connect(self.config.control_plane.clone()).await {
+                Ok(control_plane) => {
+                    match control_plane.fetch().await {
+                        Ok(Some(value)) => {
+                            match self.config.apply_runtime_document(&value.document) {
+                                Ok(config) => {
+                                    initial_config = Arc::new(config);
+                                    initial_epoch = value.revision;
+                                }
+                                Err(error) if self.config.control_plane.required_at_startup => {
+                                    return Err(error);
+                                }
+                                Err(error) => {
+                                    self.metrics.config_reload_failed();
+                                    warn!(%error, "initial etcd generation rejected; using local last-known-good config");
+                                }
+                            }
+                        }
+                        Ok(None) if self.config.control_plane.required_at_startup => {
+                            return Err(ProxyError::Config(format!(
+                                "required etcd key {:?} does not exist",
+                                self.config.control_plane.key
+                            )));
+                        }
+                        Ok(None) => warn!(
+                            key = self.config.control_plane.key,
+                            "etcd runtime key is absent; using local last-known-good config"
+                        ),
+                        Err(error) if self.config.control_plane.required_at_startup => {
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            self.metrics.config_poll_failed();
+                            warn!(%error, "initial etcd poll failed; using local last-known-good config");
+                        }
+                    }
+                    Some(control_plane)
+                }
+                Err(error) if self.config.control_plane.required_at_startup => return Err(error),
+                Err(error) => {
+                    self.metrics.config_poll_failed();
+                    warn!(%error, "etcd control plane unavailable; using local last-known-good config");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let initial_cache = initialize_cache(&initial_config, self.metrics.clone()).await?;
+        let mysql_runtime = Arc::new(ArcSwap::from(Arc::new(MysqlRuntimeSnapshot {
+            epoch: initial_epoch,
+            config: initial_config,
+            cache: initial_cache,
+        })));
+        self.metrics.config_epoch(initial_epoch);
         let mysql_listener = TcpListener::bind(self.config.proxy.listen).await?;
         let admin_listener = TcpListener::bind(self.config.admin.listen).await?;
         let postgres_read_write_listener = if self.config.postgres.enabled {
@@ -112,6 +179,20 @@ impl Proxy {
         let postgres_admission = Arc::new(Semaphore::new(self.config.postgres.max_connections));
         let redis_admission = Arc::new(Semaphore::new(self.config.redis.max_connections));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let control_plane_task = control_plane.map(|control_plane| {
+            tokio::spawn(watch_runtime_config(
+                control_plane,
+                mysql_runtime.clone(),
+                self.metrics.clone(),
+                Duration::from_secs(self.config.control_plane.poll_interval_seconds),
+                shutdown_rx.clone(),
+            ))
+        });
+        let cache_recovery_task = tokio::spawn(watch_cache_recovery(
+            mysql_runtime.clone(),
+            self.metrics.clone(),
+            shutdown_rx.clone(),
+        ));
 
         self.backends
             .start_health_checks(self.config.health_check.clone(), self.metrics.clone());
@@ -213,11 +294,14 @@ impl Proxy {
                             };
                             let connection_id =
                                 self.connection_ids.fetch_add(1, Ordering::Relaxed);
+                            let runtime = mysql_runtime.load_full();
                             let session = ProxySession::new(
                                 connection_id,
-                                self.config.clone(),
+                                runtime.epoch,
+                                runtime.config.clone(),
                                 self.backends.clone(),
                                 self.metrics.clone(),
+                                runtime.cache.clone(),
                             );
                             let metrics = self.metrics.clone();
                             let frontend_tls = self.frontend_tls.clone();
@@ -278,6 +362,10 @@ impl Proxy {
         for task in redis_tasks {
             let _ = task.await;
         }
+        if let Some(task) = control_plane_task {
+            let _ = task.await;
+        }
+        let _ = cache_recovery_task.await;
         if let Some(manager) = &self.postgres_backends {
             manager.shutdown().await;
         }
@@ -287,6 +375,127 @@ impl Proxy {
         self.backends.shutdown().await;
         info!("dbproxy stopped");
         Ok(())
+    }
+}
+
+async fn initialize_cache(
+    config: &Config,
+    metrics: Arc<Metrics>,
+) -> Result<Option<Arc<CacheManager>>, ProxyError> {
+    if !config.cache.enabled {
+        return Ok(None);
+    }
+    match CacheManager::connect(config.cache.clone(), metrics).await {
+        Ok(cache) => Ok(Some(cache)),
+        Err(error) if config.cache.fail_open => {
+            warn!(%error, "result cache unavailable; activating generation with cache bypassed");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn watch_runtime_config(
+    control_plane: EtcdControlPlane,
+    runtime: Arc<ArcSwap<MysqlRuntimeSnapshot>>,
+    metrics: Arc<Metrics>,
+    poll_interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut interval = time::interval(poll_interval);
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    // Startup already fetched once; do not immediately duplicate that request.
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                match control_plane.fetch().await {
+                    Ok(Some(value)) => {
+                        let current = runtime.load_full();
+                        if value.revision <= current.epoch {
+                            continue;
+                        }
+                        match current.config.apply_runtime_document(&value.document) {
+                            Ok(config) => match initialize_cache(&config, metrics.clone()).await {
+                                Ok(cache) => {
+                                    let config = Arc::new(config);
+                                    runtime.store(Arc::new(MysqlRuntimeSnapshot {
+                                        epoch: value.revision,
+                                        config,
+                                        cache,
+                                    }));
+                                    metrics.config_epoch(value.revision);
+                                    metrics.config_reload_succeeded();
+                                    info!(
+                                        config_epoch = value.revision,
+                                        "activated immutable etcd runtime generation for new MySQL sessions"
+                                    );
+                                }
+                                Err(error) => {
+                                    metrics.config_reload_failed();
+                                    warn!(config_epoch = value.revision, %error, "etcd generation rejected during cache initialization");
+                                }
+                            },
+                            Err(error) => {
+                                metrics.config_reload_failed();
+                                warn!(config_epoch = value.revision, %error, "invalid etcd generation rejected; retaining last-known-good config");
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Deleting the key does not delete the active routing
+                        // generation. Operators must publish a new valid value.
+                    }
+                    Err(error) => {
+                        metrics.config_poll_failed();
+                        warn!(%error, "etcd revision poll failed; retaining last-known-good config");
+                    }
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn watch_cache_recovery(
+    runtime: Arc<ArcSwap<MysqlRuntimeSnapshot>>,
+    metrics: Arc<Metrics>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut interval = time::interval(Duration::from_secs(5));
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let snapshot = runtime.load_full();
+                if snapshot.config.cache.enabled && snapshot.cache.is_none() {
+                    match CacheManager::connect(snapshot.config.cache.clone(), metrics.clone()).await {
+                        Ok(cache) => {
+                            let current = runtime.load_full();
+                            if current.epoch == snapshot.epoch && current.cache.is_none() {
+                                runtime.store(Arc::new(MysqlRuntimeSnapshot {
+                                    epoch: current.epoch,
+                                    config: current.config.clone(),
+                                    cache: Some(cache),
+                                }));
+                                info!(config_epoch = current.epoch, "Redis/Valkey result cache connection recovered for new sessions");
+                            }
+                        }
+                        Err(error) => debug!(%error, "result cache recovery attempt failed"),
+                    }
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -490,10 +699,12 @@ impl Drop for ActiveClient {
 
 struct ProxySession {
     connection_id: u32,
+    config_epoch: u64,
     operation_id: String,
     config: Arc<Config>,
     backends: Arc<BackendManager>,
     metrics: Arc<Metrics>,
+    cache: Option<Arc<CacheManager>>,
     classifier: SqlClassifier,
     users: HashMap<String, String>,
     state: SessionState,
@@ -505,6 +716,7 @@ struct ProxySession {
     prepared: HashMap<u32, PreparedStatement>,
     next_statement_id: u32,
     salt: [u8; 20],
+    pending_cache_invalidations: HashSet<CacheScope>,
 }
 
 struct PreparedStatement {
@@ -515,9 +727,11 @@ struct PreparedStatement {
 impl ProxySession {
     fn new(
         connection_id: u32,
+        config_epoch: u64,
         config: Arc<Config>,
         backends: Arc<BackendManager>,
         metrics: Arc<Metrics>,
+        cache: Option<Arc<CacheManager>>,
     ) -> Self {
         let users = config
             .users
@@ -526,6 +740,7 @@ impl ProxySession {
             .collect();
         Self {
             connection_id,
+            config_epoch,
             operation_id: operation_id::generate("mysql"),
             classifier: SqlClassifier::new(
                 config.routing.reject_multi_statements,
@@ -537,6 +752,7 @@ impl ProxySession {
             config,
             backends,
             metrics,
+            cache,
             users,
             pinned: None,
             pinned_shard: None,
@@ -544,6 +760,7 @@ impl ProxySession {
             session_commands: Vec::new(),
             prepared: HashMap::new(),
             next_statement_id: 1,
+            pending_cache_invalidations: HashSet::new(),
         }
     }
 
@@ -566,7 +783,7 @@ impl ProxySession {
                 }
                 let backend = self.primary(shard)?;
                 if self.pinned.is_none() {
-                    self.pinned = Some(self.connect(&backend).await?);
+                    self.pinned = Some(self.connect_reserved(&backend).await?);
                     self.pinned_shard = Some(shard.to_owned());
                 }
                 Ok((ConnectionSource::Pinned, backend))
@@ -616,9 +833,28 @@ impl ProxySession {
     }
 
     async fn connect(&self, backend: &Backend) -> Result<Conn, ProxyError> {
+        self.connect_with_pool(backend, false).await
+    }
+
+    async fn connect_reserved(&self, backend: &Backend) -> Result<Conn, ProxyError> {
+        self.connect_with_pool(backend, true).await
+    }
+
+    async fn connect_with_pool(
+        &self,
+        backend: &Backend,
+        reserved: bool,
+    ) -> Result<Conn, ProxyError> {
         let timeout = Duration::from_secs(self.config.proxy.backend_connect_timeout_seconds);
         let started = Instant::now();
-        let mut connection = match time::timeout(timeout, backend.connection()).await {
+        let acquisition = async {
+            if reserved {
+                backend.reserved_connection().await
+            } else {
+                backend.connection().await
+            }
+        };
+        let mut connection = match time::timeout(timeout, acquisition).await {
             Ok(result) => result?,
             Err(_) => {
                 backend.record_connection_timeout(started.elapsed());
@@ -852,6 +1088,104 @@ impl ProxySession {
         }
     }
 
+    async fn record_cache_success(
+        &mut self,
+        kind: QueryKind,
+        query: &str,
+        decision: &ShardDecision,
+    ) {
+        let Some(manager) = self.cache.clone() else {
+            return;
+        };
+        match kind {
+            QueryKind::Write => {
+                let Some(table) = decision.table.as_deref() else {
+                    return;
+                };
+                if manager.rule(table).is_none() {
+                    return;
+                }
+                let scope = CacheScope::new(self.schema.as_deref(), table, &decision.shard);
+                if self.state.in_transaction() {
+                    self.pending_cache_invalidations.insert(scope);
+                } else if let Err(error) = manager.invalidate(&scope).await {
+                    self.metrics.cache_invalidation_failed();
+                    warn!(%error, table, shard = decision.shard, "cache invalidation failed after write");
+                }
+            }
+            QueryKind::TransactionEnd => {
+                let commits = query
+                    .trim_start()
+                    .get(..6)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("COMMIT"));
+                if commits {
+                    for scope in self.pending_cache_invalidations.drain() {
+                        if let Err(error) = manager.invalidate(&scope).await {
+                            self.metrics.cache_invalidation_failed();
+                            warn!(%error, table = scope.table, shard = scope.shard, "cache invalidation failed after commit");
+                        }
+                    }
+                } else {
+                    self.pending_cache_invalidations.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn cache_lookup(
+        &self,
+        query: &str,
+        decision: &ShardDecision,
+        route: RouteTarget,
+        kind: QueryKind,
+    ) -> Result<Option<CacheLookup>, ProxyError> {
+        let Some(manager) = &self.cache else {
+            return Ok(None);
+        };
+        let Some(table) = decision.table.as_deref() else {
+            self.metrics.cache_bypass();
+            return Ok(None);
+        };
+        let Some(rule) = manager.rule(table).cloned() else {
+            self.metrics.cache_bypass();
+            return Ok(None);
+        };
+        if kind != QueryKind::Read
+            || route != RouteTarget::Replica
+            || self.config.proxy.result_mode != ResultMode::Buffered
+            || decision.table_count != 1
+            || !cache_safe_sql(query)
+        {
+            self.metrics.cache_bypass();
+            return Ok(None);
+        }
+
+        let scope = CacheScope::new(self.schema.as_deref(), table, &decision.shard);
+        let mut cache_identity = String::with_capacity(query.len() + 64);
+        cache_identity.push_str(query);
+        for command in &self.session_commands {
+            cache_identity.push('\0');
+            cache_identity.push_str(command);
+        }
+        let key = manager.query_key(&scope, &cache_identity).await?;
+        if let Some(result) = manager.get(&key).await? {
+            return Ok(Some(CacheLookup::Hit(result)));
+        }
+
+        let flight = manager.flight(&key).await;
+        let guard = flight.lock_owned().await;
+        if let Some(result) = manager.get(&key).await? {
+            return Ok(Some(CacheLookup::Hit(result)));
+        }
+        Ok(Some(CacheLookup::Fill(CacheFill {
+            manager: manager.clone(),
+            rule,
+            key,
+            _guard: guard,
+        })))
+    }
+
     async fn handle_query<W>(
         &mut self,
         query: &str,
@@ -923,6 +1257,34 @@ impl ProxySession {
         let route = self
             .state
             .route(classification.kind, self.config.routing.read_write_split);
+        let mut cache_fill = None;
+        match self
+            .cache_lookup(query, &decision, route, classification.kind)
+            .await
+        {
+            Ok(Some(CacheLookup::Hit(cached))) => {
+                let stats = write_cached_result(&cached, writer).await?;
+                self.metrics.observe_query(started.elapsed());
+                self.metrics.query_succeeded();
+                self.metrics.rows_returned(stats.rows_returned);
+                self.metrics.bytes_returned(stats.bytes_returned);
+                self.state.record_success(classification.kind);
+                return Ok(());
+            }
+            Ok(Some(CacheLookup::Fill(fill))) => cache_fill = Some(fill),
+            Ok(None) => {}
+            Err(error) if self.cache.as_ref().is_some_and(|cache| cache.fail_open()) => {
+                self.metrics.cache_bypass();
+                warn!(%error, "result cache lookup failed; bypassing cache");
+            }
+            Err(error) => {
+                self.metrics.query_failed();
+                writer
+                    .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
+                    .await?;
+                return Ok(());
+            }
+        }
         let (mut source, backend) = match self.acquire_for_route(route, &decision.shard).await {
             Ok(connection) => connection,
             Err(error) => {
@@ -943,6 +1305,7 @@ impl ProxySession {
         debug!(
             connection_id = self.connection_id,
             operation_id = self.operation_id,
+            config_epoch = self.config_epoch,
             backend = backend.name(),
             shard = decision.shard,
             kind = ?classification.kind,
@@ -967,6 +1330,7 @@ impl ProxySession {
                     max_result_rows,
                     max_result_bytes,
                     result_mode,
+                    cache_fill.is_some(),
                 )
                 .await
                 .map(QueryExecution::Success),
@@ -979,7 +1343,15 @@ impl ProxySession {
             }
         };
         match time::timeout(timeout, execution).await {
-            Ok(Ok(QueryExecution::Success(stats))) => {
+            Ok(Ok(QueryExecution::Success(materialized))) => {
+                if let (Some(fill), Some(cached)) = (cache_fill.take(), materialized.cached) {
+                    tokio::spawn(async move {
+                        if let Err(error) = fill.manager.put(&fill.key, &cached, &fill.rule).await {
+                            warn!(%error, "result cache fill failed");
+                        }
+                    });
+                }
+                let stats = materialized.stats;
                 let elapsed = backend_started.elapsed();
                 backend.record_query(BackendQueryOutcome::Success, elapsed);
                 self.metrics.observe_query(started.elapsed());
@@ -987,6 +1359,8 @@ impl ProxySession {
                 self.metrics.rows_returned(stats.rows_returned);
                 self.metrics.bytes_returned(stats.bytes_returned);
                 self.metrics.rows_affected(stats.rows_affected);
+                self.record_cache_success(classification.kind, query, &decision)
+                    .await;
                 self.state.record_success(classification.kind);
                 if classification.kind == QueryKind::ReplayableSession {
                     self.record_replayable_session_command(query);
@@ -1061,7 +1435,7 @@ impl ConnectionSource {
 }
 
 enum QueryExecution {
-    Success(ResultStats),
+    Success(MaterializedResult),
     BackendError,
 }
 
@@ -1070,6 +1444,23 @@ struct ResultStats {
     rows_returned: u64,
     rows_affected: u64,
     bytes_returned: u64,
+}
+
+struct MaterializedResult {
+    stats: ResultStats,
+    cached: Option<CachedResult>,
+}
+
+enum CacheLookup {
+    Hit(CachedResult),
+    Fill(CacheFill),
+}
+
+struct CacheFill {
+    manager: Arc<CacheManager>,
+    rule: crate::config::CacheRuleConfig,
+    key: String,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 #[async_trait]
@@ -1327,6 +1718,34 @@ where
         }
 
         let route = self.state.route(kind, self.config.routing.read_write_split);
+        let mut cache_fill = None;
+        match self
+            .cache_lookup(&routing_sql, &decision, route, kind)
+            .await
+        {
+            Ok(Some(CacheLookup::Hit(cached))) => {
+                let stats = write_cached_result(&cached, results).await?;
+                self.metrics.observe_query(started.elapsed());
+                self.metrics.query_succeeded();
+                self.metrics.rows_returned(stats.rows_returned);
+                self.metrics.bytes_returned(stats.bytes_returned);
+                self.state.record_success(kind);
+                return Ok(());
+            }
+            Ok(Some(CacheLookup::Fill(fill))) => cache_fill = Some(fill),
+            Ok(None) => {}
+            Err(error) if self.cache.as_ref().is_some_and(|cache| cache.fail_open()) => {
+                self.metrics.cache_bypass();
+                warn!(%error, "prepared result cache lookup failed; bypassing cache");
+            }
+            Err(error) => {
+                self.metrics.query_failed();
+                results
+                    .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
+                    .await?;
+                return Ok(());
+            }
+        }
         let (mut source, backend) = match self.acquire_for_route(route, &decision.shard).await {
             Ok(connection) => connection,
             Err(error) => {
@@ -1363,6 +1782,7 @@ where
                     max_result_rows,
                     max_result_bytes,
                     result_mode,
+                    cache_fill.is_some(),
                 )
                 .await
                 .map(QueryExecution::Success),
@@ -1375,13 +1795,22 @@ where
             }
         };
         match time::timeout(timeout, execution).await {
-            Ok(Ok(QueryExecution::Success(stats))) => {
+            Ok(Ok(QueryExecution::Success(materialized))) => {
+                if let (Some(fill), Some(cached)) = (cache_fill.take(), materialized.cached) {
+                    tokio::spawn(async move {
+                        if let Err(error) = fill.manager.put(&fill.key, &cached, &fill.rule).await {
+                            warn!(%error, "prepared result cache fill failed");
+                        }
+                    });
+                }
+                let stats = materialized.stats;
                 backend.record_query(BackendQueryOutcome::Success, backend_started.elapsed());
                 self.metrics.query_succeeded();
                 self.metrics.rows_returned(stats.rows_returned);
                 self.metrics.bytes_returned(stats.bytes_returned);
                 self.metrics.rows_affected(stats.rows_affected);
                 self.metrics.observe_query(started.elapsed());
+                self.record_cache_success(kind, &query, &decision).await;
                 self.state.record_success(kind);
                 if kind == QueryKind::ReplayableSession {
                     self.record_replayable_session_command(&query);
@@ -1503,7 +1932,8 @@ async fn write_result<W, P>(
     max_result_rows: usize,
     max_result_bytes: usize,
     result_mode: ResultMode,
-) -> Result<ResultStats, ProxyError>
+    capture_cache: bool,
+) -> Result<MaterializedResult, ProxyError>
 where
     W: AsyncWrite + Send + Unpin,
     P: Protocol + Unpin,
@@ -1529,10 +1959,13 @@ where
                 ..Default::default()
             })
             .await?;
-        return Ok(ResultStats {
-            rows_returned: 0,
-            rows_affected: affected_rows,
-            bytes_returned: 0,
+        return Ok(MaterializedResult {
+            stats: ResultStats {
+                rows_returned: 0,
+                rows_affected: affected_rows,
+                bytes_returned: 0,
+            },
+            cached: None,
         });
     }
 
@@ -1552,19 +1985,24 @@ where
                     max_result_bytes,
                 )?;
                 result_bytes = result_bytes.saturating_add(size);
-                rows.push(row);
+                rows.push(row.unwrap());
             }
             result.drop_result().await?;
             let mut row_writer = writer.start(&columns).await?;
             let rows_returned = rows.len() as u64;
+            let cached =
+                capture_cache.then(|| CachedResult::new(&columns, &rows, result_bytes as u64));
             for row in rows {
-                write_row(&mut row_writer, row).await?;
+                write_row_values(&mut row_writer, row).await?;
             }
             row_writer.finish().await?;
-            Ok(ResultStats {
-                rows_returned,
-                rows_affected: affected_rows,
-                bytes_returned: result_bytes as u64,
+            Ok(MaterializedResult {
+                stats: ResultStats {
+                    rows_returned,
+                    rows_affected: affected_rows,
+                    bytes_returned: result_bytes as u64,
+                },
+                cached,
             })
         }
         ResultMode::Streaming => {
@@ -1586,13 +2024,69 @@ where
             }
             result.drop_result().await?;
             row_writer.finish().await?;
-            Ok(ResultStats {
-                rows_returned: rows_returned as u64,
-                rows_affected: affected_rows,
-                bytes_returned: result_bytes as u64,
+            Ok(MaterializedResult {
+                stats: ResultStats {
+                    rows_returned: rows_returned as u64,
+                    rows_affected: affected_rows,
+                    bytes_returned: result_bytes as u64,
+                },
+                cached: None,
             })
         }
     }
+}
+
+async fn write_cached_result<W>(
+    result: &CachedResult,
+    writer: QueryResultWriter<'_, W>,
+) -> Result<ResultStats, ProxyError>
+where
+    W: AsyncWrite + Send + Unpin,
+{
+    let columns = result.frontend_columns();
+    let mut row_writer = writer.start(&columns).await?;
+    for row in &result.rows {
+        let values = row.iter().map(Value::from).collect();
+        write_row_values(&mut row_writer, values).await?;
+    }
+    row_writer.finish().await?;
+    Ok(ResultStats {
+        rows_returned: result.rows.len() as u64,
+        rows_affected: 0,
+        bytes_returned: result.bytes_returned,
+    })
+}
+
+fn cache_safe_sql(query: &str) -> bool {
+    let normalized = query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase();
+    const VOLATILE_OR_SESSION_DEPENDENT: [&str; 18] = [
+        "@",
+        "RAND(",
+        "RANDOM(",
+        "NOW(",
+        "SYSDATE(",
+        "UUID(",
+        "UUID_SHORT(",
+        "CURRENT_TIMESTAMP",
+        "CURRENT_USER",
+        "SESSION_USER",
+        "SYSTEM_USER",
+        "USER(",
+        "CONNECTION_ID(",
+        "DATABASE(",
+        "SCHEMA(",
+        "LAST_INSERT_ID(",
+        "SQL_CALC_FOUND_ROWS",
+        "SQL_NO_CACHE",
+    ];
+    normalized.matches("SELECT").count() == 1
+        && !VOLATILE_OR_SESSION_DEPENDENT
+            .iter()
+            .any(|needle| normalized.contains(needle))
 }
 
 fn check_result_limits(
@@ -1629,7 +2123,17 @@ async fn write_row<W>(
 where
     W: AsyncWrite + Send + Unpin,
 {
-    for value in row.unwrap() {
+    write_row_values(writer, row.unwrap()).await
+}
+
+async fn write_row_values<W>(
+    writer: &mut opensrv_mysql::RowWriter<'_, W>,
+    values: Vec<Value>,
+) -> Result<(), ProxyError>
+where
+    W: AsyncWrite + Send + Unpin,
+{
+    for value in values {
         write_value(writer, value)?;
     }
     writer.end_row().await?;
@@ -2019,5 +2523,15 @@ mod tests {
             sql,
             "/* ? */ SELECT * FROM orders WHERE tenant_id = 7 -- ?\n"
         );
+    }
+
+    #[test]
+    fn cache_policy_rejects_volatile_and_session_dependent_reads() {
+        assert!(cache_safe_sql(
+            "SELECT id, name FROM products WHERE id = 42"
+        ));
+        assert!(!cache_safe_sql("SELECT id, NOW() FROM products"));
+        assert!(!cache_safe_sql("SELECT id, @tenant FROM products"));
+        assert!(!cache_safe_sql("SELECT id, CURRENT_USER FROM products"));
     }
 }

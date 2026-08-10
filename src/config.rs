@@ -19,6 +19,10 @@ pub struct Config {
     pub postgres: PostgresConfig,
     #[serde(default)]
     pub redis: RedisConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
+    #[serde(default)]
+    pub control_plane: ControlPlaneConfig,
     pub users: Vec<UserConfig>,
     pub backends: Vec<BackendConfig>,
     #[serde(default)]
@@ -35,6 +39,116 @@ pub struct Config {
     pub health_check: HealthCheckConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ControlPlaneConfig {
+    pub enabled: bool,
+    pub required_at_startup: bool,
+    pub endpoints: Vec<String>,
+    pub key: String,
+    pub poll_interval_seconds: u64,
+    pub request_timeout_seconds: u64,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub tls: ControlPlaneTlsConfig,
+}
+
+impl Default for ControlPlaneConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            required_at_startup: false,
+            endpoints: vec!["http://127.0.0.1:2379".to_owned()],
+            key: "/dbproxy/config/runtime".to_owned(),
+            poll_interval_seconds: 5,
+            request_timeout_seconds: 3,
+            username: None,
+            password: None,
+            tls: ControlPlaneTlsConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ControlPlaneTlsConfig {
+    pub ca_path: Option<PathBuf>,
+    pub client_cert_path: Option<PathBuf>,
+    pub client_key_path: Option<PathBuf>,
+    pub use_webpki_roots: bool,
+}
+
+impl Default for ControlPlaneTlsConfig {
+    fn default() -> Self {
+        Self {
+            ca_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            use_webpki_roots: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeConfigDocument {
+    pub users: Option<Vec<UserConfig>>,
+    pub routing: Option<RoutingConfig>,
+    pub sharding: Option<ShardingConfig>,
+    pub write_fanout: Option<WriteFanoutConfig>,
+    pub cache: Option<CacheConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheConfig {
+    pub enabled: bool,
+    pub redis_url: String,
+    pub key_prefix: String,
+    pub request_timeout_milliseconds: u64,
+    pub max_value_bytes: usize,
+    pub fail_open: bool,
+    pub rules: Vec<CacheRuleConfig>,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            redis_url: "redis://127.0.0.1:6379/".to_owned(),
+            key_prefix: "dbproxy".to_owned(),
+            request_timeout_milliseconds: 100,
+            max_value_bytes: 1_048_576,
+            fail_open: true,
+            rules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheRuleConfig {
+    pub table: String,
+    pub ttl_seconds: u64,
+    pub negative_ttl_seconds: u64,
+    pub ttl_jitter_percent: u8,
+    pub max_rows: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for CacheRuleConfig {
+    fn default() -> Self {
+        Self {
+            table: String::new(),
+            ttl_seconds: 30,
+            negative_ttl_seconds: 5,
+            ttl_jitter_percent: 10,
+            max_rows: 1_000,
+            max_bytes: 1_048_576,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -270,7 +384,7 @@ impl Default for AdminConfig {
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
     pub username: String,
@@ -359,6 +473,8 @@ pub struct BackendConfig {
     pub tls: BackendTlsConfig,
     #[serde(default)]
     pub pool: PoolConfig,
+    #[serde(default)]
+    pub reserved_pool: Option<PoolConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -602,6 +718,8 @@ impl Config {
         }
         self.validate_postgres()?;
         self.validate_redis()?;
+        self.validate_cache()?;
+        self.validate_control_plane()?;
         if self.proxy.server_version.trim().is_empty() {
             return Err(ProxyError::Config(
                 "proxy.server_version cannot be empty".to_owned(),
@@ -703,6 +821,20 @@ impl Config {
                     "backend {:?} has invalid pool bounds {}..={}",
                     backend.name, backend.pool.min, backend.pool.max
                 )));
+            }
+            if let Some(pool) = &backend.reserved_pool {
+                if backend.role != BackendRole::Primary {
+                    return Err(ProxyError::Config(format!(
+                        "backend {:?} configures a reserved pool but is not a primary",
+                        backend.name
+                    )));
+                }
+                if pool.min > pool.max || pool.max == 0 {
+                    return Err(ProxyError::Config(format!(
+                        "backend {:?} has invalid reserved pool bounds {}..={}",
+                        backend.name, pool.min, pool.max
+                    )));
+                }
             }
             parse_backend_address(&backend.address)?;
             validate_backend_tls(backend)?;
@@ -854,6 +986,170 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    fn validate_cache(&self) -> Result<(), ProxyError> {
+        if !self.cache.enabled {
+            return Ok(());
+        }
+        if self.cache.redis_url.trim().is_empty() {
+            return Err(ProxyError::Config(
+                "cache.redis_url cannot be empty when caching is enabled".to_owned(),
+            ));
+        }
+        if self.cache.key_prefix.trim().is_empty()
+            || !self
+                .cache
+                .key_prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
+        {
+            return Err(ProxyError::Config(
+                "cache.key_prefix must contain only letters, digits, '-', '_' or ':'".to_owned(),
+            ));
+        }
+        if self.cache.request_timeout_milliseconds == 0 || self.cache.max_value_bytes == 0 {
+            return Err(ProxyError::Config(
+                "cache timeout and value-size limits must be greater than zero".to_owned(),
+            ));
+        }
+        if self.cache.rules.is_empty() {
+            return Err(ProxyError::Config(
+                "cache.rules must contain at least one explicit table rule".to_owned(),
+            ));
+        }
+        let mut tables = HashSet::new();
+        for rule in &self.cache.rules {
+            let table = rule.table.trim().to_ascii_lowercase();
+            if table.is_empty() {
+                return Err(ProxyError::Config(
+                    "cache rule table cannot be empty".to_owned(),
+                ));
+            }
+            if !tables.insert(table) {
+                return Err(ProxyError::Config(format!(
+                    "duplicate cache rule for table {:?}",
+                    rule.table
+                )));
+            }
+            if rule.ttl_seconds == 0 || rule.max_rows == 0 || rule.max_bytes == 0 {
+                return Err(ProxyError::Config(format!(
+                    "cache rule for {:?} must have positive ttl, row, and byte limits",
+                    rule.table
+                )));
+            }
+            if rule.negative_ttl_seconds > rule.ttl_seconds {
+                return Err(ProxyError::Config(format!(
+                    "cache rule for {:?} has a negative TTL greater than its normal TTL",
+                    rule.table
+                )));
+            }
+            if rule.ttl_jitter_percent > 50 {
+                return Err(ProxyError::Config(format!(
+                    "cache rule for {:?} has ttl_jitter_percent above 50",
+                    rule.table
+                )));
+            }
+            if rule.max_bytes > self.cache.max_value_bytes {
+                return Err(ProxyError::Config(format!(
+                    "cache rule for {:?} exceeds cache.max_value_bytes",
+                    rule.table
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_control_plane(&self) -> Result<(), ProxyError> {
+        if !self.control_plane.enabled {
+            return Ok(());
+        }
+        if self.control_plane.endpoints.is_empty()
+            || self.control_plane.endpoints.iter().any(|endpoint| {
+                !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
+            })
+        {
+            return Err(ProxyError::Config(
+                "control_plane.endpoints must contain at least one HTTP(S) etcd endpoint"
+                    .to_owned(),
+            ));
+        }
+        if self.control_plane.key.trim().is_empty() || !self.control_plane.key.starts_with('/') {
+            return Err(ProxyError::Config(
+                "control_plane.key must be a non-empty absolute etcd key".to_owned(),
+            ));
+        }
+        if self.control_plane.poll_interval_seconds == 0
+            || self.control_plane.request_timeout_seconds == 0
+        {
+            return Err(ProxyError::Config(
+                "control-plane poll and request timeouts must be greater than zero".to_owned(),
+            ));
+        }
+        if self.control_plane.username.is_some() != self.control_plane.password.is_some() {
+            return Err(ProxyError::Config(
+                "control-plane username and password must be configured together".to_owned(),
+            ));
+        }
+        let tls = &self.control_plane.tls;
+        if tls.client_cert_path.is_some() != tls.client_key_path.is_some() {
+            return Err(ProxyError::Config(
+                "control-plane client certificate and key must be configured together".to_owned(),
+            ));
+        }
+        if self
+            .control_plane
+            .endpoints
+            .iter()
+            .all(|endpoint| endpoint.starts_with("http://"))
+            && (tls.ca_path.is_some()
+                || tls.client_cert_path.is_some()
+                || tls.client_key_path.is_some())
+        {
+            return Err(ProxyError::Config(
+                "control-plane TLS material requires at least one HTTPS endpoint".to_owned(),
+            ));
+        }
+        if self
+            .control_plane
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.starts_with("https://"))
+            && !tls.use_webpki_roots
+            && tls.ca_path.is_none()
+        {
+            return Err(ProxyError::Config(
+                "HTTPS control-plane endpoints require public roots or an explicit CA".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn apply_runtime_document(&self, raw: &str) -> Result<Self, ProxyError> {
+        let expanded = expand_environment(raw)?;
+        let document: RuntimeConfigDocument = toml::from_str(&expanded).map_err(|error| {
+            ProxyError::Config(format!(
+                "failed to parse etcd runtime configuration: {error}"
+            ))
+        })?;
+        let mut candidate = self.clone();
+        if let Some(users) = document.users {
+            candidate.users = users;
+        }
+        if let Some(routing) = document.routing {
+            candidate.routing = routing;
+        }
+        if let Some(sharding) = document.sharding {
+            candidate.sharding = sharding;
+        }
+        if let Some(write_fanout) = document.write_fanout {
+            candidate.write_fanout = write_fanout;
+        }
+        if let Some(cache) = document.cache {
+            candidate.cache = cache;
+        }
+        candidate.validate()?;
+        Ok(candidate)
     }
 
     fn validate_postgres(&self) -> Result<(), ProxyError> {
@@ -1461,6 +1757,116 @@ mod tests {
         "#;
         let config: Config = toml::from_str(raw).unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn cache_requires_explicit_bounded_unique_rules() {
+        let raw = r#"
+            [proxy]
+            listen = "127.0.0.1:3307"
+
+            [cache]
+            enabled = true
+            redis_url = "redis://cache.internal:6379/"
+            max_value_bytes = 1024
+
+            [[cache.rules]]
+            table = "products"
+            ttl_seconds = 30
+            negative_ttl_seconds = 5
+            max_rows = 10
+            max_bytes = 1024
+
+            [[users]]
+            username = "app"
+            password = "secret"
+
+            [[backends]]
+            name = "one"
+            address = "127.0.0.1:3306"
+            role = "primary"
+            username = "root"
+            password = ""
+        "#;
+        let config: Config = toml::from_str(raw).unwrap();
+        config.validate().unwrap();
+
+        let mut invalid = config;
+        invalid.cache.rules.push(invalid.cache.rules[0].clone());
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate cache rule")
+        );
+    }
+
+    #[test]
+    fn runtime_document_updates_only_declared_mysql_policy() {
+        let raw = r#"
+            [proxy]
+            listen = "127.0.0.1:3307"
+
+            [[users]]
+            username = "old"
+            password = "secret"
+
+            [[backends]]
+            name = "one"
+            address = "127.0.0.1:3306"
+            role = "primary"
+            username = "root"
+            password = ""
+        "#;
+        let config: Config = toml::from_str(raw).unwrap();
+        config.validate().unwrap();
+        let runtime = r#"
+            [[users]]
+            username = "new"
+            password = "new-secret"
+
+            [routing]
+            read_write_split = false
+            fallback_to_primary = true
+            read_after_write_seconds = 7
+            reject_multi_statements = true
+        "#;
+        let updated = config.apply_runtime_document(runtime).unwrap();
+        assert_eq!(updated.users[0].username, "new");
+        assert!(!updated.routing.read_write_split);
+        assert_eq!(updated.routing.read_after_write_seconds, 7);
+        assert_eq!(updated.backends[0].name, "one");
+        assert_eq!(updated.proxy.listen, config.proxy.listen);
+    }
+
+    #[test]
+    fn control_plane_rejects_partial_credentials() {
+        let raw = r#"
+            [proxy]
+            listen = "127.0.0.1:3307"
+
+            [[users]]
+            username = "app"
+            password = "secret"
+
+            [[backends]]
+            name = "one"
+            address = "127.0.0.1:3306"
+            role = "primary"
+            username = "root"
+            password = ""
+        "#;
+        let mut config: Config = toml::from_str(raw).unwrap();
+        config.control_plane.enabled = true;
+        config.control_plane.username = Some("dbproxy".to_owned());
+        assert!(
+            config
+                .validate_control_plane()
+                .unwrap_err()
+                .to_string()
+                .contains("configured together")
+        );
     }
 
     #[test]

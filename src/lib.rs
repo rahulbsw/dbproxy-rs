@@ -1,9 +1,11 @@
 pub mod admin;
 pub mod auth;
 pub mod backend;
+pub mod cache;
 pub mod capabilities;
 pub mod classifier;
 pub mod config;
+pub mod control_plane;
 pub mod data_sharding;
 pub mod error;
 pub mod metrics;

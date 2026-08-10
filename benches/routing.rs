@@ -36,6 +36,7 @@ fn shard_router() -> ShardRouter {
             database: None,
             tls: BackendTlsConfig::default(),
             pool: PoolConfig::default(),
+            reserved_pool: None,
         })
         .collect::<Vec<_>>();
     ShardRouter::new(&config, &backends)

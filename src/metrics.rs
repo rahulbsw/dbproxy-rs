@@ -80,6 +80,20 @@ pub struct Metrics {
     redis_command_routing_failures: AtomicU64,
     redis_fanout_subcommands: AtomicU64,
     redis_partial_write_failures: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    cache_bypasses: AtomicU64,
+    cache_errors: AtomicU64,
+    cache_fills: AtomicU64,
+    cache_fill_rejections: AtomicU64,
+    cache_invalidations: AtomicU64,
+    cache_invalidation_failures: AtomicU64,
+    cache_singleflight_waiters: AtomicU64,
+    cache_bytes_served: AtomicU64,
+    config_epoch: AtomicU64,
+    config_reload_successes: AtomicU64,
+    config_reload_failures: AtomicU64,
+    config_poll_failures: AtomicU64,
 }
 
 impl Metrics {
@@ -367,6 +381,61 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn cache_hit(&self, bytes: u64) {
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        self.cache_bytes_served.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn cache_miss(&self) {
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_bypass(&self) {
+        self.cache_bypasses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_error(&self) {
+        self.cache_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_fill(&self) {
+        self.cache_fills.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_fill_rejected(&self) {
+        self.cache_fill_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_invalidation(&self) {
+        self.cache_invalidations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_invalidation_failed(&self) {
+        self.cache_invalidation_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_singleflight_waiter(&self) {
+        self.cache_singleflight_waiters
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn config_epoch(&self, epoch: u64) {
+        self.config_epoch.store(epoch, Ordering::Release);
+    }
+
+    pub fn config_reload_succeeded(&self) {
+        self.config_reload_successes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn config_reload_failed(&self) {
+        self.config_reload_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn config_poll_failed(&self) {
+        self.config_poll_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn encode_prometheus(&self) -> String {
         let mut output = String::with_capacity(4096);
         labeled_metric(
@@ -539,6 +608,104 @@ impl Metrics {
             "counter",
             "Result sets forwarded row-by-row without full buffering.",
             self.streaming_result_sets.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_hits_total",
+            "counter",
+            "MySQL result-cache hits.",
+            self.cache_hits.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_misses_total",
+            "counter",
+            "MySQL result-cache misses.",
+            self.cache_misses.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_bypasses_total",
+            "counter",
+            "Queries bypassing cache because of policy or consistency state.",
+            self.cache_bypasses.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_errors_total",
+            "counter",
+            "Redis/Valkey cache request and decoding errors.",
+            self.cache_errors.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_fills_total",
+            "counter",
+            "Successful result-cache fills.",
+            self.cache_fills.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_fill_rejections_total",
+            "counter",
+            "Results not cached because they exceeded a rule limit.",
+            self.cache_fill_rejections.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_invalidations_total",
+            "counter",
+            "Committed table/shard cache-version increments.",
+            self.cache_invalidations.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_invalidation_failures_total",
+            "counter",
+            "Cache-version increments that failed after a database commit.",
+            self.cache_invalidation_failures.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_singleflight_waiters_total",
+            "counter",
+            "Cache misses coalesced behind an in-process fill.",
+            self.cache_singleflight_waiters.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_bytes_served_total",
+            "counter",
+            "Serialized result-cache bytes served on hits.",
+            self.cache_bytes_served.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_config_epoch",
+            "gauge",
+            "Active immutable etcd routing-configuration revision (zero for local config).",
+            self.config_epoch.load(Ordering::Acquire),
+        );
+        metric(
+            &mut output,
+            "dbproxy_config_reload_successes_total",
+            "counter",
+            "Valid etcd runtime generations atomically activated.",
+            self.config_reload_successes.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_config_reload_failures_total",
+            "counter",
+            "New etcd generations rejected during parsing, validation, or cache setup.",
+            self.config_reload_failures.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_config_poll_failures_total",
+            "counter",
+            "Failed etcd revision-poll operations while retaining last-known-good config.",
+            self.config_poll_failures.load(Ordering::Relaxed),
         );
         metric(
             &mut output,

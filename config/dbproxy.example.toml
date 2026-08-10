@@ -25,6 +25,24 @@ listen = "127.0.0.1:6071"
 max_connections = 32
 request_timeout_seconds = 5
 
+[control_plane]
+# Optional etcd v3 JSON-gateway control plane. It is polled for immutable
+# routing revisions and is never part of the query path.
+enabled = false
+required_at_startup = false
+endpoints = ["https://etcd.internal:2379"]
+key = "/dbproxy/production/runtime"
+poll_interval_seconds = 5
+request_timeout_seconds = 3
+# username = "dbproxy"
+# password = "replace-with-an-environment-reference-in-your-private-config"
+
+[control_plane.tls]
+use_webpki_roots = false
+# ca_path = "/etc/dbproxy/tls/etcd-ca.pem"
+# client_cert_path = "/etc/dbproxy/tls/etcd-client.pem"
+# client_key_path = "/etc/dbproxy/tls/etcd-client-key.pem"
+
 [postgres]
 # PostgreSQL/TimescaleDB forwarding is disabled in the starter topology.
 # When enabled, clients authenticate directly with the selected PostgreSQL
@@ -115,6 +133,27 @@ enabled = false
 # The Redis adapter also supports Valkey because both use RESP.
 strategy = "hash"
 
+[cache]
+# Optional MySQL read-through result cache. This is separate from the Redis
+# proxy listener above and connects directly to an existing Redis/Valkey cache.
+enabled = false
+redis_url = "redis://127.0.0.1:6379/"
+key_prefix = "dbproxy"
+request_timeout_milliseconds = 100
+max_value_bytes = 1048576
+# Cache failures bypass Redis and read from MySQL. Set false only when the cache
+# is a required service dependency.
+fail_open = true
+
+# Rules are explicit: arbitrary SELECT statements are never cached globally.
+# [[cache.rules]]
+# table = "products"
+# ttl_seconds = 30
+# negative_ttl_seconds = 5
+# ttl_jitter_percent = 10
+# max_rows = 1000
+# max_bytes = 1048576
+
 # [[redis_backends]]
 # name = "redis-primary"
 # address = "redis-primary.internal:6379"
@@ -157,6 +196,15 @@ mode = "disabled"
 [backends.pool]
 min = 2
 max = 64
+connection_ttl_seconds = 300
+inactive_ttl_seconds = 60
+
+# Optional isolation for transactions and non-replayable session state. These
+# connections are additional to pool.max and must be included in the database
+# connection budget.
+[backends.reserved_pool]
+min = 1
+max = 8
 connection_ttl_seconds = 300
 inactive_ttl_seconds = 60
 

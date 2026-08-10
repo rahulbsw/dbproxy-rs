@@ -25,7 +25,7 @@ The live status is also available from `GET /capabilities` and
 | Cross-shard joins | Distributed query planner | Require bounded join strategies, cardinality limits, spill policy, and type/collation compatibility |
 | Automatic table rewriting | AST and catalog layer | Apply dialect-aware rewrites only against a versioned schema snapshot and verify generated SQL before routing |
 | Runtime reload | Versioned control plane | Parse and validate immutable snapshots, publish one epoch atomically, and drain resources removed by the old epoch |
-| Query cache | Coherence subsystem | Require bounded memory, identity/session-aware keys, transaction-safe invalidation, and explicit staleness policy |
+| Query cache | Implemented, constrained | Explicit MySQL table rules use bounded Redis/Valkey values, per-process singleflight, replica-eligible text/prepared reads, and commit-aware table/shard generations; streaming reads and bypass writes remain uncached |
 | Admin SQL | Authenticated control plane | Keep separate from data credentials; add authorization, audit records, deadlines, and read-only defaults |
 | Atomic write fanout | Durable coordinator | Implement MySQL XA decision journaling, recovery, idempotency, and in-doubt transaction operations |
 
@@ -79,9 +79,9 @@ versioned catalog used for metadata validation.
 ### Phase 5: durable writes and online movement
 
 Atomic fanout requires a durable XA decision journal and restart recovery before
-it can be used for resharding dual writes. Query caching is not enabled for
-fanout or migration traffic until invalidation is tied to the same committed
-configuration and transaction epochs.
+it can be used for resharding dual writes. The constrained cache must remain
+disabled for fanout or migration traffic until invalidation is tied to the same
+committed configuration and transaction epochs.
 
 ## Non-negotiable invariants
 

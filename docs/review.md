@@ -69,6 +69,10 @@
 - Streaming mode cannot replace a partially emitted result with a MySQL error;
   mid-stream failures close the client connection and require application retry.
 - Runtime configuration changes require restart.
+- MySQL result caching is opt-in per table and transaction-aware for writes
+  passing through DBProxy. Streaming reads and direct database writes bypass
+  its coherence contract; use bounded TTLs or an external CDC
+  invalidator for those topologies.
 - PostgreSQL forwarding is connection-pinned and does not yet provide protocol
   termination, transaction pooling, or SQL-level read/write splitting.
 - PostgreSQL startup sharding cannot coexist with native end-to-end TLS because

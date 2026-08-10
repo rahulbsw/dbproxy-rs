@@ -29,6 +29,14 @@ async fn binary_prepared_statements_route_through_proxy() {
         .await
         .expect("execute a binary prepared read");
     assert_eq!(marker.as_deref(), Some("replica"));
+    let cached_marker: Option<String> = connection
+        .exec_first(
+            "SELECT marker FROM backend_identity WHERE id = :id",
+            params! {"id" => 1_u8},
+        )
+        .await
+        .expect("repeat a binary prepared read through cache");
+    assert_eq!(cached_marker.as_deref(), Some("replica"));
 
     connection
         .exec_drop(
@@ -51,6 +59,95 @@ async fn binary_prepared_statements_route_through_proxy() {
         .expect("read the prepared write from the primary consistency window");
     assert_eq!(primary_visible, Some(1));
 
+    connection.disconnect().await.expect("disconnect cleanly");
+}
+
+#[tokio::test]
+#[ignore = "requires `docker compose up --build --detach --wait`"]
+async fn mysql_read_through_cache_records_a_hit() {
+    let opts = Opts::from(
+        OptsBuilder::default()
+            .ip_or_hostname("127.0.0.1")
+            .tcp_port(6033)
+            .user(Some("app"))
+            .pass(Some("app-secret"))
+            .db_name(Some("app")),
+    );
+    let mut connection = Conn::new(opts)
+        .await
+        .expect("connect to the Docker DBProxy listener");
+    let query = "SELECT marker FROM backend_identity WHERE id = 1 /* cache integration */";
+
+    for _ in 0..2 {
+        let marker: Option<String> = connection
+            .query_first(query)
+            .await
+            .expect("execute a cacheable text read");
+        assert_eq!(marker.as_deref(), Some("replica"));
+    }
+
+    let metrics = fetch_admin_metrics().await;
+    let hits = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("dbproxy_cache_hits_total "))
+        .and_then(|value| value.parse::<u64>().ok())
+        .expect("cache hit metric is present and numeric");
+    assert!(hits >= 1, "expected at least one cache hit, got {hits}");
+    connection.disconnect().await.expect("disconnect cleanly");
+}
+
+#[tokio::test]
+#[ignore = "requires `docker compose up --build --detach --wait`"]
+async fn mysql_cache_invalidation_advances_only_on_commit() {
+    let opts = Opts::from(
+        OptsBuilder::default()
+            .ip_or_hostname("127.0.0.1")
+            .tcp_port(6033)
+            .user(Some("app"))
+            .pass(Some("app-secret"))
+            .db_name(Some("app")),
+    );
+    let mut connection = Conn::new(opts)
+        .await
+        .expect("connect to the Docker DBProxy listener");
+    let version_key = b"dbproxy-test:version:app:proxy_write_test:default";
+    let before = redis_optional_u64(version_key).await;
+
+    connection
+        .query_drop("START TRANSACTION")
+        .await
+        .expect("start rollback transaction");
+    connection
+        .query_drop(
+            "INSERT INTO proxy_write_test(id, message) VALUES (9101, 'rollback cache test') \
+             ON DUPLICATE KEY UPDATE message = VALUES(message)",
+        )
+        .await
+        .expect("write inside rollback transaction");
+    assert_eq!(redis_optional_u64(version_key).await, before);
+    connection
+        .query_drop("ROLLBACK")
+        .await
+        .expect("rollback transaction");
+    assert_eq!(redis_optional_u64(version_key).await, before);
+
+    connection
+        .query_drop("START TRANSACTION")
+        .await
+        .expect("start commit transaction");
+    connection
+        .query_drop(
+            "INSERT INTO proxy_write_test(id, message) VALUES (9102, 'commit cache test') \
+             ON DUPLICATE KEY UPDATE message = VALUES(message)",
+        )
+        .await
+        .expect("write inside commit transaction");
+    assert_eq!(redis_optional_u64(version_key).await, before);
+    connection
+        .query_drop("COMMIT")
+        .await
+        .expect("commit transaction");
+    assert_eq!(redis_optional_u64(version_key).await, before + 1);
     connection.disconnect().await.expect("disconnect cleanly");
 }
 
@@ -157,6 +254,17 @@ async fn redis_command(port: u16, arguments: &[&[u8]]) -> RedisReply {
     read_resp_reply(&mut stream).await
 }
 
+async fn redis_optional_u64(key: &[u8]) -> u64 {
+    match redis_command(6380, &[b"GET", key]).await {
+        RedisReply::Bulk(Some(value)) => std::str::from_utf8(&value)
+            .expect("cache version is UTF-8")
+            .parse()
+            .expect("cache version is numeric"),
+        RedisReply::Bulk(None) => 0,
+        reply => panic!("unexpected cache version reply: {reply:?}"),
+    }
+}
+
 async fn write_resp_command(stream: &mut TcpStream, arguments: &[&[u8]]) {
     let mut request = format!("*{}\r\n", arguments.len()).into_bytes();
     for argument in arguments {
@@ -218,4 +326,24 @@ async fn read_crlf_line(stream: &mut TcpStream) -> Vec<u8> {
         line.push(byte);
         assert!(line.len() <= 64 * 1024, "Redis reply line is too long");
     }
+}
+
+async fn fetch_admin_metrics() -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", 6071))
+        .await
+        .expect("connect to the DBProxy admin listener");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("request metrics");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read metrics response");
+    let response = String::from_utf8(response).expect("metrics response is UTF-8");
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_owned())
+        .expect("metrics response has HTTP headers")
 }

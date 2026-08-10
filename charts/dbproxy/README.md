@@ -2,6 +2,8 @@
 
 This chart runs DBProxy as independent active-active data-plane replicas. It
 does not add consensus, shared session state, or distributed transactions.
+DBProxy's optional etcd control plane can distribute immutable MySQL policy
+generations across the replicas while transactions remain local and pinned.
 
 The repository deployer creates or checks the credentials Secret and performs
 an atomic Helm upgrade in one command. Supply a private values file containing
@@ -36,6 +38,12 @@ separately managed configuration, or replace `config.content`. Environment
 references such as `${DBPROXY_BACKEND_PASSWORD}` are expanded by DBProxy at
 startup.
 
+To use shared runtime policy, enable `[control_plane]` in `config.content`, use
+HTTPS/mTLS for etcd, and add `DBPROXY_ETCD_PASSWORD` to the external Secret.
+The pod identity needs read-only access to its exact etcd key. Active sessions
+drain on their original revision; backend or listener changes still use a
+rolling Helm upgrade.
+
 Enable protocol service ports only when the matching listener is enabled in the
 TOML configuration. The admin service exposes health, topology, and metrics and
 should be restricted by NetworkPolicy or an authenticated monitoring path.
@@ -48,6 +56,10 @@ backend group is:
 ```text
 replicaCount × pool.max × number of matching DBProxy backend entries
 ```
+
+Add `replicaCount × reserved_pool.max` for each primary that enables affinity
+isolation. The reserve protects transaction completion; it does not reduce the
+database connection budget.
 
 PostgreSQL and Redis transparent modes use one backend connection per active
 client, per pod. Redis command mode may open up to

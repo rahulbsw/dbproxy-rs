@@ -80,6 +80,30 @@ shard_command = "DBPROXY.SHARD"
 [redis.sharding]
 enabled = false
 
+[cache]
+enabled = true
+redis_url = "redis://:redis-secret@redis-primary:6379/"
+key_prefix = "dbproxy-test"
+request_timeout_milliseconds = 500
+max_value_bytes = 1048576
+fail_open = false
+
+[[cache.rules]]
+table = "backend_identity"
+ttl_seconds = 30
+negative_ttl_seconds = 5
+ttl_jitter_percent = 0
+max_rows = 10
+max_bytes = 65536
+
+[[cache.rules]]
+table = "proxy_write_test"
+ttl_seconds = 30
+negative_ttl_seconds = 5
+ttl_jitter_percent = 0
+max_rows = 100
+max_bytes = 65536
+
 [[redis_backends]]
 name = "redis-primary"
 address = "redis-primary:6379"
@@ -107,6 +131,12 @@ database = "app"
 [backends.pool]
 min = 1
 max = 16
+connection_ttl_seconds = 300
+inactive_ttl_seconds = 60
+
+[backends.reserved_pool]
+min = 1
+max = 4
 connection_ttl_seconds = 300
 inactive_ttl_seconds = 60
 

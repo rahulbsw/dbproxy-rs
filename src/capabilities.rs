@@ -112,13 +112,13 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "runtime_configuration_reload",
-        status: CapabilityStatus::Planned,
-        contract: "requires versioned immutable snapshots and connection draining",
+        status: CapabilityStatus::Constrained,
+        contract: "optional etcd revisions atomically update MySQL users, routing, sharding, fanout, and cache for new sessions while active transactions drain on their original generation",
     },
     Capability {
         name: "query_cache",
-        status: CapabilityStatus::Planned,
-        contract: "requires transaction-aware invalidation and bounded memory",
+        status: CapabilityStatus::Constrained,
+        contract: "explicit MySQL table rules, bounded Redis/Valkey values, singleflight fills, and commit-aware generation invalidation",
     },
     Capability {
         name: "admin_sql",

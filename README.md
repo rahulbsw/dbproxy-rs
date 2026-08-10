@@ -33,9 +33,10 @@ graduation criteria.
 | Redis / Valkey command mode | Bounded command parsing and proxy-side key placement | Command key and listener role | CRC16 hash tags or stable hash, range, and exact value; guarded multi-key fanout | One connection per used shard for each client session |
 
 DBProxy processes are independent and can run active-active behind a TCP load
-balancer. They do not form a consensus cluster or share runtime state. Every
-instance must receive the same configuration and routing epoch from an external
-deployment system.
+balancer. They do not form a consensus cluster or share transaction state. An
+optional etcd control plane distributes immutable MySQL routing generations;
+etcd is never consulted on the query path, and each transaction drains on the
+generation on which its client session started.
 
 ## Architecture at a glance
 
@@ -76,6 +77,8 @@ flowchart LR
 | [Architecture](docs/architecture.md) | Data paths, routing, consistency, failure, and security model |
 | [Operations and metrics](docs/operations.md) | Readiness, Prometheus metrics, alerts, and capacity tuning |
 | [Protocol sharding](docs/protocol-sharding.md) | PostgreSQL, TimescaleDB, Redis, and Valkey routing contracts |
+| [MySQL cache](docs/cache.md) | Read-through rules, consistency, failure, and invalidation contracts |
+| [Shared etcd config](docs/control-plane.md) | Runtime generation scope, security, last-known-good, and draining behavior |
 | [Database/network review](docs/review.md) | Correctness review and intentional production boundaries |
 | [Advanced roadmap](docs/advanced-features.md) | XA, scatter/gather, online resharding, and acceptance gates |
 | [Contributing](CONTRIBUTING.md) | Development workflow and change expectations |
@@ -98,11 +101,15 @@ flowchart LR
 - bounded-concurrent fanout to prevent target-count latency from growing
   serially
 - conservative primary routing on parse failures and locking reads
-- weighted round-robin across healthy replicas
+- load-aware weighted round-robin across healthy replica pools
 - automatic fallback to the primary (configurable)
 - backend connection pools with reset-on-return
+- optional primary reserved pools isolating transactions and pinned session
+  state from ordinary autocommit traffic
 - transaction, `USE`, `SET`, and prepared-statement connection affinity
 - configurable read-after-write consistency window
+- optional bounded Redis/Valkey read-through caching for explicitly configured
+  MySQL tables, with singleflight fills and commit-aware invalidation
 - SQL substring deny rules and multi-statement rejection
 - active backend health checks and automatic recovery
 - client/admin admission limits and I/O deadlines
@@ -570,8 +577,9 @@ recommendations.
   support resuming after a mid-stream backend failure
 - scatter/gather queries, cross-shard joins, and automatic table rewriting are
   not implemented
-- dynamic runtime configuration, query cache, and an admin SQL
-  interface are out of scope for this first release
+- runtime etcd generations currently cover MySQL users, routing, sharding,
+  fanout, and cache policy; listener, backend, PostgreSQL, and Redis topology
+  changes still require restart, and an admin SQL interface is out of scope
 - write fanout reports partial failures but is not a distributed transaction
 
 See [docs/architecture.md](docs/architecture.md) for design details.

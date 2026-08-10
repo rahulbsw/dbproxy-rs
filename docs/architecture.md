@@ -4,6 +4,9 @@
 
 MySQL is protocol-terminated so DBProxy can parse SQL, pool backend
 connections, route individual statements, and enforce transaction affinity.
+Primary and replica backends already own independent bounded pools. Replica
+selection preserves configured weights among similarly loaded pools and avoids
+a pool whose in-use-plus-waiter pressure is materially higher than its peers.
 
 PostgreSQL/TimescaleDB is transparent and connection-pinned:
 
@@ -74,6 +77,9 @@ flowchart LR
     K --> S["Session state"]
     S -->|"writes / transactions / affinity"| HP["Selected shard primary"]
     S -->|"safe reads"| HR["Selected shard replicas"]
+    S -->|"cacheable read"| RC["Redis/Valkey result cache"]
+    RC -->|"miss + singleflight"| HR
+    HP -->|"commit generation"| RC
     K -->|"configured DML copies"| FW["Fanout shard primaries"]
     HR -->|"none healthy and fallback enabled"| HP
     HC["Health monitor"] --> HP
@@ -122,6 +128,12 @@ or protocol-uncertain connections are disconnected rather than returned for
 reuse. Client reads/writes and admin request lines also have deadlines, and both
 listeners enforce independent admission limits.
 
+A primary can configure `reserved_pool`. `BEGIN` and non-replayable session
+state acquire from that independent pool, preventing a burst of ordinary
+autocommit work from consuming every connection needed to finish existing
+transactions. If no reserve is configured, affinity uses the normal primary
+pool. Reserved capacity is additive and must be included in database limits.
+
 ## Consistency
 
 Three rules prevent the common read/write-split correctness failures:
@@ -132,6 +144,37 @@ Three rules prevent the common read/write-split correctness failures:
 
 The time window is not a substitute for replication-position tracking. A future
 GTID-aware mode can replace it without changing the classifier interface.
+
+## Active-active transactions and configuration epochs
+
+An L4 load balancer selects one DBProxy process when a client opens its TCP
+connection. That process owns the MySQL protocol session. `BEGIN` pins the
+selected shard, primary backend connection, and immutable configuration
+generation until `COMMIT` or `ROLLBACK` succeeds.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as L4 load balancer
+    participant P as DBProxy pod (epoch 42)
+    participant D as Shard primary
+    participant E as etcd
+    C->>L: Open TCP connection
+    L->>P: Select one pod
+    C->>P: BEGIN
+    P->>D: Pin pooled connection
+    E-->>P: Publish epoch 43
+    Note over P: Existing session retains epoch 42
+    C->>P: Statements and COMMIT
+    P->>D: Same connection through COMMIT
+    Note over P: New sessions use epoch 43
+```
+
+etcd stores policy, never transaction state. If the pod or its connection dies,
+the database rolls back an open transaction and the client must retry the whole
+unit of work. DBProxy does not claim transparent transaction resume. Atomic
+cross-shard work remains disabled until the durable XA/2PC coordinator in the
+advanced roadmap is implemented.
 
 ## Failure model
 

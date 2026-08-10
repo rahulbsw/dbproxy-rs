@@ -59,6 +59,10 @@ impl SessionState {
         self.in_transaction || self.session_pinned
     }
 
+    pub fn in_transaction(&self) -> bool {
+        self.in_transaction
+    }
+
     fn requires_primary_consistency(&self) -> bool {
         self.last_write
             .is_some_and(|last_write| last_write.elapsed() < self.read_after_write)
