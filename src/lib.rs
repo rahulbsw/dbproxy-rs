@@ -16,6 +16,7 @@ pub mod redis;
 pub mod routing;
 pub mod sharding;
 pub mod tls;
+pub mod xa;
 
 pub use config::Config;
 pub use proxy::Proxy;

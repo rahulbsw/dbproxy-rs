@@ -62,13 +62,15 @@
 
 ## Intentional production boundaries
 
-- Synchronous fanout is not atomic and has no durable retry ledger. Prefer native
-  replication for identical copies or CDC/outbox/XA for recoverable delivery.
-- Scatter/gather, cross-shard aggregation, distributed transactions, and online
-  resharding are not implemented.
+- Default synchronous fanout is non-atomic. Optional MySQL XA provides durable
+  atomicity only for allowlisted autocommit DML; it does not span a client
+  transaction or remove schema/application idempotency requirements.
+- Scatter/gather, cross-shard aggregation, general distributed transactions,
+  and online resharding are not implemented.
 - Streaming mode cannot replace a partially emitted result with a MySQL error;
   mid-stream failures close the client connection and require application retry.
-- Runtime configuration changes require restart.
+- etcd can reload scoped MySQL policy. XA durability, listeners, and backend or
+  protocol topology remain restart-only.
 - MySQL result caching is opt-in per table and transaction-aware for writes
   passing through DBProxy. Streaming reads and direct database writes bypass
   its coherence contract; use bounded TTLs or an external CDC

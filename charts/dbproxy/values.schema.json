@@ -5,8 +5,8 @@
   "properties": {
     "replicaCount": {
       "type": "integer",
-      "minimum": 2,
-      "description": "At least two independent replicas are required for active-active availability."
+      "minimum": 1,
+      "description": "Use at least two replicas for stateless active-active availability; durable XA Deployment mode requires exactly one."
     },
     "image": {
       "type": "object",
@@ -27,6 +27,18 @@
       }
     },
     "terminationGracePeriodSeconds": {"type": "integer", "minimum": 1},
+    "persistence": {
+      "type": "object",
+      "required": ["enabled", "accessModes", "size", "mountPath"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "existingClaim": {"type": "string"},
+        "storageClass": {"type": "string"},
+        "accessModes": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "size": {"type": "string", "minLength": 1},
+        "mountPath": {"type": "string", "pattern": "^/"}
+      }
+    },
     "service": {
       "type": "object",
       "properties": {

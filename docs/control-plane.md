@@ -7,7 +7,9 @@ database request latency.
 
 The local TOML file is the bootstrap and last-known-good configuration. The
 etcd key contains a TOML fragment with any of these top-level sections:
-`users`, `routing`, `sharding`, `write_fanout`, and `cache`. Listener addresses,
+`users`, `routing`, `sharding`, ordinary `write_fanout`, and `cache`. XA atomic
+mode, its journal path/size, participant bound, and recovery timeout are
+restart-only. Listener addresses,
 backend credentials/topology, PostgreSQL/TimescaleDB, Redis/Valkey proxy
 topology, health checks, and TLS listener identity remain bootstrap settings and
 require a rolling restart.

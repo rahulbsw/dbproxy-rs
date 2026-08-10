@@ -6,11 +6,16 @@ metadata:
     {{- include "dbproxy.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- if .Values.persistence.enabled }}
+  strategy:
+    type: Recreate
+  {{- else }}
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxUnavailable: 0
       maxSurge: 1
+  {{- end }}
   selector:
     matchLabels:
       {{- include "dbproxy.selectorLabels" . | nindent 6 }}
@@ -82,6 +87,10 @@ spec:
             - name: config
               mountPath: /etc/dbproxy
               readOnly: true
+            {{- if .Values.persistence.enabled }}
+            - name: xa-journal
+              mountPath: {{ .Values.persistence.mountPath }}
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -92,6 +101,11 @@ spec:
             items:
               - key: {{ .Values.config.key }}
                 path: {{ .Values.config.key }}
+        {{- if .Values.persistence.enabled }}
+        - name: xa-journal
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-xa" (include "dbproxy.fullname" .)) .Values.persistence.existingClaim }}
+        {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

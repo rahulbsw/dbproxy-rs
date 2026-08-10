@@ -110,6 +110,7 @@ async fn handle(
             ),
             "/readyz"
                 if backends.ready()
+                    && metrics.xa_ready()
                     && postgres_backends
                         .as_ref()
                         .is_none_or(|manager| manager.ready())
@@ -126,7 +127,11 @@ async fn handle(
             "/readyz" => (
                 "503 Service Unavailable",
                 "application/json",
-                "{\"status\":\"not_ready\",\"reason\":\"primary_unhealthy\"}\n".to_owned(),
+                if metrics.xa_ready() {
+                    "{\"status\":\"not_ready\",\"reason\":\"primary_unhealthy\"}\n".to_owned()
+                } else {
+                    "{\"status\":\"not_ready\",\"reason\":\"xa_in_doubt\"}\n".to_owned()
+                },
             ),
             "/backends" => (
                 "200 OK",

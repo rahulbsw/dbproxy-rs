@@ -172,9 +172,10 @@ sequenceDiagram
 
 etcd stores policy, never transaction state. If the pod or its connection dies,
 the database rolls back an open transaction and the client must retry the whole
-unit of work. DBProxy does not claim transparent transaction resume. Atomic
-cross-shard work remains disabled until the durable XA/2PC coordinator in the
-advanced roadmap is implemented.
+unit of work. DBProxy does not claim transparent transaction resume. The
+separate constrained XA path covers only one allowlisted autocommit DML
+statement across MySQL fanout participants; it does not distribute this client
+transaction.
 
 ## Failure model
 
@@ -189,9 +190,9 @@ advanced roadmap is implemented.
 - Any unhealthy shard primary makes `/readyz` return HTTP 503.
 - Readiness remains false until each primary has completed at least one
   successful health check.
-- Required fanout failures are returned to the client. Fanout targets execute
-  with bounded concurrency and are not atomic: any subset may already have
-  committed when another target fails.
+- Default fanout targets execute with bounded concurrency and can partially
+  complete. Optional MySQL XA fanout uses a fsynced single-writer journal;
+  pre-decision failures abort and post-decision failures remain recoverable.
 - Backend errors become MySQL error packets instead of panicking the client
   task.
 - Connection admission is bounded before allocating a session.

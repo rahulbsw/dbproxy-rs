@@ -114,5 +114,12 @@ The deployer reduces command count; it does not remove the need to:
 - test failover, pool exhaustion, partial fanout, and shutdown behavior;
 - monitor `/readyz`, backend health, pool saturation, and routing failures.
 
+For MySQL XA atomic fanout, set `replicaCount: 1` and
+`persistence.enabled: true`; the chart mounts a single-writer PVC at
+`/var/lib/dbproxy` and switches updates to `Recreate` so the journal is never
+mounted by two Deployment pods. Run separate one-replica releases with separate
+PVCs for active-active XA. Never place the decision journal on `emptyDir`; see
+[the XA guide](mysql-xa.md).
+
 See the [Helm chart guide](../charts/dbproxy/README.md) and
 [operations guide](operations.md) for these contracts.

@@ -29,6 +29,8 @@ Completed:
   command-mode read-only enforcement
 - NanoID operation identifiers for bounded-cardinality log correlation
 - a hardened active-active Helm deployment with independent stateless replicas
+- constrained MySQL XA fanout for allowlisted autocommit DML, with a checksummed
+  fsynced journal, bounded participants, restart recovery, and in-doubt metrics
 
 Run the live protocol and routing suite with Docker Compose or Podman Compose;
 the script auto-detects a running runtime:
@@ -44,8 +46,9 @@ override auto-detection.
 
 ## Distributed-atomic write fanout
 
-The first atomic mode will target MySQL XA transactions. It must use the routed
-primary and every fanout primary as XA participants.
+The first atomic mode targets MySQL XA transactions and uses the routed primary
+and every fanout primary as XA participants. The state machine below is now
+implemented; see [mysql-xa.md](mysql-xa.md) for its operating contract.
 
 Required state machine:
 
@@ -58,16 +61,15 @@ Required state machine:
 7. issue `XA COMMIT` to every participant;
 8. durably mark the transaction complete and compact completed records.
 
-Any failure before the commit decision must drive `XA ROLLBACK`. A failure after
-the durable commit decision is an in-doubt commit, not a rollback: background
-recovery must continue `XA COMMIT` until every participant confirms completion.
+Any failure before the commit decision drives `XA ROLLBACK`. A failure after
+the durable commit decision is an in-doubt commit, not a rollback. The current
+release retries recovery during startup and withholds readiness until
+completion; online background reconciliation and an operator admin endpoint
+remain follow-up work.
 
-Startup readiness must remain false while the coordinator scans its journal,
-queries `XA RECOVER`, and reconciles known transactions. Unknown prepared XA
-transactions must never be guessed; they require an operator-visible quarantine
-state. The journal needs checksums, versioned records, fsync, compaction, and a
-single-writer lock so two DBProxy processes cannot coordinate from the same
-path.
+Startup does not accept traffic until the coordinator scans its checksummed,
+versioned journal and reconciles known decisions. Unknown prepared XA
+transactions are not adopted or guessed; operators must inspect them directly.
 
 Initial constraints:
 

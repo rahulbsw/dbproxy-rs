@@ -154,10 +154,17 @@ strategy = "hash"
 
 [write_fanout]
 enabled = true
+# Set atomic = true only for MySQL XA-capable participants after provisioning
+# durable storage for xa_journal_path. See docs/mysql-xa.md.
+atomic = false
 target_shards = ["orders-mirror"]
 tables = ["orders", "order_items"]
 failure_policy = "all"
 max_concurrency = 8
+xa_max_participants = 16
+xa_journal_path = "/var/lib/dbproxy/xa-journal.jsonl"
+xa_journal_max_bytes = 67108864
+xa_recovery_timeout_seconds = 30
 
 [health_check]
 interval_seconds = 5

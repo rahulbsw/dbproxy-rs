@@ -467,6 +467,7 @@ to its normally routed primary:
 ```toml
 [write_fanout]
 enabled = true
+atomic = false
 target_shards = ["orders-mirror", "analytics-copy"]
 tables = ["orders", "order_items"]
 failure_policy = "all"
@@ -478,10 +479,18 @@ not then execute the routed primary. `best_effort` logs and counts a secondary
 failure but continues. Fanout is deliberately rejected inside transactions or
 other pinned sessions.
 
-Fanout is not distributed atomic commit. A target can accept a write before a
-later target or the routed primary fails. Use MySQL replication when the copies
-are identical availability replicas; use an outbox/CDC pipeline or XA-aware
-coordinator when atomic or recoverable multi-system delivery is required.
+The default `atomic = false` path can partially complete. For allowlisted MySQL
+`INSERT`, `UPDATE`, and `DELETE` statements, `atomic = true` uses every selected
+primary as an XA participant, fsyncs its decision journal, recovers incomplete
+decisions at restart, bounds the participant set, and removes the instance from
+readiness while a decision is in doubt. It is rejected inside a client
+transaction and cannot be combined with the result cache. The journal must be
+on durable, single-writer storage.
+
+See [the MySQL XA operations guide](docs/mysql-xa.md) for configuration,
+failure semantics, Kubernetes storage, and application retry rules. Prefer
+native replication for identical availability replicas and an outbox/CDC
+pipeline for asynchronous cross-system delivery.
 
 See
 [`config/dbproxy.sharded.example.toml`](config/dbproxy.sharded.example.toml)
@@ -580,7 +589,8 @@ recommendations.
 - runtime etcd generations currently cover MySQL users, routing, sharding,
   fanout, and cache policy; listener, backend, PostgreSQL, and Redis topology
   changes still require restart, and an admin SQL interface is out of scope
-- write fanout reports partial failures but is not a distributed transaction
+- non-atomic write fanout can report partial completion; opt-in MySQL XA is
+  limited to allowlisted autocommit DML and does not span a client transaction
 
 See [docs/architecture.md](docs/architecture.md) for design details.
 See [docs/review.md](docs/review.md) for the database/network review and

@@ -55,8 +55,9 @@ The read-after-write window and transaction/session affinity take precedence:
 reads requiring primary or session consistency bypass cache. Cache invalidation
 currently covers statements executed through DBProxy. If applications or CDC
 jobs write directly to MySQL, use short TTLs until an external CDC invalidator
-is deployed. Write fanout remains non-atomic and should not be combined with
-cache-dependent correctness.
+is deployed. Atomic fanout and caching are rejected when enabled together;
+default non-atomic fanout should not be combined with cache-dependent
+correctness.
 
 With `fail_open = true`, Redis connection, timeout, and decoding failures fall
 back to MySQL. With `fail_open = false`, lookup failures return a query error.

@@ -20,6 +20,7 @@ base64 = "0.22"
 bytes = "1.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures-util = "0.3"
+fs2 = "0.4"
 memchr = "2.7"
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
 nanoid = "0.5"

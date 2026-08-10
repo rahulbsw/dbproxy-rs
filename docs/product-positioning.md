@@ -19,7 +19,8 @@ DBProxy fits this stage by providing:
 - MySQL connection pooling and statement-level read/write routing;
 - transparent PostgreSQL and Redis role routing;
 - hash, range, and exact-value placement over a declared topology;
-- bounded fanout only where its non-atomic behavior is explicitly accepted;
+- bounded non-atomic fanout where partial completion is accepted, or constrained
+  MySQL XA for allowlisted autocommit DML with durable per-instance recovery;
 - consistent health, admission limits, operation identifiers, and metrics;
 - no required topology database, operator, or per-database agent.
 

@@ -17,6 +17,11 @@ to have passed a health check and to remain below the configured consecutive
 failure threshold. Replicas do not gate readiness because reads can fall back to
 their shard primary.
 
+When atomic MySQL fanout is enabled, readiness also requires
+`dbproxy_xa_in_doubt_transactions == 0`. A post-decision participant failure
+withdraws readiness, and restart recovery must resolve the durable decision
+before the listener becomes available.
+
 At startup, readiness is false until the first successful primary probes.
 When PostgreSQL is enabled, readiness also requires every configured shard
 primary to pass its configured probe. The default is TCP transport. A
@@ -45,6 +50,7 @@ validate replication role, or measure replica lag.
 | Runtime config | `dbproxy_config_epoch`, `dbproxy_config_reload_successes_total`, `dbproxy_config_reload_failures_total`, `dbproxy_config_poll_failures_total` |
 | Routing | `dbproxy_replica_fallbacks_total`, `dbproxy_shard_routing_failures_total` |
 | Fanout | `dbproxy_write_fanout_attempts_total`, `dbproxy_write_fanout_successes_total`, `dbproxy_write_fanout_failures_total`, `dbproxy_write_fanout_timeouts_total` |
+| MySQL XA | `dbproxy_xa_transactions_total`, `dbproxy_xa_prepares_total`, `dbproxy_xa_commit_decisions_total`, `dbproxy_xa_commits_total`, `dbproxy_xa_rollbacks_total`, `dbproxy_xa_recovery_attempts_total`, `dbproxy_xa_recovery_failures_total`, `dbproxy_xa_in_doubt_transactions`, `dbproxy_xa_oldest_in_doubt_age_seconds` |
 | Prepared | `dbproxy_prepared_statements_created_total`, `dbproxy_prepared_statement_executions_total`, `dbproxy_prepared_statements_closed_total` |
 | Backend | `dbproxy_backend_healthy`, `dbproxy_backend_consecutive_failures`, `dbproxy_backend_health_checks_total{outcome}`, `dbproxy_backend_last_health_check_timestamp_seconds`, `dbproxy_backend_last_success_timestamp_seconds`, backend connection/query totals and duration sums |
 | Pools | shared pool connection/idle/in-use/waiter/pressure metrics, `dbproxy_backend_reserved_pool_enabled`, reserved connection/idle/in-use/waiter metrics, and shared pool failure/reset/discard counters |
@@ -72,6 +78,9 @@ database values are never used as labels.
   checking the database's total connection budget.
 - Any increase in `dbproxy_write_fanout_failures_total` or
   `dbproxy_write_fanout_timeouts_total`: possible cross-database divergence.
+- `dbproxy_xa_in_doubt_transactions > 0`: a durable commit or abort decision
+  is not resolved everywhere. Do not replay the application write; preserve
+  the journal volume and restore participant connectivity.
 - A rising ratio of `dbproxy_replica_fallbacks_total` to
   `dbproxy_queries_replica_total`: unhealthy or undersized replicas.
 - Any increase in `dbproxy_forced_shutdowns_total`: drain deadline too short or

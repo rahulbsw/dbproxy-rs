@@ -11,6 +11,7 @@ start. The focused guides below describe design and operating contracts.
 | [Operations and metrics](operations.md) | Health endpoints, Prometheus metrics, alerts, and capacity tuning |
 | [Protocol sharding](protocol-sharding.md) | PostgreSQL/TimescaleDB and Redis/Valkey hash, range, value, and command routing |
 | [MySQL read-through cache](cache.md) | Redis/Valkey cache rules, consistency, invalidation, and failure behavior |
+| [MySQL XA fanout](mysql-xa.md) | Atomic fanout configuration, recovery, storage, and retry contract |
 | [Shared etcd control plane](control-plane.md) | Immutable runtime generations, last-known-good behavior, and transaction draining |
 | [Database and networking review](review.md) | Closed correctness issues and intentional production boundaries |
 | [Advanced execution roadmap](advanced-features.md) | Safety contracts for XA, scatter/gather, online resharding, and streaming |

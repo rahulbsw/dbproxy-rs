@@ -69,6 +69,13 @@ impl SqlAnalysis {
     pub fn statements(&self) -> Option<&[Statement]> {
         self.statements.as_deref()
     }
+
+    pub fn is_atomic_dml(&self) -> bool {
+        matches!(
+            self.statements.as_deref(),
+            Some([Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)])
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -272,6 +279,41 @@ mod tests {
             .unwrap();
         assert_eq!(analysis.classification.kind, QueryKind::Read);
         assert_eq!(analysis.statements().expect("parsed statements").len(), 1);
+    }
+
+    #[test]
+    fn atomic_dml_excludes_ddl_and_unparsed_statements() {
+        let classifier = SqlClassifier::new(true, &[]);
+        assert!(
+            classifier
+                .analyze("INSERT INTO orders(id) VALUES (1)")
+                .unwrap()
+                .is_atomic_dml()
+        );
+        assert!(
+            classifier
+                .analyze("UPDATE orders SET id = 2 WHERE id = 1")
+                .unwrap()
+                .is_atomic_dml()
+        );
+        assert!(
+            classifier
+                .analyze("DELETE FROM orders WHERE id = 2")
+                .unwrap()
+                .is_atomic_dml()
+        );
+        assert!(
+            !classifier
+                .analyze("TRUNCATE TABLE orders")
+                .unwrap()
+                .is_atomic_dml()
+        );
+        assert!(
+            !classifier
+                .analyze("this is not valid mysql")
+                .unwrap()
+                .is_atomic_dml()
+        );
     }
 
     #[test]

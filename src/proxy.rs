@@ -51,6 +51,7 @@ use crate::{
     routing::{RouteTarget, SessionState},
     sharding::{ShardDecision, ShardRouter},
     tls,
+    xa::{XaJournal, XaRecord, XaState},
 };
 
 pub struct Proxy {
@@ -138,6 +139,26 @@ impl Proxy {
                 }
             }
         } else {
+            None
+        };
+        let xa_journal = if initial_config.write_fanout.atomic {
+            let journal = Arc::new(
+                XaJournal::open(
+                    initial_config.write_fanout.xa_journal_path.clone(),
+                    initial_config.write_fanout.xa_journal_max_bytes,
+                )
+                .await?,
+            );
+            recover_xa_journal(
+                journal.clone(),
+                self.backends.clone(),
+                self.metrics.clone(),
+                &initial_config,
+            )
+            .await?;
+            Some(journal)
+        } else {
+            self.metrics.xa_in_doubt(0);
             None
         };
         let initial_cache = initialize_cache(&initial_config, self.metrics.clone()).await?;
@@ -302,6 +323,7 @@ impl Proxy {
                                 self.backends.clone(),
                                 self.metrics.clone(),
                                 runtime.cache.clone(),
+                                xa_journal.clone(),
                             );
                             let metrics = self.metrics.clone();
                             let frontend_tls = self.frontend_tls.clone();
@@ -378,6 +400,139 @@ impl Proxy {
     }
 }
 
+async fn recover_xa_journal(
+    journal: Arc<XaJournal>,
+    backends: Arc<BackendManager>,
+    metrics: Arc<Metrics>,
+    config: &Config,
+) -> Result<(), ProxyError> {
+    let deadline =
+        Instant::now() + Duration::from_secs(config.write_fanout.xa_recovery_timeout_seconds);
+    loop {
+        let records = journal.outstanding()?;
+        metrics.xa_in_doubt(records.len());
+        metrics.xa_oldest_in_doubt(records.iter().map(|record| record.unix_millis).min());
+        if records.is_empty() {
+            return Ok(());
+        }
+        for record in records {
+            metrics.xa_recovery_attempted();
+            if let Err(error) = resolve_xa_record(
+                &journal,
+                &backends,
+                &metrics,
+                config.proxy.backend_connect_timeout_seconds,
+                config.proxy.backend_query_timeout_seconds,
+                record,
+            )
+            .await
+            {
+                metrics.xa_recovery_failed();
+                warn!(%error, "XA recovery attempt remains in doubt");
+            }
+        }
+        let remaining = journal.outstanding_count()?;
+        metrics.xa_in_doubt(remaining);
+        metrics.xa_oldest_in_doubt(
+            journal
+                .outstanding()?
+                .iter()
+                .map(|record| record.unix_millis)
+                .min(),
+        );
+        if remaining == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(ProxyError::Protocol(format!(
+                "XA startup recovery timed out with {remaining} in-doubt transaction(s); readiness is withheld"
+            )));
+        }
+        time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn resolve_xa_record(
+    journal: &XaJournal,
+    backends: &BackendManager,
+    metrics: &Metrics,
+    connect_timeout_seconds: u64,
+    query_timeout_seconds: u64,
+    mut record: XaRecord,
+) -> Result<(), ProxyError> {
+    if matches!(record.state, XaState::Started | XaState::Prepared) {
+        journal
+            .append(&record.xid, &record.participants, XaState::AbortDecided)
+            .await?;
+        record.state = XaState::AbortDecided;
+    }
+    let command = match record.state {
+        XaState::CommitDecided => "COMMIT",
+        XaState::AbortDecided => "ROLLBACK",
+        XaState::Completed => return Ok(()),
+        XaState::Started | XaState::Prepared => unreachable!("decision assigned above"),
+    };
+    let xid = record.xid.replace('\\', "\\\\").replace('\'', "''");
+    for shard in &record.participants {
+        let backend = backends.primary(shard).ok_or_else(|| {
+            ProxyError::Protocol(format!(
+                "XA recovery cannot find primary for participant shard {shard:?}"
+            ))
+        })?;
+        let mut connection = time::timeout(
+            Duration::from_secs(connect_timeout_seconds),
+            backend.connection(),
+        )
+        .await
+        .map_err(|_| {
+            ProxyError::Protocol(format!(
+                "XA recovery connection to shard {shard:?} timed out"
+            ))
+        })??;
+        let sql = format!("XA {command} '{xid}'");
+        match time::timeout(
+            Duration::from_secs(query_timeout_seconds),
+            connection.query_drop(sql),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if xa_branch_not_found(&error) => {
+                // XA resolution has no status query. XAER_NOTA is the expected
+                // idempotent result after an earlier recovery attempt succeeded.
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                let _ = connection.disconnect().await;
+                return Err(ProxyError::Protocol(format!(
+                    "XA {command} timed out on participant shard {shard:?}"
+                )));
+            }
+        }
+    }
+    journal
+        .append(&record.xid, &record.participants, XaState::Completed)
+        .await?;
+    if record.state == XaState::CommitDecided {
+        metrics.xa_committed();
+    } else {
+        metrics.xa_rolled_back();
+    }
+    metrics.xa_in_doubt(journal.outstanding_count()?);
+    metrics.xa_oldest_in_doubt(
+        journal
+            .outstanding()?
+            .iter()
+            .map(|record| record.unix_millis)
+            .min(),
+    );
+    Ok(())
+}
+
+fn xa_branch_not_found(error: &mysql_async::Error) -> bool {
+    matches!(error, mysql_async::Error::Server(server) if server.code == 1397)
+}
+
 async fn initialize_cache(
     config: &Config,
     metrics: Arc<Metrics>,
@@ -416,6 +571,24 @@ async fn watch_runtime_config(
                             continue;
                         }
                         match current.config.apply_runtime_document(&value.document) {
+                            Ok(config)
+                                if config.write_fanout.atomic
+                                    != current.config.write_fanout.atomic
+                                    || config.write_fanout.xa_journal_path
+                                        != current.config.write_fanout.xa_journal_path
+                                    || config.write_fanout.xa_journal_max_bytes
+                                        != current.config.write_fanout.xa_journal_max_bytes
+                                    || config.write_fanout.xa_max_participants
+                                        != current.config.write_fanout.xa_max_participants
+                                    || config.write_fanout.xa_recovery_timeout_seconds
+                                        != current
+                                            .config
+                                            .write_fanout
+                                            .xa_recovery_timeout_seconds =>
+                            {
+                                metrics.config_reload_failed();
+                                warn!(config_epoch = value.revision, "etcd generation changes restart-only XA durability settings; retaining last-known-good config");
+                            }
                             Ok(config) => match initialize_cache(&config, metrics.clone()).await {
                                 Ok(cache) => {
                                     let config = Arc::new(config);
@@ -705,6 +878,7 @@ struct ProxySession {
     backends: Arc<BackendManager>,
     metrics: Arc<Metrics>,
     cache: Option<Arc<CacheManager>>,
+    xa_journal: Option<Arc<XaJournal>>,
     classifier: SqlClassifier,
     users: HashMap<String, String>,
     state: SessionState,
@@ -722,6 +896,32 @@ struct ProxySession {
 struct PreparedStatement {
     query: String,
     kind: QueryKind,
+    atomic_dml: bool,
+}
+
+#[derive(Clone, Copy)]
+enum XaCommand<'a> {
+    Text(&'a str),
+    Prepared(&'a str, &'a [Value]),
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct XaExecutionResult {
+    affected_rows: u64,
+    last_insert_id: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum XaBranchPhase {
+    Active,
+    Prepared,
+}
+
+struct XaBranch {
+    shard: String,
+    backend: Arc<Backend>,
+    connection: Conn,
+    phase: XaBranchPhase,
 }
 
 impl ProxySession {
@@ -732,6 +932,7 @@ impl ProxySession {
         backends: Arc<BackendManager>,
         metrics: Arc<Metrics>,
         cache: Option<Arc<CacheManager>>,
+        xa_journal: Option<Arc<XaJournal>>,
     ) -> Self {
         let users = config
             .users
@@ -753,6 +954,7 @@ impl ProxySession {
             backends,
             metrics,
             cache,
+            xa_journal,
             users,
             pinned: None,
             pinned_shard: None,
@@ -1088,6 +1290,275 @@ impl ProxySession {
         }
     }
 
+    async fn execute_atomic_fanout(
+        &self,
+        command: XaCommand<'_>,
+        decision: &ShardDecision,
+        targets: &[String],
+    ) -> Result<XaExecutionResult, ProxyError> {
+        let journal = self.xa_journal.as_ref().ok_or_else(|| {
+            ProxyError::Protocol(
+                "atomic fanout is active without an initialized XA journal".to_owned(),
+            )
+        })?;
+        let mut participants = Vec::with_capacity(targets.len() + 1);
+        participants.push(decision.shard.clone());
+        for target in targets {
+            if !participants.contains(target) {
+                participants.push(target.clone());
+            }
+        }
+        if participants.len() > self.config.write_fanout.xa_max_participants {
+            return Err(ProxyError::Protocol(format!(
+                "XA fanout has {} participants, exceeding configured limit {}",
+                participants.len(),
+                self.config.write_fanout.xa_max_participants
+            )));
+        }
+
+        let xid = operation_id::generate("dbproxy-xa");
+        journal
+            .append(&xid, &participants, XaState::Started)
+            .await?;
+        self.metrics.xa_started();
+        self.metrics.xa_in_doubt(journal.outstanding_count()?);
+        self.metrics.xa_oldest_in_doubt(
+            journal
+                .outstanding()?
+                .iter()
+                .map(|record| record.unix_millis)
+                .min(),
+        );
+        for _ in targets {
+            self.metrics.fanout_attempted();
+        }
+
+        let xid_sql = xid.replace('\\', "\\\\").replace('\'', "''");
+        let mut branches = Vec::<XaBranch>::with_capacity(participants.len());
+        let prepare_result: Result<XaExecutionResult, ProxyError> = async {
+            for shard in &participants {
+                let backend = self.primary(shard)?;
+                let mut connection = self.connect(&backend).await?;
+                self.xa_control(&mut connection, &backend, format!("XA START '{xid_sql}'"))
+                    .await?;
+                branches.push(XaBranch {
+                    shard: shard.clone(),
+                    backend,
+                    connection,
+                    phase: XaBranchPhase::Active,
+                });
+            }
+
+            let mut routed_result = XaExecutionResult::default();
+            for (index, branch) in branches.iter_mut().enumerate() {
+                let started = Instant::now();
+                let timeout = Duration::from_secs(self.config.proxy.backend_query_timeout_seconds);
+                let execution = match command {
+                    XaCommand::Text(query) => {
+                        time::timeout(timeout, branch.connection.query_drop(query)).await
+                    }
+                    XaCommand::Prepared(query, values) => {
+                        time::timeout(
+                            timeout,
+                            branch
+                                .connection
+                                .exec_drop(query, Params::Positional(values.to_vec())),
+                        )
+                        .await
+                    }
+                };
+                match execution {
+                    Ok(Ok(())) => {
+                        branch
+                            .backend
+                            .record_query(BackendQueryOutcome::Success, started.elapsed());
+                    }
+                    Ok(Err(error)) => {
+                        branch
+                            .backend
+                            .record_query(BackendQueryOutcome::Failure, started.elapsed());
+                        return Err(error.into());
+                    }
+                    Err(_) => {
+                        branch
+                            .backend
+                            .record_query(BackendQueryOutcome::Timeout, started.elapsed());
+                        return Err(ProxyError::Protocol(format!(
+                            "XA business statement timed out on shard {:?}",
+                            branch.shard
+                        )));
+                    }
+                }
+                if index == 0 {
+                    routed_result = XaExecutionResult {
+                        affected_rows: branch.connection.affected_rows(),
+                        last_insert_id: branch.connection.last_insert_id().unwrap_or_default(),
+                    };
+                }
+            }
+
+            for branch in &mut branches {
+                self.xa_control(
+                    &mut branch.connection,
+                    &branch.backend,
+                    format!("XA END '{xid_sql}'"),
+                )
+                .await?;
+                self.xa_control(
+                    &mut branch.connection,
+                    &branch.backend,
+                    format!("XA PREPARE '{xid_sql}'"),
+                )
+                .await?;
+                branch.phase = XaBranchPhase::Prepared;
+            }
+            journal
+                .append(&xid, &participants, XaState::Prepared)
+                .await?;
+            self.metrics.xa_prepared();
+            Ok(routed_result)
+        }
+        .await;
+
+        let routed_result = match prepare_result {
+            Ok(result) => result,
+            Err(error) => {
+                journal
+                    .append(&xid, &participants, XaState::AbortDecided)
+                    .await?;
+                let resolved = self
+                    .resolve_live_xa_branches(&xid_sql, &mut branches, false)
+                    .await;
+                if resolved {
+                    journal
+                        .append(&xid, &participants, XaState::Completed)
+                        .await?;
+                    self.metrics.xa_rolled_back();
+                }
+                self.metrics.xa_in_doubt(journal.outstanding_count()?);
+                self.metrics.xa_oldest_in_doubt(
+                    journal
+                        .outstanding()?
+                        .iter()
+                        .map(|record| record.unix_millis)
+                        .min(),
+                );
+                for _ in targets {
+                    self.metrics.fanout_failed();
+                }
+                return Err(if resolved {
+                    error
+                } else {
+                    ProxyError::Protocol(format!(
+                        "{error}; XA rollback remains in doubt and readiness has been withdrawn"
+                    ))
+                });
+            }
+        };
+
+        journal
+            .append(&xid, &participants, XaState::CommitDecided)
+            .await?;
+        self.metrics.xa_commit_decided();
+        let resolved = self
+            .resolve_live_xa_branches(&xid_sql, &mut branches, true)
+            .await;
+        if !resolved {
+            self.metrics.xa_in_doubt(journal.outstanding_count()?);
+            self.metrics.xa_oldest_in_doubt(
+                journal
+                    .outstanding()?
+                    .iter()
+                    .map(|record| record.unix_millis)
+                    .min(),
+            );
+            for _ in targets {
+                self.metrics.fanout_failed();
+            }
+            return Err(ProxyError::Protocol(format!(
+                "XA commit was durably decided for {xid} but is incomplete; do not blindly retry because restart recovery will finish it"
+            )));
+        }
+        journal
+            .append(&xid, &participants, XaState::Completed)
+            .await?;
+        self.metrics.xa_committed();
+        self.metrics.xa_in_doubt(journal.outstanding_count()?);
+        self.metrics.xa_oldest_in_doubt(
+            journal
+                .outstanding()?
+                .iter()
+                .map(|record| record.unix_millis)
+                .min(),
+        );
+        for _ in targets {
+            self.metrics.fanout_succeeded();
+        }
+        Ok(routed_result)
+    }
+
+    async fn xa_control(
+        &self,
+        connection: &mut Conn,
+        backend: &Backend,
+        sql: String,
+    ) -> Result<(), ProxyError> {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(self.config.proxy.backend_query_timeout_seconds);
+        match time::timeout(timeout, connection.query_drop(sql)).await {
+            Ok(Ok(())) => {
+                backend.record_query(BackendQueryOutcome::Success, started.elapsed());
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                backend.record_query(BackendQueryOutcome::Failure, started.elapsed());
+                Err(error.into())
+            }
+            Err(_) => {
+                backend.record_query(BackendQueryOutcome::Timeout, started.elapsed());
+                Err(ProxyError::Protocol(format!(
+                    "XA control statement timed out on backend {:?}",
+                    backend.name()
+                )))
+            }
+        }
+    }
+
+    async fn resolve_live_xa_branches(
+        &self,
+        xid_sql: &str,
+        branches: &mut [XaBranch],
+        commit: bool,
+    ) -> bool {
+        let mut resolved = true;
+        for branch in branches {
+            if !commit && matches!(branch.phase, XaBranchPhase::Active) {
+                let _ = self
+                    .xa_control(
+                        &mut branch.connection,
+                        &branch.backend,
+                        format!("XA END '{xid_sql}'"),
+                    )
+                    .await;
+            }
+            let operation = if commit { "COMMIT" } else { "ROLLBACK" };
+            let result = self
+                .xa_control(
+                    &mut branch.connection,
+                    &branch.backend,
+                    format!("XA {operation} '{xid_sql}'"),
+                )
+                .await;
+            if let Err(error) = result
+                && !matches!(&error, ProxyError::Backend(source) if xa_branch_not_found(source))
+            {
+                resolved = false;
+                warn!(shard = branch.shard, %error, operation, "XA participant resolution failed");
+            }
+        }
+        resolved
+    }
+
     async fn record_cache_success(
         &mut self,
         kind: QueryKind,
@@ -1221,6 +1692,7 @@ impl ProxySession {
             analysis_started.elapsed(),
             Some(analysis.classification.parsed),
         );
+        let atomic_dml = analysis.is_atomic_dml();
         let classification = &analysis.classification;
         self.metrics.query_started(classification.kind);
         let started = Instant::now();
@@ -1244,6 +1716,45 @@ impl ProxySession {
                     b"write fanout is not supported inside a pinned session or transaction",
                 )
                 .await?;
+            return Ok(());
+        }
+        if self.config.write_fanout.atomic && !fanout.is_empty() {
+            if classification.kind != QueryKind::Write || !atomic_dml {
+                self.metrics.query_failed();
+                writer
+                    .error(
+                        ErrorKind::ER_NOT_SUPPORTED_YET,
+                        b"atomic fanout only supports parsed single-table DML",
+                    )
+                    .await?;
+                return Ok(());
+            }
+            match self
+                .execute_atomic_fanout(XaCommand::Text(query), &decision, &fanout)
+                .await
+            {
+                Ok(result) => {
+                    writer
+                        .completed(OkResponse {
+                            affected_rows: result.affected_rows,
+                            last_insert_id: result.last_insert_id,
+                            ..Default::default()
+                        })
+                        .await?;
+                    self.metrics.query_primary();
+                    self.metrics.query_succeeded();
+                    self.metrics.rows_affected(result.affected_rows);
+                    self.metrics.observe_query(started.elapsed());
+                    self.state.record_success(classification.kind);
+                }
+                Err(error) => {
+                    self.metrics.query_failed();
+                    self.metrics.observe_query(started.elapsed());
+                    writer
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
+                        .await?;
+                }
+            }
             return Ok(());
         }
         if let Err(error) = self.fanout_text(query, fanout).await {
@@ -1546,6 +2057,7 @@ where
             analysis_started.elapsed(),
             Some(analysis.classification.parsed),
         );
+        let atomic_dml = analysis.is_atomic_dml();
         let classification = analysis.classification;
         if self.prepared.len() >= self.config.proxy.max_prepared_statements_per_connection {
             info.error(
@@ -1614,6 +2126,7 @@ where
             PreparedStatement {
                 query: query.to_owned(),
                 kind: classification.kind,
+                atomic_dml,
             },
         );
         self.metrics.prepared_created();
@@ -1638,6 +2151,7 @@ where
         };
         let query = prepared.query.clone();
         let kind = prepared.kind;
+        let atomic_dml = prepared.atomic_dml;
         self.metrics.prepared_executed();
         self.metrics.query_started(kind);
         let started = Instant::now();
@@ -1683,6 +2197,49 @@ where
                     b"write fanout is not supported inside a pinned session or transaction",
                 )
                 .await?;
+            return Ok(());
+        }
+        if self.config.write_fanout.atomic && !fanout_targets.is_empty() {
+            if kind != QueryKind::Write || !atomic_dml {
+                self.metrics.query_failed();
+                results
+                    .error(
+                        ErrorKind::ER_NOT_SUPPORTED_YET,
+                        b"atomic fanout only supports parsed single-table DML",
+                    )
+                    .await?;
+                return Ok(());
+            }
+            match self
+                .execute_atomic_fanout(
+                    XaCommand::Prepared(&query, &values),
+                    &decision,
+                    &fanout_targets,
+                )
+                .await
+            {
+                Ok(result) => {
+                    results
+                        .completed(OkResponse {
+                            affected_rows: result.affected_rows,
+                            last_insert_id: result.last_insert_id,
+                            ..Default::default()
+                        })
+                        .await?;
+                    self.metrics.query_primary();
+                    self.metrics.query_succeeded();
+                    self.metrics.rows_affected(result.affected_rows);
+                    self.metrics.observe_query(started.elapsed());
+                    self.state.record_success(kind);
+                }
+                Err(error) => {
+                    self.metrics.query_failed();
+                    self.metrics.observe_query(started.elapsed());
+                    results
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
+                        .await?;
+                }
+            }
             return Ok(());
         }
         let session: &ProxySession = self;

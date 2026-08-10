@@ -1,7 +1,7 @@
 use std::{
     fmt::Write,
     sync::atomic::{AtomicI64, AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::classifier::QueryKind;
@@ -46,6 +46,15 @@ pub struct Metrics {
     fanout_successes: AtomicU64,
     fanout_failures: AtomicU64,
     fanout_timeouts: AtomicU64,
+    xa_transactions: AtomicU64,
+    xa_prepares: AtomicU64,
+    xa_commit_decisions: AtomicU64,
+    xa_commits: AtomicU64,
+    xa_rollbacks: AtomicU64,
+    xa_recovery_attempts: AtomicU64,
+    xa_recovery_failures: AtomicU64,
+    xa_in_doubt: AtomicI64,
+    xa_oldest_in_doubt_unix_millis: AtomicU64,
     prepared_created: AtomicU64,
     prepared_executed: AtomicU64,
     prepared_closed: AtomicU64,
@@ -191,6 +200,51 @@ impl Metrics {
 
     pub fn fanout_timed_out(&self) {
         self.fanout_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn xa_started(&self) {
+        self.xa_transactions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn xa_prepared(&self) {
+        self.xa_prepares.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn xa_commit_decided(&self) {
+        self.xa_commit_decisions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn xa_committed(&self) {
+        self.xa_commits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn xa_rolled_back(&self) {
+        self.xa_rollbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn xa_recovery_attempted(&self) {
+        self.xa_recovery_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn xa_recovery_failed(&self) {
+        self.xa_recovery_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn xa_in_doubt(&self, count: usize) {
+        self.xa_in_doubt.store(count as i64, Ordering::Release);
+        if count == 0 {
+            self.xa_oldest_in_doubt_unix_millis
+                .store(0, Ordering::Release);
+        }
+    }
+
+    pub fn xa_oldest_in_doubt(&self, unix_millis: Option<u64>) {
+        self.xa_oldest_in_doubt_unix_millis
+            .store(unix_millis.unwrap_or_default(), Ordering::Release);
+    }
+
+    pub fn xa_ready(&self) -> bool {
+        self.xa_in_doubt.load(Ordering::Acquire) == 0
     }
 
     pub fn prepared_created(&self) {
@@ -762,6 +816,78 @@ impl Metrics {
             "counter",
             "Secondary shard writes exceeding their deadline.",
             self.fanout_timeouts.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_xa_transactions_total",
+            "counter",
+            "Atomic MySQL XA fanout transactions started.",
+            self.xa_transactions.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_xa_prepares_total",
+            "counter",
+            "Atomic MySQL XA fanouts prepared on every participant.",
+            self.xa_prepares.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_xa_commit_decisions_total",
+            "counter",
+            "Durable XA commit decisions written to the journal.",
+            self.xa_commit_decisions.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_xa_commits_total",
+            "counter",
+            "XA fanouts fully committed on every participant.",
+            self.xa_commits.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_xa_rollbacks_total",
+            "counter",
+            "XA fanouts durably aborted and resolved on every participant.",
+            self.xa_rollbacks.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_xa_recovery_attempts_total",
+            "counter",
+            "In-doubt XA transactions examined during recovery.",
+            self.xa_recovery_attempts.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_xa_recovery_failures_total",
+            "counter",
+            "XA recovery attempts that could not resolve every participant.",
+            self.xa_recovery_failures.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_xa_in_doubt_transactions",
+            "gauge",
+            "Durable XA decisions not yet resolved on every participant.",
+            self.xa_in_doubt.load(Ordering::Acquire),
+        );
+        let oldest_millis = self.xa_oldest_in_doubt_unix_millis.load(Ordering::Acquire);
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        metric(
+            &mut output,
+            "dbproxy_xa_oldest_in_doubt_age_seconds",
+            "gauge",
+            "Age in seconds of the oldest durable XA decision not yet resolved.",
+            if oldest_millis == 0 {
+                0.0
+            } else {
+                now_millis.saturating_sub(oldest_millis) as f64 / 1_000.0
+            },
         );
         metric(
             &mut output,

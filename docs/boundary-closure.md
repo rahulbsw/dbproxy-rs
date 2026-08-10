@@ -27,7 +27,7 @@ The live status is also available from `GET /capabilities` and
 | Runtime reload | Versioned control plane | Parse and validate immutable snapshots, publish one epoch atomically, and drain resources removed by the old epoch |
 | Query cache | Implemented, constrained | Explicit MySQL table rules use bounded Redis/Valkey values, per-process singleflight, replica-eligible text/prepared reads, and commit-aware table/shard generations; streaming reads and bypass writes remain uncached |
 | Admin SQL | Authenticated control plane | Keep separate from data credentials; add authorization, audit records, deadlines, and read-only defaults |
-| Atomic write fanout | Durable coordinator | Implement MySQL XA decision journaling, recovery, idempotency, and in-doubt transaction operations |
+| Atomic write fanout | Implemented, constrained | MySQL XA decision journal and restart recovery for allowlisted autocommit DML; online reconciliation and client-transaction fanout remain open |
 
 ## Delivery sequence
 
@@ -78,10 +78,11 @@ versioned catalog used for metadata validation.
 
 ### Phase 5: durable writes and online movement
 
-Atomic fanout requires a durable XA decision journal and restart recovery before
-it can be used for resharding dual writes. The constrained cache must remain
-disabled for fanout or migration traffic until invalidation is tied to the same
-committed configuration and transaction epochs.
+Constrained MySQL XA fanout now has a durable decision journal and restart
+recovery for allowlisted autocommit DML. General client-transaction fanout,
+online reconciliation APIs, and resharding orchestration remain future phases.
+The cache is rejected with XA until invalidation is tied to the same committed
+configuration and transaction epochs.
 
 ## Non-negotiable invariants
 

@@ -132,8 +132,8 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "distributed_atomic_fanout",
-        status: CapabilityStatus::Planned,
-        contract: "requires durable XA decisions, recovery, and operator handling of in-doubt work",
+        status: CapabilityStatus::Constrained,
+        contract: "opt-in MySQL XA for allowlisted autocommit DML with fsynced local decisions, restart recovery, bounded participants, and readiness withdrawal while in doubt",
     },
 ];
 
@@ -175,7 +175,7 @@ mod tests {
         let mut metrics = String::new();
         encode_prometheus(&mut metrics);
         assert!(metrics.contains(
-            "dbproxy_capability_info{capability=\"distributed_atomic_fanout\",status=\"planned\"} 1"
+            "dbproxy_capability_info{capability=\"distributed_atomic_fanout\",status=\"constrained\"} 1"
         ));
     }
 }

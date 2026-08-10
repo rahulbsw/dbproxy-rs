@@ -612,25 +612,40 @@ pub enum FanoutFailurePolicy {
     BestEffort,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WriteFanoutConfig {
     pub enabled: bool,
+    /// Use MySQL XA and a durable local decision journal for atomic fanout.
+    pub atomic: bool,
     pub target_shards: Vec<String>,
     pub tables: Vec<String>,
     pub failure_policy: FanoutFailurePolicy,
     #[serde(default = "default_fanout_max_concurrency")]
     pub max_concurrency: usize,
+    #[serde(default = "default_xa_max_participants")]
+    pub xa_max_participants: usize,
+    #[serde(default = "default_xa_journal_path")]
+    pub xa_journal_path: PathBuf,
+    #[serde(default = "default_xa_journal_max_bytes")]
+    pub xa_journal_max_bytes: u64,
+    #[serde(default = "default_xa_recovery_timeout_seconds")]
+    pub xa_recovery_timeout_seconds: u64,
 }
 
 impl Default for WriteFanoutConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            atomic: false,
             target_shards: Vec::new(),
             tables: Vec::new(),
             failure_policy: FanoutFailurePolicy::All,
             max_concurrency: default_fanout_max_concurrency(),
+            xa_max_participants: default_xa_max_participants(),
+            xa_journal_path: default_xa_journal_path(),
+            xa_journal_max_bytes: default_xa_journal_max_bytes(),
+            xa_recovery_timeout_seconds: default_xa_recovery_timeout_seconds(),
         }
     }
 }
@@ -951,6 +966,68 @@ impl Config {
             return Err(ProxyError::Config(
                 "write_fanout.max_concurrency must be greater than zero".to_owned(),
             ));
+        }
+        if self.write_fanout.atomic {
+            if !self.write_fanout.enabled {
+                return Err(ProxyError::Config(
+                    "write_fanout.atomic requires write_fanout.enabled".to_owned(),
+                ));
+            }
+            if self.write_fanout.failure_policy != FanoutFailurePolicy::All {
+                return Err(ProxyError::Config(
+                    "write_fanout.atomic requires failure_policy = \"all\"".to_owned(),
+                ));
+            }
+            if self.write_fanout.tables.is_empty() {
+                return Err(ProxyError::Config(
+                    "write_fanout.atomic requires an explicit non-empty tables allowlist"
+                        .to_owned(),
+                ));
+            }
+            let participants = self.write_fanout.target_shards.len().saturating_add(1);
+            if self.write_fanout.xa_max_participants < participants
+                || self.write_fanout.xa_max_participants < 2
+            {
+                return Err(ProxyError::Config(format!(
+                    "write_fanout.xa_max_participants must be at least {participants}"
+                )));
+            }
+            if !self.write_fanout.xa_journal_path.is_absolute() {
+                return Err(ProxyError::Config(
+                    "write_fanout.xa_journal_path must be absolute".to_owned(),
+                ));
+            }
+            if self.write_fanout.xa_journal_max_bytes < 1_048_576 {
+                return Err(ProxyError::Config(
+                    "write_fanout.xa_journal_max_bytes must be at least 1048576".to_owned(),
+                ));
+            }
+            if self.write_fanout.xa_recovery_timeout_seconds == 0 {
+                return Err(ProxyError::Config(
+                    "write_fanout.xa_recovery_timeout_seconds must be greater than zero".to_owned(),
+                ));
+            }
+            if self.cache.enabled {
+                return Err(ProxyError::Config(
+                    "result caching and atomic write fanout cannot be enabled together".to_owned(),
+                ));
+            }
+            let mut primary_addresses = HashMap::<&str, &str>::new();
+            for backend in self
+                .backends
+                .iter()
+                .filter(|backend| backend.role == BackendRole::Primary)
+            {
+                if let Some(existing_shard) =
+                    primary_addresses.insert(&backend.address, &backend.shard)
+                    && existing_shard != backend.shard
+                {
+                    return Err(ProxyError::Config(format!(
+                        "atomic fanout requires distinct MySQL resource managers; shards {:?} and {:?} share primary address {:?}",
+                        existing_shard, backend.shard, backend.address
+                    )));
+                }
+            }
         }
         if self
             .write_fanout
@@ -1642,6 +1719,22 @@ fn default_fanout_max_concurrency() -> usize {
     8
 }
 
+fn default_xa_max_participants() -> usize {
+    16
+}
+
+fn default_xa_journal_path() -> PathBuf {
+    PathBuf::from("/var/lib/dbproxy/xa-journal.jsonl")
+}
+
+fn default_xa_journal_max_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_xa_recovery_timeout_seconds() -> u64 {
+    30
+}
+
 fn validate_relay_buffer(field: &str, bytes: usize) -> Result<(), ProxyError> {
     if !(4 * 1024..=1024 * 1024).contains(&bytes) {
         return Err(ProxyError::Config(format!(
@@ -1757,6 +1850,64 @@ mod tests {
         "#;
         let config: Config = toml::from_str(raw).unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn atomic_fanout_requires_safe_durable_configuration() {
+        let raw = r#"
+            [proxy]
+            listen = "127.0.0.1:3307"
+
+            [[users]]
+            username = "app"
+            password = "secret"
+
+            [[backends]]
+            name = "one"
+            address = "127.0.0.1:3306"
+            role = "primary"
+            shard = "default"
+            username = "root"
+            password = ""
+
+            [[backends]]
+            name = "mirror"
+            address = "127.0.0.1:3308"
+            role = "primary"
+            shard = "mirror"
+            username = "root"
+            password = ""
+
+            [write_fanout]
+            enabled = true
+            atomic = true
+            target_shards = ["mirror"]
+            tables = ["orders"]
+            failure_policy = "all"
+            xa_journal_path = "/tmp/dbproxy-test-xa.jsonl"
+        "#;
+        let config: Config = toml::from_str(raw).unwrap();
+        config.validate().unwrap();
+
+        let mut invalid = config.clone();
+        invalid.write_fanout.failure_policy = FanoutFailurePolicy::BestEffort;
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("failure_policy")
+        );
+
+        let mut invalid = config;
+        invalid.backends[1].address = invalid.backends[0].address.clone();
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("distinct MySQL resource managers")
+        );
     }
 
     #[test]

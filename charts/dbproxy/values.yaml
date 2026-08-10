@@ -140,6 +140,16 @@ resources:
   requests: {cpu: 100m, memory: 128Mi}
   limits: {memory: 512Mi}
 
+# Durable single-writer storage for the MySQL XA decision journal. The
+# Deployment chart intentionally permits this mode only with replicaCount: 1.
+persistence:
+  enabled: false
+  existingClaim: ""
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+  size: 1Gi
+  mountPath: /var/lib/dbproxy
+
 terminationGracePeriodSeconds: 45
 livenessProbe:
   initialDelaySeconds: 5
