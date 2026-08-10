@@ -29,10 +29,20 @@ use crate::{
     operation_id, tls,
 };
 
+mod terminate;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PostgresEndpoint {
     ReadWrite,
     ReadOnly,
+}
+
+#[derive(Clone)]
+pub struct PostgresServeOptions {
+    pub config: PostgresConfig,
+    pub users: Vec<crate::config::UserConfig>,
+    pub frontend_tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
+    pub frontend_tls_mode: crate::config::FrontendTlsMode,
 }
 
 struct PostgresBackend {
@@ -41,6 +51,7 @@ struct PostgresBackend {
     role: BackendRole,
     weight: u32,
     shard: String,
+    database: String,
     readiness_probe: Option<PostgresReadinessProbeConfig>,
     readiness_transport: Option<PostgresReadinessTransport>,
     healthy: AtomicBool,
@@ -56,6 +67,7 @@ struct PostgresBackend {
     connection_attempts: AtomicU64,
     connection_failures: AtomicU64,
     active_connections: AtomicI64,
+    sql_pool: Option<terminate::PostgresSqlPool>,
 }
 
 #[derive(Clone)]
@@ -65,7 +77,10 @@ enum PostgresReadinessTransport {
 }
 
 impl PostgresBackend {
-    fn from_config(config: &PostgresBackendConfig) -> Result<Self, ProxyError> {
+    fn from_config(
+        config: &PostgresBackendConfig,
+        postgres: &PostgresConfig,
+    ) -> Result<Self, ProxyError> {
         parse_backend_address(&config.address)?;
         let readiness_transport = config
             .readiness_probe
@@ -84,6 +99,7 @@ impl PostgresBackend {
             role: config.role,
             weight: config.weight,
             shard: config.shard.clone(),
+            database: config.database.clone(),
             readiness_probe: config.readiness_probe.clone(),
             readiness_transport,
             healthy: AtomicBool::new(false),
@@ -99,6 +115,9 @@ impl PostgresBackend {
             connection_attempts: AtomicU64::new(0),
             connection_failures: AtomicU64::new(0),
             active_connections: AtomicI64::new(0),
+            sql_pool: (postgres.routing_mode == crate::config::PostgresRoutingMode::Transaction)
+                .then(|| terminate::PostgresSqlPool::new(config, postgres))
+                .transpose()?,
         })
     }
 
@@ -234,6 +253,12 @@ impl PostgresBackend {
             BackendRole::Replica => "replica",
         }
     }
+
+    fn pool_pressure_millis(&self) -> u64 {
+        self.sql_pool
+            .as_ref()
+            .map_or(0, terminate::PostgresSqlPool::pressure_millis)
+    }
 }
 
 async fn execute_postgres_readiness_query<C>(
@@ -265,13 +290,14 @@ struct PostgresShard {
 impl PostgresBackendManager {
     pub fn from_config(
         backends: &[PostgresBackendConfig],
+        config: &PostgresConfig,
     ) -> Result<Option<Arc<Self>>, ProxyError> {
         if backends.is_empty() {
             return Ok(None);
         }
         let all = backends
             .iter()
-            .map(PostgresBackend::from_config)
+            .map(|backend| PostgresBackend::from_config(backend, config))
             .map(|backend| backend.map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
         let default_shard = all[0].shard.clone();
@@ -330,10 +356,20 @@ impl PostgresBackendManager {
         if endpoint == PostgresEndpoint::ReadWrite {
             return Some(shard.primary.clone());
         }
-        let total_weight = shard
+        let minimum_pressure = shard
             .replicas
             .iter()
             .filter(|backend| backend.healthy.load(Ordering::Acquire))
+            .map(|backend| backend.pool_pressure_millis())
+            .min()?;
+        let pressure_ceiling = minimum_pressure.saturating_add(50);
+        let total_weight = shard
+            .replicas
+            .iter()
+            .filter(|backend| {
+                backend.healthy.load(Ordering::Acquire)
+                    && backend.pool_pressure_millis() <= pressure_ceiling
+            })
             .map(|backend| u64::from(backend.weight))
             .sum::<u64>();
         if total_weight == 0 {
@@ -341,11 +377,10 @@ impl PostgresBackendManager {
         }
         let selected = shard.replica_cursor.fetch_add(1, Ordering::Relaxed) % total_weight;
         let mut cumulative = 0_u64;
-        for backend in shard
-            .replicas
-            .iter()
-            .filter(|backend| backend.healthy.load(Ordering::Acquire))
-        {
+        for backend in shard.replicas.iter().filter(|backend| {
+            backend.healthy.load(Ordering::Acquire)
+                && backend.pool_pressure_millis() <= pressure_ceiling
+        }) {
             cumulative += u64::from(backend.weight);
             if selected < cumulative {
                 return Some(backend.clone());
@@ -500,6 +535,20 @@ impl PostgresBackendManager {
                 connection_attempts: backend.connection_attempts.load(Ordering::Relaxed),
                 connection_failures: backend.connection_failures.load(Ordering::Relaxed),
                 active_connections: backend.active_connections.load(Ordering::Relaxed),
+                transaction_pool: backend.sql_pool.as_ref().map(|pool| {
+                    let snapshot = pool.snapshot();
+                    PostgresPoolStatus {
+                        capacity: snapshot.capacity,
+                        total: snapshot.total,
+                        idle: snapshot.idle,
+                        in_use: snapshot.in_use,
+                        waiters: snapshot.waiters,
+                        pressure_millis: snapshot.pressure_millis,
+                        checkouts: snapshot.checkouts,
+                        acquire_timeouts: snapshot.acquire_timeouts,
+                        reset_failures: snapshot.reset_failures,
+                    }
+                }),
             })
             .collect()
     }
@@ -587,6 +636,56 @@ impl PostgresBackendManager {
             output,
             "# TYPE dbproxy_postgres_backend_last_success_timestamp_seconds gauge"
         );
+        for (name, metric_type, help) in [
+            (
+                "dbproxy_postgres_pool_connections",
+                "gauge",
+                "Connections owned by a terminating-mode PostgreSQL backend pool.",
+            ),
+            (
+                "dbproxy_postgres_pool_idle_connections",
+                "gauge",
+                "Idle reset connections in a terminating-mode PostgreSQL backend pool.",
+            ),
+            (
+                "dbproxy_postgres_pool_in_use_connections",
+                "gauge",
+                "Checked-out connections in a terminating-mode PostgreSQL backend pool.",
+            ),
+            (
+                "dbproxy_postgres_pool_capacity",
+                "gauge",
+                "Configured maximum connections in a terminating-mode PostgreSQL backend pool.",
+            ),
+            (
+                "dbproxy_postgres_pool_waiters",
+                "gauge",
+                "Clients waiting for a terminating-mode PostgreSQL backend pool.",
+            ),
+            (
+                "dbproxy_postgres_pool_pressure_ratio",
+                "gauge",
+                "Terminating-mode PostgreSQL pool in-use plus waiter pressure divided by capacity.",
+            ),
+            (
+                "dbproxy_postgres_pool_checkouts_total",
+                "counter",
+                "Terminating-mode PostgreSQL pool checkouts.",
+            ),
+            (
+                "dbproxy_postgres_pool_acquire_timeouts_total",
+                "counter",
+                "Terminating-mode PostgreSQL pool acquisitions that timed out.",
+            ),
+            (
+                "dbproxy_postgres_pool_reset_failures_total",
+                "counter",
+                "PostgreSQL connections discarded because ROLLBACK and DISCARD ALL reset failed.",
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} {metric_type}");
+        }
         for backend in &self.all {
             let labels = format!(
                 "{{backend=\"{}\",role=\"{}\",shard=\"{}\"}}",
@@ -666,6 +765,54 @@ impl PostgresBackendManager {
                 "dbproxy_postgres_backend_last_success_timestamp_seconds{labels} {}",
                 backend.last_health_success.load(Ordering::Relaxed)
             );
+            if let Some(pool) = &backend.sql_pool {
+                let pool = pool.snapshot();
+                let _ = writeln!(
+                    output,
+                    "dbproxy_postgres_pool_connections{labels} {}",
+                    pool.total
+                );
+                let _ = writeln!(
+                    output,
+                    "dbproxy_postgres_pool_idle_connections{labels} {}",
+                    pool.idle
+                );
+                let _ = writeln!(
+                    output,
+                    "dbproxy_postgres_pool_in_use_connections{labels} {}",
+                    pool.in_use
+                );
+                let _ = writeln!(
+                    output,
+                    "dbproxy_postgres_pool_capacity{labels} {}",
+                    pool.capacity
+                );
+                let _ = writeln!(
+                    output,
+                    "dbproxy_postgres_pool_waiters{labels} {}",
+                    pool.waiters
+                );
+                let _ = writeln!(
+                    output,
+                    "dbproxy_postgres_pool_pressure_ratio{labels} {}",
+                    pool.pressure_millis as f64 / 1_000.0
+                );
+                let _ = writeln!(
+                    output,
+                    "dbproxy_postgres_pool_checkouts_total{labels} {}",
+                    pool.checkouts
+                );
+                let _ = writeln!(
+                    output,
+                    "dbproxy_postgres_pool_acquire_timeouts_total{labels} {}",
+                    pool.acquire_timeouts
+                );
+                let _ = writeln!(
+                    output,
+                    "dbproxy_postgres_pool_reset_failures_total{labels} {}",
+                    pool.reset_failures
+                );
+            }
         }
     }
 }
@@ -687,6 +834,21 @@ pub struct PostgresBackendStatus {
     pub connection_attempts: u64,
     pub connection_failures: u64,
     pub active_connections: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction_pool: Option<PostgresPoolStatus>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PostgresPoolStatus {
+    pub capacity: usize,
+    pub total: u64,
+    pub idle: u64,
+    pub in_use: u64,
+    pub waiters: i64,
+    pub pressure_millis: u64,
+    pub checkouts: u64,
+    pub acquire_timeouts: u64,
+    pub reset_failures: u64,
 }
 
 pub async fn serve(
@@ -694,10 +856,18 @@ pub async fn serve(
     endpoint: PostgresEndpoint,
     manager: Arc<PostgresBackendManager>,
     metrics: Arc<Metrics>,
-    config: PostgresConfig,
+    options: Arc<PostgresServeOptions>,
     admission: Arc<Semaphore>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let config = &options.config;
+    if config.routing_mode == crate::config::PostgresRoutingMode::Transaction {
+        terminate::serve(
+            listener, endpoint, manager, metrics, options, admission, shutdown,
+        )
+        .await;
+        return;
+    }
     let mut sessions = JoinSet::new();
     let shard_router = Arc::new(ProtocolShardRouter::new(&config.sharding));
     loop {
@@ -1139,16 +1309,23 @@ mod tests {
             role,
             weight,
             shard: "default".to_owned(),
+            username: String::new(),
+            password: String::new(),
+            database: String::new(),
+            tls: crate::config::PostgresReadinessTlsConfig::default(),
             readiness_probe: None,
         }
     }
 
     #[test]
     fn read_write_endpoint_always_selects_primary() {
-        let manager = PostgresBackendManager::from_config(&[
-            backend("primary", BackendRole::Primary, 1),
-            backend("replica", BackendRole::Replica, 1),
-        ])
+        let manager = PostgresBackendManager::from_config(
+            &[
+                backend("primary", BackendRole::Primary, 1),
+                backend("replica", BackendRole::Replica, 1),
+            ],
+            &PostgresConfig::default(),
+        )
         .unwrap()
         .unwrap();
         assert_eq!(
@@ -1162,10 +1339,13 @@ mod tests {
 
     #[test]
     fn read_only_endpoint_requires_a_healthy_replica() {
-        let manager = PostgresBackendManager::from_config(&[
-            backend("primary", BackendRole::Primary, 1),
-            backend("replica", BackendRole::Replica, 1),
-        ])
+        let manager = PostgresBackendManager::from_config(
+            &[
+                backend("primary", BackendRole::Primary, 1),
+                backend("replica", BackendRole::Replica, 1),
+            ],
+            &PostgresConfig::default(),
+        )
         .unwrap()
         .unwrap();
         assert!(manager.select(PostgresEndpoint::ReadOnly, None).is_none());
@@ -1262,9 +1442,10 @@ mod tests {
         first.shard = "s0".to_owned();
         let mut second = backend("s1-primary", BackendRole::Primary, 1);
         second.shard = "s1".to_owned();
-        let manager = PostgresBackendManager::from_config(&[first, second])
-            .unwrap()
-            .unwrap();
+        let manager =
+            PostgresBackendManager::from_config(&[first, second], &PostgresConfig::default())
+                .unwrap()
+                .unwrap();
         assert_eq!(
             manager
                 .select(PostgresEndpoint::ReadWrite, Some("s1"))

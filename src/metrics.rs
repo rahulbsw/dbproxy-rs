@@ -73,6 +73,13 @@ pub struct Metrics {
     postgres_cancel_requests: AtomicU64,
     postgres_shard_routes: AtomicU64,
     postgres_shard_routing_failures: AtomicU64,
+    postgres_terminated_queries: AtomicU64,
+    postgres_queries_primary: AtomicU64,
+    postgres_queries_replica: AtomicU64,
+    postgres_transaction_pins: AtomicU64,
+    postgres_session_pins: AtomicU64,
+    postgres_read_only_rejections: AtomicU64,
+    postgres_statement_routing_failures: AtomicU64,
     redis_active_clients: AtomicI64,
     redis_accepted_clients: AtomicU64,
     redis_rejected_clients: AtomicU64,
@@ -364,6 +371,40 @@ impl Metrics {
 
     pub fn postgres_shard_routing_failed(&self) {
         self.postgres_shard_routing_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn postgres_terminated_query(&self) {
+        self.postgres_terminated_queries
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn postgres_query_primary(&self) {
+        self.postgres_queries_primary
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn postgres_query_replica(&self) {
+        self.postgres_queries_replica
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn postgres_transaction_pin(&self) {
+        self.postgres_transaction_pins
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn postgres_session_pin(&self) {
+        self.postgres_session_pins.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn postgres_read_only_rejected(&self) {
+        self.postgres_read_only_rejections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn postgres_statement_routing_failed(&self) {
+        self.postgres_statement_routing_failures
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1015,6 +1056,56 @@ impl Metrics {
             "counter",
             "PostgreSQL connections rejected because shard selection failed.",
             self.postgres_shard_routing_failures.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_postgres_terminated_queries_total",
+            "counter",
+            "Queries handled by PostgreSQL terminating transaction-pool mode.",
+            self.postgres_terminated_queries.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_postgres_queries_primary_total",
+            "counter",
+            "Terminated PostgreSQL queries routed to a primary pool.",
+            self.postgres_queries_primary.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_postgres_queries_replica_total",
+            "counter",
+            "Terminated PostgreSQL queries routed to a replica pool.",
+            self.postgres_queries_replica.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_postgres_transaction_pins_total",
+            "counter",
+            "PostgreSQL terminating sessions pinned for a transaction.",
+            self.postgres_transaction_pins.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_postgres_session_pins_total",
+            "counter",
+            "PostgreSQL terminating sessions pinned for session state.",
+            self.postgres_session_pins.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_postgres_read_only_rejections_total",
+            "counter",
+            "Writes and session-state statements rejected on the terminated PostgreSQL read-only listener.",
+            self.postgres_read_only_rejections.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_postgres_statement_routing_failures_total",
+            "counter",
+            "Terminated PostgreSQL statements rejected because safe routing could not be proven.",
+            self.postgres_statement_routing_failures
+                .load(Ordering::Relaxed),
         );
         metric(
             &mut output,

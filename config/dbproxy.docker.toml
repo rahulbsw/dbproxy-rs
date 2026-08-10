@@ -22,10 +22,15 @@ request_timeout_seconds = 5
 
 [postgres]
 enabled = true
+routing_mode = "transparent"
 read_write_listen = "0.0.0.0:6432"
 read_only_listen = "0.0.0.0:6433"
 max_connections = 128
 connect_timeout_seconds = 5
+query_timeout_seconds = 30
+pool_acquire_timeout_seconds = 5
+pool_max_per_backend = 32
+read_after_write_seconds = 2
 shutdown_grace_seconds = 10
 fallback_to_primary = true
 relay_buffer_bytes = 32768

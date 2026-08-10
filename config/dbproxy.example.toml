@@ -45,13 +45,18 @@ use_webpki_roots = false
 
 [postgres]
 # PostgreSQL/TimescaleDB forwarding is disabled in the starter topology.
-# When enabled, clients authenticate directly with the selected PostgreSQL
-# backend and TLS remains end to end.
+# "transparent" keeps end-to-end authentication and full wire compatibility.
+# "transaction" terminates simple queries for routing and backend pooling.
 enabled = false
+routing_mode = "transparent"
 read_write_listen = "0.0.0.0:6432"
 read_only_listen = "0.0.0.0:6433"
 max_connections = 1024
 connect_timeout_seconds = 5
+query_timeout_seconds = 30
+pool_acquire_timeout_seconds = 5
+pool_max_per_backend = 32
+read_after_write_seconds = 2
 shutdown_grace_seconds = 10
 fallback_to_primary = true
 # Per-direction transparent relay buffer. Each connection owns two buffers.
@@ -71,6 +76,14 @@ strategy = "hash"
 # role = "primary"
 # weight = 1
 # shard = "default"
+# Required only with routing_mode = "transaction":
+# username = "dbproxy_pool"
+# password = "replace-with-secret-injected-at-deploy-time"
+# database = "app"
+# [postgres_backends.tls]
+# enabled = true
+# use_webpki_roots = false
+# ca_path = "/etc/dbproxy/tls/postgres-ca.pem"
 #
 # Optional authenticated SQL readiness. Without this block DBProxy uses a TCP
 # transport probe. Environment expansion keeps the password out of this file.

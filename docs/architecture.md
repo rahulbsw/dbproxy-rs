@@ -8,7 +8,8 @@ Primary and replica backends already own independent bounded pools. Replica
 selection preserves configured weights among similarly loaded pools and avoids
 a pool whose in-use-plus-waiter pressure is materially higher than its peers.
 
-PostgreSQL/TimescaleDB is transparent and connection-pinned:
+PostgreSQL/TimescaleDB defaults to transparent connection pinning and also has
+an opt-in terminating simple-query path:
 
 ```mermaid
 flowchart LR
@@ -23,10 +24,11 @@ flowchart LR
 ```
 
 The startup shard key is removed before transparent forwarding, which preserves
-the complete PostgreSQL protocol, including
-extended queries, binary types, COPY, cancellation, and TLS. The database
-performs authentication. A future protocol-terminating mode is required for
-transaction pooling or statement-level routing.
+the complete PostgreSQL protocol, including extended queries, binary types,
+COPY, cancellation, and TLS. The database performs authentication. Transaction
+mode authenticates the frontend, parses simple-query statements, pins
+transaction/session state, and reuses safely reset backend connections; see
+[PostgreSQL transaction pooling](postgres-pooling.md).
 
 Redis connection mode uses the same connection-pinned transport model:
 

@@ -19,6 +19,10 @@ Completed:
   weighted backend selection, COPY/extended-protocol preservation, cancellation
   broadcast, unsharded end-to-end TLS, optional authenticated SQL readiness
   with verified TLS or mTLS, transport health, and metrics
+- opt-in PostgreSQL/TimescaleDB simple-query termination with frontend
+  authentication/TLS, independently verified backend TLS, bounded transaction
+  pools, SQL read/write routing, transaction/session pinning, post-write
+  consistency, cancellation, and per-pool pressure metrics
 - transparent Redis read-write and read-only listeners with RESP2/RESP3
   preservation, weighted replica selection, end-to-end AUTH/ACL and unsharded TLS,
   graceful draining, transport health, and metrics

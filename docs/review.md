@@ -75,10 +75,13 @@
   passing through DBProxy. Streaming reads and direct database writes bypass
   its coherence contract; use bounded TTLs or an external CDC
   invalidator for those topologies.
-- PostgreSQL forwarding is connection-pinned and does not yet provide protocol
-  termination, transaction pooling, or SQL-level read/write splitting.
-- PostgreSQL startup sharding cannot coexist with native end-to-end TLS because
-  the startup shard selector would be encrypted.
+- PostgreSQL transparent forwarding remains connection-pinned. The optional
+  terminating mode adds bounded transaction pools and simple-query read/write
+  routing, but extended queries, `COPY`, and binary/extension type fidelity
+  remain on transparent mode.
+- PostgreSQL startup sharding cannot be inspected through native end-to-end TLS.
+  Terminating mode supports frontend TLS termination followed by a separately
+  verified backend TLS or mTLS hop.
 - Redis/Valkey connection mode preserves Pub/Sub, transactions, scripts, RESP3
   pushes, AUTH/ACL, TLS, and large values. Command mode intentionally rejects
   those stateful/streaming shapes when safe multi-shard semantics are not

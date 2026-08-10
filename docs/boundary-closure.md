@@ -11,8 +11,8 @@ The live status is also available from `GET /capabilities` and
 
 | Boundary | Disposition | Closure |
 | --- | --- | --- |
-| PostgreSQL one backend connection per client | New protocol engine | Terminate PostgreSQL startup/authentication and extended query messages, then add transaction pooling with session-state pinning |
-| PostgreSQL statement read/write splitting | New protocol engine | Classify parsed statements only after termination; pin transactions, portals, COPY, prepared statements, and unsafe session state |
+| PostgreSQL one backend connection per client | Implemented, constrained | Opt-in simple-query termination adds transaction pools and session/transaction pinning; extended queries and COPY remain transparent |
+| PostgreSQL statement read/write splitting | Implemented, constrained | Parsed single simple-query statements route by role with transaction pinning and post-write consistency; portals and COPY remain transparent |
 | Sharding inside end-to-end PostgreSQL TLS | Protocol invariant | Offer client TLS termination at DBProxy plus independently verified backend TLS; encrypted end-to-end startup metadata cannot also be inspected |
 | Authenticated readiness over TLS | Implemented | Per-backend certificate/hostname-verified TLS and optional mTLS for `SELECT 1` probes |
 | Redis selector before AUTH/HELLO | Command-engine work | Add an authenticated command-routing frontend; transparent connection mode cannot choose a key shard before it sees a key |
@@ -49,17 +49,18 @@ Acceptance requires fault tests for topology changes during connection
 establishment and active requests. An instance must fail readiness if it cannot
 prove one coherent topology/configuration epoch.
 
-### Phase 3: PostgreSQL termination and pooling
+### Phase 3: PostgreSQL termination and pooling (simple-query milestone complete)
 
 Implement a separate listener mode; do not alter transparent mode:
 
-1. client TLS termination and PostgreSQL startup/authentication;
-2. independently verified TLS connections to backends;
-3. simple and extended query parsing with portal/prepared-statement ownership;
-4. transaction pooling for sessions with replayable state;
-5. pinning for transactions, COPY, temporary objects, advisory locks, LISTEN,
-   cursors, and unknown state;
-6. statement-level read/write routing with post-write consistency windows.
+Implemented: client TLS termination and MD5 authentication, independently
+verified backend TLS/mTLS, bounded transaction pools, parsed simple-query
+routing, read-after-write consistency, exact transaction pinning, conservative
+session-state pinning, cancellation, reset-before-reuse, and pool metrics.
+
+Remaining in this phase: extended-query portal/prepared ownership, `COPY`,
+binary/extension result fidelity, and finer-grained handling for temporary
+objects and advisory locks. Those shapes continue to use transparent mode.
 
 Cancellation keys must map to the exact in-flight backend. Pool reuse requires
 an explicit reset that proves no transaction, portal, prepared statement,

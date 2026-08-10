@@ -76,7 +76,8 @@ impl Proxy {
         config.validate()?;
         let backends = BackendManager::from_config(&config.backends)?;
         let frontend_tls = tls::frontend_server_config(&config.proxy.tls)?;
-        let postgres_backends = PostgresBackendManager::from_config(&config.postgres_backends)?;
+        let postgres_backends =
+            PostgresBackendManager::from_config(&config.postgres_backends, &config.postgres)?;
         let redis_backends = RedisBackendManager::from_config(&config.redis_backends)?;
         Ok(Self {
             config: Arc::new(config),
@@ -233,6 +234,12 @@ impl Proxy {
             shutdown_rx.clone(),
         ));
         let mut postgres_tasks = Vec::new();
+        let postgres_options = Arc::new(postgres::PostgresServeOptions {
+            config: self.config.postgres.clone(),
+            users: self.config.users.clone(),
+            frontend_tls: self.frontend_tls.clone(),
+            frontend_tls_mode: self.config.proxy.tls.mode,
+        });
         if let (Some(listener), Some(manager)) =
             (postgres_read_write_listener, self.postgres_backends.clone())
         {
@@ -241,7 +248,7 @@ impl Proxy {
                 PostgresEndpoint::ReadWrite,
                 manager,
                 self.metrics.clone(),
-                self.config.postgres.clone(),
+                postgres_options.clone(),
                 postgres_admission.clone(),
                 shutdown_rx.clone(),
             )));
@@ -254,7 +261,7 @@ impl Proxy {
                 PostgresEndpoint::ReadOnly,
                 manager,
                 self.metrics.clone(),
-                self.config.postgres.clone(),
+                postgres_options,
                 postgres_admission,
                 shutdown_rx.clone(),
             )));

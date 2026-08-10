@@ -37,18 +37,18 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "postgres_protocol_termination",
-        status: CapabilityStatus::Planned,
-        contract: "required before transaction pooling or statement-level routing",
+        status: CapabilityStatus::Constrained,
+        contract: "opt-in simple-query protocol termination with MD5 frontend authentication and independently verified backend TLS; use transparent mode for extended protocol and COPY",
     },
     Capability {
         name: "postgres_transaction_pooling",
-        status: CapabilityStatus::Planned,
-        contract: "requires protocol termination and session-state pinning",
+        status: CapabilityStatus::Constrained,
+        contract: "bounded per-backend pools reset with ROLLBACK and DISCARD ALL; transactions and unsafe session state are pinned",
     },
     Capability {
         name: "postgres_statement_read_write_split",
-        status: CapabilityStatus::Planned,
-        contract: "requires protocol termination, SQL classification, and transaction pinning",
+        status: CapabilityStatus::Constrained,
+        contract: "single parsed simple-query statements route reads to replicas and writes to primaries with read-after-write consistency",
     },
     Capability {
         name: "postgres_connection_sharding",

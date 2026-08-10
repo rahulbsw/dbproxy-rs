@@ -1,9 +1,10 @@
 # PostgreSQL, TimescaleDB, Redis, and Valkey sharding
 
-PostgreSQL/TimescaleDB and the default Redis/Valkey mode remain
+PostgreSQL/TimescaleDB transparent mode and the default Redis/Valkey mode remain
 connection-pinned so backend authentication and protocol state retain native
-semantics. Redis/Valkey additionally offers an opt-in command-routing mode for
-proxy-side key hashing and explicitly supported multi-key operations.
+semantics. PostgreSQL transaction mode routes simple-query statements within a
+startup-selected shard, while Redis/Valkey additionally offers command routing
+for proxy-side key hashing and explicitly supported multi-key operations.
 
 Every configured shard must have exactly one primary and may have weighted
 replicas. Read-write listener connections use that shard's primary. Read-only
@@ -21,11 +22,14 @@ PGOPTIONS='-c dbproxy.shard_key=tenant-42' \
   psql 'host=127.0.0.1 port=6432 user=proxy dbname=app'
 ```
 
-When a client first requests PostgreSQL SSL or GSS encryption, sharded mode
+In transparent mode, when a client first requests PostgreSQL SSL or GSS encryption, sharded mode
 responds `N` so a `prefer` client can send the readable StartupMessage. Clients
 requiring end-to-end PostgreSQL TLS cannot use startup-based sharding because
 the shard key is encrypted. Terminate transport TLS in a trusted sidecar,
-service mesh, or load balancer before DBProxy when this mode is used.
+service mesh, or load balancer before DBProxy when this mode is used. In
+`routing_mode = "transaction"`, DBProxy can terminate configured frontend TLS,
+read the startup selector, and use an independently verified backend TLS/mTLS
+connection.
 
 ## Redis and Valkey connection selection
 

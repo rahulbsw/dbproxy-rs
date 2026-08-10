@@ -155,10 +155,15 @@ impl Default for CacheRuleConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct PostgresConfig {
     pub enabled: bool,
+    pub routing_mode: PostgresRoutingMode,
     pub read_write_listen: SocketAddr,
     pub read_only_listen: Option<SocketAddr>,
     pub max_connections: usize,
     pub connect_timeout_seconds: u64,
+    pub query_timeout_seconds: u64,
+    pub pool_acquire_timeout_seconds: u64,
+    pub pool_max_per_backend: usize,
+    pub read_after_write_seconds: u64,
     pub shutdown_grace_seconds: u64,
     pub fallback_to_primary: bool,
     pub relay_buffer_bytes: usize,
@@ -170,6 +175,7 @@ impl Default for PostgresConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            routing_mode: PostgresRoutingMode::Transparent,
             read_write_listen: "0.0.0.0:6432"
                 .parse()
                 .expect("valid default PostgreSQL read-write address"),
@@ -180,6 +186,10 @@ impl Default for PostgresConfig {
             ),
             max_connections: 1024,
             connect_timeout_seconds: 5,
+            query_timeout_seconds: 30,
+            pool_acquire_timeout_seconds: 5,
+            pool_max_per_backend: 32,
+            read_after_write_seconds: 2,
             shutdown_grace_seconds: 10,
             fallback_to_primary: true,
             relay_buffer_bytes: default_relay_buffer_bytes(),
@@ -187,6 +197,14 @@ impl Default for PostgresConfig {
             sharding: ProtocolShardingConfig::default(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PostgresRoutingMode {
+    #[default]
+    Transparent,
+    Transaction,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -408,6 +426,14 @@ pub struct PostgresBackendConfig {
     pub weight: u32,
     #[serde(default = "default_shard")]
     pub shard: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub database: String,
+    #[serde(default)]
+    pub tls: PostgresReadinessTlsConfig,
     #[serde(default)]
     pub readiness_probe: Option<PostgresReadinessProbeConfig>,
 }
@@ -1250,6 +1276,9 @@ impl Config {
         }
         if self.postgres.max_connections == 0
             || self.postgres.connect_timeout_seconds == 0
+            || self.postgres.query_timeout_seconds == 0
+            || self.postgres.pool_acquire_timeout_seconds == 0
+            || self.postgres.pool_max_per_backend == 0
             || self.postgres.shutdown_grace_seconds == 0
         {
             return Err(ProxyError::Config(
@@ -1317,6 +1346,15 @@ impl Config {
                 *primaries_by_shard.entry(&backend.shard).or_default() += 1;
             }
             parse_backend_address(&backend.address)?;
+            validate_postgres_tls(backend, &backend.tls, "tls")?;
+            if self.postgres.routing_mode == PostgresRoutingMode::Transaction
+                && (backend.username.trim().is_empty() || backend.database.trim().is_empty())
+            {
+                return Err(ProxyError::Config(format!(
+                    "PostgreSQL transaction routing requires username and database for backend {:?}",
+                    backend.name
+                )));
+            }
             if let Some(probe) = &backend.readiness_probe
                 && (probe.username.trim().is_empty()
                     || probe.password.is_empty()
@@ -1328,7 +1366,7 @@ impl Config {
                 )));
             }
             if let Some(probe) = &backend.readiness_probe {
-                validate_postgres_readiness_tls(backend, &probe.tls)?;
+                validate_postgres_tls(backend, &probe.tls, "readiness_probe.tls")?;
             }
         }
         let backend_shards = self
@@ -1342,6 +1380,19 @@ impl Config {
                 return Err(ProxyError::Config(format!(
                     "PostgreSQL shard {shard:?} requires exactly one primary backend, found {primaries}"
                 )));
+            }
+            if self.postgres.routing_mode == PostgresRoutingMode::Transaction {
+                let databases = self
+                    .postgres_backends
+                    .iter()
+                    .filter(|backend| backend.shard == *shard)
+                    .map(|backend| backend.database.as_str())
+                    .collect::<HashSet<_>>();
+                if databases.len() != 1 {
+                    return Err(ProxyError::Config(format!(
+                        "PostgreSQL transaction pools for shard {shard:?} must use one database"
+                    )));
+                }
             }
         }
         validate_protocol_sharding("postgres", &self.postgres.sharding, &backend_shards)
@@ -1577,9 +1628,10 @@ fn validate_backend_tls(backend: &BackendConfig) -> Result<(), ProxyError> {
     Ok(())
 }
 
-fn validate_postgres_readiness_tls(
+fn validate_postgres_tls(
     backend: &PostgresBackendConfig,
     tls: &PostgresReadinessTlsConfig,
+    scope: &str,
 ) -> Result<(), ProxyError> {
     if !tls.enabled {
         if tls.ca_path.is_some()
@@ -1588,32 +1640,32 @@ fn validate_postgres_readiness_tls(
             || !tls.use_webpki_roots
         {
             return Err(ProxyError::Config(format!(
-                "PostgreSQL backend {:?} readiness_probe.tls options require enabled = true",
-                backend.name
+                "PostgreSQL backend {:?} {scope} options require enabled = true",
+                backend.name,
             )));
         }
         return Ok(());
     }
     if !tls.use_webpki_roots && tls.ca_path.is_none() {
         return Err(ProxyError::Config(format!(
-            "PostgreSQL backend {:?} readiness_probe.tls requires ca_path when WebPKI roots are disabled",
-            backend.name
+            "PostgreSQL backend {:?} {scope} requires ca_path when WebPKI roots are disabled",
+            backend.name,
         )));
     }
     if tls.client_cert_path.is_some() != tls.client_key_path.is_some() {
         return Err(ProxyError::Config(format!(
-            "PostgreSQL backend {:?} readiness_probe.tls client_cert_path and client_key_path must be configured together",
-            backend.name
+            "PostgreSQL backend {:?} {scope} client_cert_path and client_key_path must be configured together",
+            backend.name,
         )));
     }
     if let Some(path) = tls.ca_path.as_deref() {
-        validate_readable_file(path, "PostgreSQL readiness TLS ca_path")?;
+        validate_readable_file(path, &format!("PostgreSQL {scope} ca_path"))?;
     }
     if let Some(path) = tls.client_cert_path.as_deref() {
-        validate_readable_file(path, "PostgreSQL readiness TLS client_cert_path")?;
+        validate_readable_file(path, &format!("PostgreSQL {scope} client_cert_path"))?;
     }
     if let Some(path) = tls.client_key_path.as_deref() {
-        validate_readable_file(path, "PostgreSQL readiness TLS client_key_path")?;
+        validate_readable_file(path, &format!("PostgreSQL {scope} client_key_path"))?;
     }
     Ok(())
 }
@@ -2387,9 +2439,74 @@ mod tests {
 
     #[test]
     fn performance_controls_have_safe_defaults() {
+        assert_eq!(
+            PostgresConfig::default().routing_mode,
+            PostgresRoutingMode::Transparent
+        );
         assert_eq!(PostgresConfig::default().relay_buffer_bytes, 32 * 1024);
         assert_eq!(RedisConfig::default().relay_buffer_bytes, 32 * 1024);
         assert_eq!(WriteFanoutConfig::default().max_concurrency, 8);
+    }
+
+    #[test]
+    fn validates_postgres_transaction_pool_credentials_and_database_affinity() {
+        let raw = r#"
+            [proxy]
+            listen = "127.0.0.1:3307"
+
+            [postgres]
+            enabled = true
+            routing_mode = "transaction"
+            read_write_listen = "127.0.0.1:6432"
+            read_only_listen = "127.0.0.1:6433"
+
+            [[users]]
+            username = "app"
+            password = "secret"
+
+            [[backends]]
+            name = "mysql"
+            address = "127.0.0.1:3306"
+            role = "primary"
+            username = "root"
+            password = ""
+
+            [[postgres_backends]]
+            name = "pg-primary"
+            address = "127.0.0.1:5432"
+            role = "primary"
+            username = "pool"
+            password = "pool-secret"
+            database = "app"
+
+            [[postgres_backends]]
+            name = "pg-replica"
+            address = "127.0.0.1:5433"
+            role = "replica"
+            username = "pool"
+            password = "pool-secret"
+            database = "app"
+        "#;
+        let mut config: Config = toml::from_str(raw).unwrap();
+        config.validate().unwrap();
+
+        config.postgres_backends[1].database = "analytics".to_owned();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must use one database")
+        );
+        config.postgres_backends[1].database = "app".to_owned();
+        config.postgres_backends[0].username.clear();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("requires username and database")
+        );
     }
 
     #[test]

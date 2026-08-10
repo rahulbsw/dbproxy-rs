@@ -56,8 +56,8 @@ validate replication role, or measure replica lag.
 | Pools | shared pool connection/idle/in-use/waiter/pressure metrics, `dbproxy_backend_reserved_pool_enabled`, reserved connection/idle/in-use/waiter metrics, and shared pool failure/reset/discard counters |
 | Admin/shutdown | `dbproxy_admin_active_connections`, `dbproxy_admin_requests_total`, `dbproxy_admin_rejected_connections_total`, `dbproxy_forced_shutdowns_total` |
 | Capabilities | `dbproxy_capability_info{capability,status}`; the same contracts are available from `/capabilities` |
-| PostgreSQL clients | `dbproxy_postgres_active_clients`, accepted/rejected/error totals, directional forwarded bytes, connection failures, replica fallbacks, shard routes, and shard-routing failures |
-| PostgreSQL backends | `dbproxy_postgres_backend_healthy{mode}`, `dbproxy_postgres_backend_transport_healthy`, `dbproxy_postgres_backend_sql_healthy`, `dbproxy_postgres_backend_sql_health_checks_total{outcome}`, connection totals and failures |
+| PostgreSQL clients | active/accepted/rejected/error totals, transparent wire bytes, terminated queries, primary/replica routes, transaction/session pins, read-only rejections, cancellations, and statement/shard-routing failures |
+| PostgreSQL backends | health and SQL-probe metrics, connection totals/failures, and transaction-pool total/idle/in-use/waiter/pressure/checkouts/acquire-timeout/reset-failure metrics |
 | Redis/Valkey clients | `dbproxy_redis_active_clients`, accepted/rejected/error totals, directional forwarded bytes, connection failures, replica fallbacks, shard routes, command totals, read-only rejections, cross-shard commands, routing failures, generated fanout subcommands, partial-write failures |
 | Redis backends | `dbproxy_redis_backend_transport_healthy`, `dbproxy_redis_backend_connections_total`, `dbproxy_redis_backend_connection_failures_total`, active connections, health-check outcomes, and health timestamps |
 
@@ -89,6 +89,11 @@ database values are never used as labels.
   undersized downstream consumer.
 - `dbproxy_postgres_backend_transport_healthy{role="primary"} == 0`: the
   PostgreSQL/TimescaleDB primary cannot accept TCP connections.
+- Sustained `dbproxy_postgres_pool_waiters > 0` or increasing
+  `dbproxy_postgres_pool_acquire_timeouts_total`: a transaction pool is
+  saturated or its backend is slow to connect.
+- Any increase in `dbproxy_postgres_pool_reset_failures_total`: an unsafe
+  connection was discarded because its state could not be reset.
 - `dbproxy_postgres_backend_healthy{role="primary"} == 0` while transport is
   healthy: authenticated SQL readiness, credentials, or database selection is
   failing.

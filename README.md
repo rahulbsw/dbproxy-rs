@@ -5,7 +5,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org/)
 
 `dbproxy-rs` is a clean-room Rust database proxy supporting MySQL plus
-transparent PostgreSQL/TimescaleDB and Redis/Valkey forwarding. It adopts useful
+PostgreSQL/TimescaleDB and Redis/Valkey routing. It adopts useful
 operational ideas from Meituan DBProxy and ProxySQL—read/write hostgroups,
 weighted replica selection, health-aware failover, SQL filtering, connection
 pools, transaction affinity, sharding, guarded write fanout, and metrics—without
@@ -28,7 +28,7 @@ graduation criteria.
 | Protocol | Proxy behavior | Read/write routing | Sharding | Backend connection model |
 | --- | --- | --- | --- | --- |
 | MySQL | Protocol termination, authentication, TLS upgrade, SQL parsing, prepared statements | Statement-level with transaction and session affinity | Statement key or explicit shard hint; hash, range, and exact value | Independent bounded pool per configured backend |
-| PostgreSQL / TimescaleDB | Transparent wire relay preserving extended protocol, `COPY`, types, cancellation, and notices | Separate read-write and read-only listeners | Startup-key connection pinning; hash, range, and exact value | One selected backend connection per client connection |
+| PostgreSQL / TimescaleDB | Transparent wire relay, or opt-in simple-query termination with transaction pooling | Connection-level or statement-level read/write routing | Startup-key pinning; hash, range, and exact value | Transparent sessions or bounded per-backend pools |
 | Redis / Valkey connection mode | Transparent RESP2/RESP3 relay | Separate read-write and read-only listeners | `DBPROXY.SHARD` connection pinning; hash, range, and exact value | One selected backend connection per client connection |
 | Redis / Valkey command mode | Bounded command parsing and proxy-side key placement | Command key and listener role | CRC16 hash tags or stable hash, range, and exact value; guarded multi-key fanout | One connection per used shard for each client session |
 
@@ -262,18 +262,25 @@ remains a backward-compatible alias. To override auto-detection, set
 
 ## PostgreSQL and TimescaleDB
 
-PostgreSQL compatibility uses transparent wire forwarding. DBProxy does not
-decode or re-encode query results, so PostgreSQL drivers retain extended-query
-behavior, binary and extension types, `COPY`, cancellation, notices,
-notifications, and TimescaleDB-specific messages.
+PostgreSQL compatibility has two explicit modes. The default `transparent` mode
+does not decode or re-encode traffic, so drivers retain extended queries,
+binary and extension types, `COPY`, cancellation, notices, notifications, and
+TimescaleDB-specific messages. The opt-in `transaction` mode terminates the
+simple-query protocol to pool backend connections and route each safely parsed
+statement.
 
 ```toml
 [postgres]
 enabled = true
+routing_mode = "transparent" # or "transaction"
 read_write_listen = "0.0.0.0:6432"
 read_only_listen = "0.0.0.0:6433"
 max_connections = 1024
 connect_timeout_seconds = 5
+query_timeout_seconds = 30
+pool_acquire_timeout_seconds = 5
+pool_max_per_backend = 32
+read_after_write_seconds = 2
 shutdown_grace_seconds = 10
 fallback_to_primary = true
 relay_buffer_bytes = 32768
@@ -283,6 +290,16 @@ name = "timescale-primary"
 address = "timescale-primary.internal:5432"
 role = "primary"
 weight = 1
+# Required only by routing_mode = "transaction".
+username = "dbproxy_pool"
+password = "${DBPROXY_POSTGRES_POOL_PASSWORD}"
+database = "app"
+
+# Optional verified TLS/mTLS for transaction-pool backend connections.
+[postgres_backends.tls]
+enabled = true
+use_webpki_roots = false
+ca_path = "/etc/dbproxy/tls/postgres-ca.pem"
 
 [postgres_backends.readiness_probe]
 username = "dbproxy_health"
@@ -301,12 +318,11 @@ role = "replica"
 weight = 2
 ```
 
-Connections on the read-write listener are pinned to the primary. Connections
-on the read-only listener are distributed across healthy replicas, falling back
-to the primary only when configured. Authentication remains end to end.
-Unsharded mode also preserves native end-to-end TLS; startup-sharded mode needs
-external TLS termination because DBProxy must read the selector. PostgreSQL
-client credentials and private keys are not stored by DBProxy. An optional
+In transparent mode, connections on the read-write listener are pinned to the
+primary and read-only connections are distributed across healthy replicas.
+Authentication remains end to end. Unsharded mode preserves native end-to-end
+TLS; startup-sharded transparent mode needs external TLS termination because
+DBProxy must read the selector. An optional
 per-backend `readiness_probe` uses a separate least-privilege role to
 authenticate and execute `SELECT 1`; omit it to retain TCP-only health checks.
 Readiness TLS verifies the certificate chain and the hostname from the backend
@@ -319,10 +335,16 @@ option is removed before forwarding. See
 [docs/protocol-sharding.md](docs/protocol-sharding.md) for hash, range, and
 exact-value configurations.
 
-The adapter is session-level rather than statement-level. It deliberately does
-not move a PostgreSQL transaction between servers. Enforce read-only access with
-PostgreSQL roles, `default_transaction_read_only`, or genuinely read-only
-replicas; the endpoint name alone is not a database permission boundary.
+In transaction mode, DBProxy authenticates frontend users from `[[users]]`,
+terminates optional frontend TLS, opens independently authenticated/TLS backend
+connections, and routes read-only statements to the least-pressured healthy
+replica. Writes, transactions, unsafe session state, and the post-write
+consistency window use the shard primary. Transactions and session state pin a
+backend connection; released connections are reset with `ROLLBACK; DISCARD
+ALL`. This mode accepts exactly one parseable statement per simple-query
+message and rejects writes on the read-only listener. Extended queries, `COPY`,
+Pub/Sub-like `LISTEN` workflows, and extension/binary type fidelity should use
+transparent mode. See [PostgreSQL transaction pooling](docs/postgres-pooling.md).
 
 ## Redis and Valkey
 
@@ -565,12 +587,12 @@ recommendations.
 
 ## Current boundaries
 
-- PostgreSQL mode uses one backend TCP connection per client connection; protocol
-  termination, transaction pooling, and statement-level read/write splitting
-  are not yet implemented
-- PostgreSQL/TimescaleDB sharding is connection-level. End-to-end PostgreSQL TLS
-  hides startup shard metadata, so sharded mode requires a plaintext trusted hop
-  or external TLS termination
+- PostgreSQL transaction mode currently supports the simple-query protocol;
+  extended query, prepared portals, `COPY`, and binary/extension result types
+  remain on transparent mode
+- PostgreSQL/TimescaleDB sharding is startup-selected. Transparent end-to-end TLS
+  hides the selector; transaction mode can terminate frontend TLS and use a
+  separately verified TLS or mTLS backend hop
 - PostgreSQL readiness defaults to TCP transport. Authenticated SQL probes can
   use certificate/hostname-verified TLS or mTLS; plaintext probes remain an
   explicit trusted-network option

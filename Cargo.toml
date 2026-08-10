@@ -28,6 +28,7 @@ nanoid = "0.5"
 # rustls 0.23 update until a newer opensrv-mysql release is published. Crates.io
 # publication is disabled above so a packaged build cannot lose this source pin.
 opensrv-mysql = { version = "0.7.0", git = "https://github.com/datafuselabs/opensrv", rev = "3142eb545fab811bc9289091781ce6d771cf0bf7" }
+pgwire = { version = "0.40.5", default-features = false, features = ["server-api-ring"] }
 redis-client = { package = "redis", version = "0.32", default-features = false, features = ["connection-manager", "tokio-comp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmp-serde = "1.3"
