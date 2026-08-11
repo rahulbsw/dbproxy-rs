@@ -116,6 +116,12 @@ DBProxy local demo is ready:
   Redis RW/RO:        127.0.0.1:6380 / 127.0.0.1:6381  password=redis-secret
   Health and metrics: http://127.0.0.1:6071
 
+Verify every protocol:
+  ./scripts/smoke.sh
+
+Configure real shards:
+  docs/sharding-examples.md
+
 Stop it with:
   ./deploy.sh local-down
 
@@ -165,11 +171,14 @@ ensure_kubernetes_secret() {
       return
     fi
 
-    kubectl -n "${namespace}" create secret generic "${secret_name}" \
-      --from-literal=DBPROXY_FRONTEND_PASSWORD="${frontend_password}" \
-      --from-literal=DBPROXY_BACKEND_PASSWORD="${backend_password}" \
-      --dry-run=client -o yaml \
-      | kubectl apply -f -
+    local frontend_password_base64
+    local backend_password_base64
+    frontend_password_base64="$(printf '%s' "${frontend_password}" | base64 | tr -d '\n')"
+    backend_password_base64="$(printf '%s' "${backend_password}" | base64 | tr -d '\n')"
+    printf '%s\n' \
+      '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"'"${secret_name}"'"},"type":"Opaque","data":{"DBPROXY_FRONTEND_PASSWORD":"'"${frontend_password_base64}"'","DBPROXY_BACKEND_PASSWORD":"'"${backend_password_base64}"'"}}' \
+      | kubectl -n "${namespace}" apply -f -
+    unset frontend_password_base64 backend_password_base64
     return
   fi
 

@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     io,
+    ops::ControlFlow,
     pin::Pin,
     sync::{
         Arc,
@@ -13,9 +14,10 @@ use std::{
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use bigdecimal::{BigDecimal, ToPrimitive};
 use futures_util::{StreamExt, stream};
 use mysql_async::{
-    Conn, Params, Value,
+    Conn, Params, QueryResult, Value,
     consts::{ColumnFlags as BackendColumnFlags, ColumnType as BackendColumnType},
     prelude::{Protocol, Queryable},
 };
@@ -25,6 +27,7 @@ use opensrv_mysql::{
     ValueInner, plain_run_with_options, secure_run_with_options,
 };
 use sha1::{Digest, Sha1};
+use sqlparser::ast::{Value as SqlValue, ValueWithSpan, VisitMut, VisitorMut};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
@@ -40,7 +43,10 @@ use crate::{
     auth::{verify_caching_sha2_password, verify_native_password},
     backend::{Backend, BackendManager, BackendQueryOutcome},
     cache::{CacheManager, CacheScope, CachedResult},
-    classifier::{QueryKind, SqlAnalysis, SqlClassifier},
+    classifier::{
+        MysqlTransactionEvaluation, MysqlTransactionSemantics, QueryKind, SqlAnalysis,
+        SqlClassifier,
+    },
     config::{Config, FanoutFailurePolicy, FrontendTlsMode, ResultMode},
     control_plane::EtcdControlPlane,
     error::ProxyError,
@@ -49,7 +55,10 @@ use crate::{
     postgres::{self, PostgresBackendManager, PostgresEndpoint},
     redis::{self, RedisBackendManager, RedisEndpoint},
     routing::{RouteTarget, SessionState},
-    sharding::{ShardDecision, ShardRouter},
+    sharding::{
+        AggregateKind, AggregatePlan, PlannedShardQuery, ShardDecision, ShardQueryPlan,
+        ShardRouter, parameterize_mysql_scatter_plan,
+    },
     tls,
     xa::{XaJournal, XaRecord, XaState},
 };
@@ -541,6 +550,19 @@ fn xa_branch_not_found(error: &mysql_async::Error) -> bool {
     matches!(error, mysql_async::Error::Server(server) if server.code == 1397)
 }
 
+fn fanout_error_metadata(error: &ProxyError) -> (&'static str, u16) {
+    match error {
+        ProxyError::Backend(mysql_async::Error::Server(server)) => ("mysql_server", server.code),
+        ProxyError::Backend(mysql_async::Error::Driver(_)) => ("mysql_driver", 0),
+        ProxyError::Backend(mysql_async::Error::Io(_)) => ("mysql_io", 0),
+        ProxyError::Backend(mysql_async::Error::Other(_)) => ("mysql_other", 0),
+        ProxyError::Backend(mysql_async::Error::Url(_)) => ("mysql_url", 0),
+        ProxyError::Config(_) => ("configuration", 0),
+        ProxyError::Io(_) => ("io", 0),
+        ProxyError::Protocol(_) => ("protocol", 0),
+    }
+}
+
 async fn initialize_cache(
     config: &Config,
     metrics: Arc<Metrics>,
@@ -905,6 +927,9 @@ struct PreparedStatement {
     query: String,
     kind: QueryKind,
     atomic_dml: bool,
+    mysql_transaction_semantics: MysqlTransactionSemantics,
+    columns: Vec<Column>,
+    routing_statements: Option<Vec<sqlparser::ast::Statement>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1145,19 +1170,17 @@ impl ProxySession {
         self.session_commands.push(query.to_owned());
     }
 
-    fn shard_decision(&self, query: &str) -> Result<ShardDecision, ProxyError> {
-        self.shard_router
-            .route(query)
-            .map_err(|error| ProxyError::Protocol(error.to_string()))
-    }
-
-    fn shard_decision_from_analysis(
+    fn shard_plan_from_analysis(
         &self,
         query: &str,
         analysis: &SqlAnalysis,
-    ) -> Result<ShardDecision, ProxyError> {
+    ) -> Result<ShardQueryPlan, ProxyError> {
         self.shard_router
-            .route_parsed(query, analysis.statements())
+            .plan_parsed(
+                query,
+                analysis.statements(),
+                self.config.sharding.max_scatter_shards,
+            )
             .map_err(|error| ProxyError::Protocol(error.to_string()))
     }
 
@@ -1198,7 +1221,13 @@ impl ProxySession {
                         ))
                     });
                 } else {
-                    warn!(shard = target, %error, "best-effort write fanout failed");
+                    let (category, mysql_code) = fanout_error_metadata(&error);
+                    warn!(
+                        shard = target,
+                        error.category = category,
+                        error.mysql_code = mysql_code,
+                        "best-effort write fanout failed"
+                    );
                 }
             }
         }
@@ -1578,18 +1607,17 @@ impl ProxySession {
         };
         match kind {
             QueryKind::Write => {
-                let Some(table) = decision.table.as_deref() else {
-                    return;
-                };
-                if manager.rule(table).is_none() {
-                    return;
-                }
-                let scope = CacheScope::new(self.schema.as_deref(), table, &decision.shard);
-                if self.state.in_transaction() {
-                    self.pending_cache_invalidations.insert(scope);
-                } else if let Err(error) = manager.invalidate(&scope).await {
-                    self.metrics.cache_invalidation_failed();
-                    warn!(%error, table, shard = decision.shard, "cache invalidation failed after write");
+                for table in &decision.tables {
+                    if manager.rule(table).is_none() {
+                        continue;
+                    }
+                    let scope = CacheScope::new(self.schema.as_deref(), table, &decision.shard);
+                    if self.state.in_transaction() || !self.state.autocommit_enabled() {
+                        self.pending_cache_invalidations.insert(scope);
+                    } else if let Err(error) = manager.invalidate(&scope).await {
+                        self.metrics.cache_invalidation_failed();
+                        warn!(%error, table, shard = decision.shard, "cache invalidation failed after write");
+                    }
                 }
             }
             QueryKind::TransactionEnd => {
@@ -1598,17 +1626,54 @@ impl ProxySession {
                     .get(..6)
                     .is_some_and(|prefix| prefix.eq_ignore_ascii_case("COMMIT"));
                 if commits {
-                    for scope in self.pending_cache_invalidations.drain() {
-                        if let Err(error) = manager.invalidate(&scope).await {
-                            self.metrics.cache_invalidation_failed();
-                            warn!(%error, table = scope.table, shard = scope.shard, "cache invalidation failed after commit");
-                        }
-                    }
+                    self.flush_pending_cache_invalidations("commit").await;
                 } else {
                     self.pending_cache_invalidations.clear();
                 }
             }
             _ => {}
+        }
+    }
+
+    async fn flush_pending_cache_invalidations(&mut self, reason: &'static str) {
+        let Some(manager) = self.cache.clone() else {
+            self.pending_cache_invalidations.clear();
+            return;
+        };
+        for scope in self.pending_cache_invalidations.drain() {
+            if let Err(error) = manager.invalidate(&scope).await {
+                self.metrics.cache_invalidation_failed();
+                warn!(
+                    %error,
+                    table = scope.table,
+                    shard = scope.shard,
+                    reason,
+                    "cache invalidation failed after transaction boundary"
+                );
+            }
+        }
+    }
+
+    async fn record_mysql_transaction_outcome(
+        &mut self,
+        evaluation: MysqlTransactionEvaluation,
+        succeeded: bool,
+    ) {
+        if evaluation.implicit_commit {
+            self.flush_pending_cache_invalidations("implicit_commit")
+                .await;
+        }
+        if succeeded {
+            self.state.record_mysql_transaction_success(evaluation);
+        } else if evaluation.implicit_commit {
+            // MySQL performs the leading commit before many statements execute. If the
+            // statement fails or its outcome is unknown, clearing local transaction
+            // state is the conservative routing decision.
+            self.state.record_implicit_commit();
+        }
+        if evaluation.implicit_commit && !self.state.is_pinned() {
+            self.pinned.take();
+            self.pinned_shard.take();
         }
     }
 
@@ -1665,6 +1730,323 @@ impl ProxySession {
         })))
     }
 
+    async fn acquire_for_scatter(
+        &self,
+        route: RouteTarget,
+        shard: &str,
+    ) -> Result<(Conn, Arc<Backend>), ProxyError> {
+        match route {
+            RouteTarget::Primary => {
+                let backend = self.primary(shard)?;
+                let connection = self.connect(&backend).await?;
+                Ok((connection, backend))
+            }
+            RouteTarget::Replica => {
+                if let Some(backend) = self.backends.replica(shard) {
+                    match self.connect(&backend).await {
+                        Ok(connection) => Ok((connection, backend)),
+                        Err(error) if self.config.routing.fallback_to_primary => {
+                            self.metrics.backend_failed();
+                            self.metrics.replica_fallback();
+                            let (category, mysql_code) = fanout_error_metadata(&error);
+                            warn!(
+                                backend = backend.name(),
+                                error.category = category,
+                                error.mysql_code = mysql_code,
+                                "scatter replica connection failed; falling back to primary"
+                            );
+                            let primary = self.primary(shard)?;
+                            let connection = self.connect(&primary).await?;
+                            Ok((connection, primary))
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else if self.config.routing.fallback_to_primary {
+                    self.metrics.replica_fallback();
+                    let primary = self.primary(shard)?;
+                    let connection = self.connect(&primary).await?;
+                    Ok((connection, primary))
+                } else {
+                    Err(ProxyError::Protocol(format!(
+                        "no healthy replica is available for shard {shard:?}"
+                    )))
+                }
+            }
+            RouteTarget::PinnedPrimary => Err(ProxyError::Protocol(
+                "cross-shard reads are not supported in pinned sessions or transactions".to_owned(),
+            )),
+        }
+    }
+
+    async fn execute_buffered_shard_query(
+        &self,
+        branch: PlannedShardQuery,
+        route: RouteTarget,
+        budget: Arc<tokio::sync::Mutex<ScatterBudget>>,
+        deadline: time::Instant,
+        prepared_values: Option<Arc<Vec<Value>>>,
+    ) -> Result<BufferedShardResult, ProxyError> {
+        let (mut connection, backend) =
+            time::timeout_at(deadline, self.acquire_for_scatter(route, &branch.shard))
+                .await
+                .map_err(|_| {
+                    ProxyError::Protocol(format!(
+                        "scatter connection acquisition on shard {:?} exceeded the shared deadline",
+                        branch.shard
+                    ))
+                })??;
+        if backend.role() == crate::config::BackendRole::Primary {
+            self.metrics.query_primary();
+        } else {
+            self.metrics.query_replica();
+        }
+        let started = Instant::now();
+        let timeout = Duration::from_secs(self.config.proxy.backend_query_timeout_seconds);
+        let execution = async {
+            if let Some(values) = prepared_values {
+                let values = branch
+                    .parameter_indexes
+                    .iter()
+                    .map(|index| {
+                        values.get(*index).cloned().ok_or_else(|| {
+                            ProxyError::Protocol(
+                                "prepared scatter parameter index is out of bounds".to_owned(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let result = connection
+                    .exec_iter(&branch.sql, Params::Positional(values))
+                    .await?;
+                self.buffer_scatter_result(result, &budget).await
+            } else {
+                let result = connection.query_iter(&branch.sql).await?;
+                self.buffer_scatter_result(result, &budget).await
+            }
+        };
+        match time::timeout_at(deadline, execution).await {
+            Ok(Ok(result)) => {
+                backend.record_query(BackendQueryOutcome::Success, started.elapsed());
+                Ok(result)
+            }
+            Ok(Err(error)) => {
+                backend.record_query(BackendQueryOutcome::Failure, started.elapsed());
+                self.metrics.backend_failed();
+                let _ = connection.disconnect().await;
+                Err(error)
+            }
+            Err(_) => {
+                backend.record_query(BackendQueryOutcome::Timeout, started.elapsed());
+                self.metrics.query_timed_out();
+                let _ = connection.disconnect().await;
+                Err(ProxyError::Protocol(format!(
+                    "scatter query on shard {:?} timed out after {} seconds",
+                    branch.shard,
+                    timeout.as_secs()
+                )))
+            }
+        }
+    }
+
+    async fn buffer_scatter_result<P>(
+        &self,
+        mut result: QueryResult<'_, '_, P>,
+        budget: &tokio::sync::Mutex<ScatterBudget>,
+    ) -> Result<BufferedShardResult, ProxyError>
+    where
+        P: Protocol,
+    {
+        let columns = result
+            .columns_ref()
+            .iter()
+            .map(to_frontend_column)
+            .collect::<Vec<_>>();
+        let wire_metadata = result
+            .columns_ref()
+            .iter()
+            .map(|column| {
+                (
+                    column.character_set(),
+                    column.column_length(),
+                    column.decimals(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if columns.is_empty() {
+            return Err(ProxyError::Protocol(
+                "scatter/gather branches must return rows".to_owned(),
+            ));
+        }
+        let mut rows = Vec::new();
+        while let Some(row) = result.next().await? {
+            let size = row_size(&row);
+            {
+                let mut budget = budget.lock().await;
+                check_result_limits(
+                    budget.rows,
+                    budget.bytes,
+                    size,
+                    self.config.proxy.max_result_rows,
+                    self.config.proxy.max_result_bytes,
+                )?;
+                budget.rows += 1;
+                budget.bytes = budget.bytes.saturating_add(size);
+            }
+            rows.push(row.unwrap());
+        }
+        result.drop_result().await?;
+        Ok(BufferedShardResult {
+            columns,
+            wire_metadata,
+            rows,
+        })
+    }
+
+    async fn execute_scatter_plan<W>(
+        &mut self,
+        plan: ShardQueryPlan,
+        writer: QueryResultWriter<'_, W>,
+        started: Instant,
+        prepared_columns: Option<Vec<Column>>,
+        prepared_values: Option<Vec<Value>>,
+    ) -> Result<(), ProxyError>
+    where
+        W: AsyncWrite + Send + Unpin,
+    {
+        if self.state.is_pinned() {
+            self.metrics.query_failed();
+            self.metrics.scatter_failed();
+            writer
+                .error(
+                    ErrorKind::ER_NOT_SUPPORTED_YET,
+                    b"cross-shard reads are not supported in pinned sessions or transactions",
+                )
+                .await?;
+            return Ok(());
+        }
+        let (queries, aggregate) = match plan {
+            ShardQueryPlan::UnionAll(queries) => (queries, None),
+            ShardQueryPlan::Aggregate(plan) => (plan.queries.clone(), Some(plan)),
+            ShardQueryPlan::Single(_) => unreachable!("single-shard plan used as scatter"),
+        };
+        self.metrics.scatter_planned(queries.len());
+        let route = self
+            .state
+            .route(QueryKind::Read, self.config.routing.read_write_split);
+        let budget = Arc::new(tokio::sync::Mutex::new(ScatterBudget::default()));
+        let deadline = time::Instant::now()
+            + Duration::from_secs(self.config.proxy.backend_query_timeout_seconds);
+        let session: &ProxySession = self;
+        let prepared_values = prepared_values.map(Arc::new);
+        let mut results = stream::iter(queries.into_iter().enumerate().map(|(index, branch)| {
+            let budget = budget.clone();
+            let prepared_values = prepared_values.clone();
+            async move {
+                (
+                    index,
+                    session
+                        .execute_buffered_shard_query(
+                            branch,
+                            route,
+                            budget,
+                            deadline,
+                            prepared_values,
+                        )
+                        .await,
+                )
+            }
+        }))
+        .buffer_unordered(self.config.sharding.scatter_concurrency)
+        .collect::<Vec<_>>()
+        .await;
+        results.sort_by_key(|(index, _)| *index);
+        let mut gathered = Vec::with_capacity(results.len());
+        for (_, result) in results {
+            match result {
+                Ok(result) => gathered.push(result),
+                Err(error) => {
+                    self.metrics.query_failed();
+                    self.metrics.scatter_failed();
+                    self.metrics.observe_query(started.elapsed());
+                    writer
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
+        let Some(first) = gathered.first() else {
+            self.metrics.query_failed();
+            self.metrics.scatter_failed();
+            writer
+                .error(ErrorKind::ER_UNKNOWN_ERROR, b"scatter plan has no branches")
+                .await?;
+            return Ok(());
+        };
+        if gathered.iter().skip(1).any(|result| {
+            result.columns != first.columns || result.wire_metadata != first.wire_metadata
+        }) || aggregate
+            .as_ref()
+            .is_some_and(|plan| first.columns.len() < plan.visible_columns)
+            || prepared_columns.as_ref().is_some_and(|columns| {
+                columns.len()
+                    != aggregate
+                        .as_ref()
+                        .map_or(first.columns.len(), |plan| plan.visible_columns)
+            })
+        {
+            self.metrics.query_failed();
+            self.metrics.scatter_failed();
+            writer
+                .error(
+                    ErrorKind::ER_UNKNOWN_ERROR,
+                    b"scatter shards returned incompatible column metadata",
+                )
+                .await?;
+            return Ok(());
+        }
+
+        let (columns, rows) = if let Some(plan) = aggregate {
+            let columns = prepared_columns
+                .filter(|columns| columns.len() == plan.visible_columns)
+                .unwrap_or_else(|| first.columns[..plan.visible_columns].to_vec());
+            let row = match merge_aggregate_rows(&plan, &gathered) {
+                Ok(row) => row,
+                Err(error) => {
+                    self.metrics.query_failed();
+                    self.metrics.scatter_failed();
+                    writer
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
+                        .await?;
+                    return Ok(());
+                }
+            };
+            (columns, vec![row])
+        } else {
+            let columns = prepared_columns.unwrap_or_else(|| first.columns.clone());
+            let rows = gathered
+                .iter_mut()
+                .flat_map(|result| std::mem::take(&mut result.rows))
+                .collect();
+            (columns, rows)
+        };
+        let bytes_returned = rows.iter().map(|row| values_size(row)).sum::<usize>();
+        let rows_returned = rows.len() as u64;
+        let mut row_writer = writer.start(&columns).await?;
+        for row in rows {
+            write_row_values(&mut row_writer, row).await?;
+        }
+        row_writer.finish().await?;
+        self.metrics.query_succeeded();
+        self.metrics.rows_returned(rows_returned);
+        self.metrics.bytes_returned(bytes_returned as u64);
+        self.metrics
+            .scatter_merged(rows_returned, bytes_returned as u64);
+        self.metrics.observe_query(started.elapsed());
+        self.state.record_success(QueryKind::Read);
+        Ok(())
+    }
+
     async fn handle_query<W>(
         &mut self,
         query: &str,
@@ -1701,11 +2083,15 @@ impl ProxySession {
             Some(analysis.classification.parsed),
         );
         let atomic_dml = analysis.is_atomic_dml();
+        let mysql_transaction = analysis.mysql_transaction_semantics().evaluate(
+            self.state.autocommit_enabled(),
+            self.state.table_locks_active(),
+        );
         let classification = &analysis.classification;
         self.metrics.query_started(classification.kind);
         let started = Instant::now();
-        let decision = match self.shard_decision_from_analysis(query, &analysis) {
-            Ok(decision) => decision,
+        let plan = match self.shard_plan_from_analysis(query, &analysis) {
+            Ok(plan) => plan,
             Err(error) => {
                 self.metrics.shard_routing_failed();
                 self.metrics.query_failed();
@@ -1713,6 +2099,24 @@ impl ProxySession {
                     .error(ErrorKind::ER_PARSE_ERROR, error.to_string().as_bytes())
                     .await?;
                 return Ok(());
+            }
+        };
+        let decision = match plan {
+            ShardQueryPlan::Single(decision) => decision,
+            plan @ (ShardQueryPlan::UnionAll(_) | ShardQueryPlan::Aggregate(_)) => {
+                if classification.kind != QueryKind::Read || !scatter_safe_sql(query) {
+                    self.metrics.query_failed();
+                    writer
+                        .error(
+                            ErrorKind::ER_NOT_SUPPORTED_YET,
+                            b"scatter/gather supports deterministic read-only queries",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                return self
+                    .execute_scatter_plan(plan, writer, started, None, None)
+                    .await;
             }
         };
         let fanout = self.fanout_targets(&decision);
@@ -1881,12 +2285,15 @@ impl ProxySession {
                 self.record_cache_success(classification.kind, query, &decision)
                     .await;
                 self.state.record_success(classification.kind);
+                self.record_mysql_transaction_outcome(mysql_transaction, true)
+                    .await;
                 if classification.kind == QueryKind::ReplayableSession {
                     self.record_replayable_session_command(query);
                 }
                 if self
                     .state
                     .should_release_transaction_pin(classification.kind)
+                    || (mysql_transaction.implicit_commit && !self.state.is_pinned())
                 {
                     self.pinned.take();
                     self.pinned_shard.take();
@@ -1898,6 +2305,8 @@ impl ProxySession {
                 self.metrics.backend_failed();
                 self.metrics.query_failed();
                 self.metrics.observe_query(started.elapsed());
+                self.record_mysql_transaction_outcome(mysql_transaction, false)
+                    .await;
                 Ok(())
             }
             Ok(Err(error)) => {
@@ -1906,6 +2315,8 @@ impl ProxySession {
                 self.metrics.query_failed();
                 self.metrics.observe_query(started.elapsed());
                 source.discard(self).await;
+                self.record_mysql_transaction_outcome(mysql_transaction, false)
+                    .await;
                 Err(error)
             }
             Err(_) => {
@@ -1914,6 +2325,8 @@ impl ProxySession {
                 self.metrics.query_timed_out();
                 self.metrics.observe_query(started.elapsed());
                 source.discard(self).await;
+                self.record_mysql_transaction_outcome(mysql_transaction, false)
+                    .await;
                 Err(ProxyError::Protocol(format!(
                     "backend query timed out after {} seconds",
                     timeout.as_secs()
@@ -1968,6 +2381,18 @@ struct ResultStats {
 struct MaterializedResult {
     stats: ResultStats,
     cached: Option<CachedResult>,
+}
+
+struct BufferedShardResult {
+    columns: Vec<Column>,
+    wire_metadata: Vec<(u16, u32, u8)>,
+    rows: Vec<Vec<Value>>,
+}
+
+#[derive(Default)]
+struct ScatterBudget {
+    rows: usize,
+    bytes: usize,
 }
 
 enum CacheLookup {
@@ -2066,6 +2491,8 @@ where
             Some(analysis.classification.parsed),
         );
         let atomic_dml = analysis.is_atomic_dml();
+        let mysql_transaction_semantics = analysis.mysql_transaction_semantics().clone();
+        let routing_statements = analysis.statements().map(<[_]>::to_vec);
         let classification = analysis.classification;
         if self.prepared.len() >= self.config.proxy.max_prepared_statements_per_connection {
             info.error(
@@ -2135,6 +2562,9 @@ where
                 query: query.to_owned(),
                 kind: classification.kind,
                 atomic_dml,
+                mysql_transaction_semantics,
+                columns: columns.clone(),
+                routing_statements,
             },
         );
         self.metrics.prepared_created();
@@ -2160,6 +2590,12 @@ where
         let query = prepared.query.clone();
         let kind = prepared.kind;
         let atomic_dml = prepared.atomic_dml;
+        let mysql_transaction = prepared.mysql_transaction_semantics.evaluate(
+            self.state.autocommit_enabled(),
+            self.state.table_locks_active(),
+        );
+        let prepared_columns = prepared.columns.clone();
+        let routing_statements = prepared.routing_statements.clone();
         self.metrics.prepared_executed();
         self.metrics.query_started(kind);
         let started = Instant::now();
@@ -2185,8 +2621,31 @@ where
                 return Ok(());
             }
         };
-        let decision = match self.shard_decision(&routing_sql) {
-            Ok(decision) => decision,
+        let bound_statements = match routing_statements.as_ref() {
+            Some(statements) => {
+                self.metrics.prepared_routing_cache_hit();
+                match bind_mysql_routing_statements(statements, &values) {
+                    Ok(statements) => Some(statements),
+                    Err(error) => {
+                        self.metrics.query_failed();
+                        results
+                            .error(ErrorKind::ER_WRONG_ARGUMENTS, error.to_string().as_bytes())
+                            .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            None => {
+                self.metrics.prepared_routing_cache_miss();
+                None
+            }
+        };
+        let mut plan = match self.shard_router.plan_parsed(
+            &query,
+            bound_statements.as_deref(),
+            self.config.sharding.max_scatter_shards,
+        ) {
+            Ok(plan) => plan,
             Err(error) => {
                 self.metrics.shard_routing_failed();
                 self.metrics.query_failed();
@@ -2194,6 +2653,47 @@ where
                     .error(ErrorKind::ER_PARSE_ERROR, error.to_string().as_bytes())
                     .await?;
                 return Ok(());
+            }
+        };
+        let decision = match plan {
+            ShardQueryPlan::Single(decision) => decision,
+            ref mut plan @ (ShardQueryPlan::UnionAll(_) | ShardQueryPlan::Aggregate(_)) => {
+                if kind != QueryKind::Read || !scatter_safe_sql(&routing_sql) {
+                    self.metrics.query_failed();
+                    results
+                        .error(
+                            ErrorKind::ER_NOT_SUPPORTED_YET,
+                            b"scatter/gather supports deterministic read-only queries",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                let Some(routing_statements) = routing_statements.as_deref() else {
+                    self.metrics.query_failed();
+                    results
+                        .error(
+                            ErrorKind::ER_NOT_SUPPORTED_YET,
+                            b"prepared scatter requires a parsed routing template",
+                        )
+                        .await?;
+                    return Ok(());
+                };
+                if let Err(error) = parameterize_mysql_scatter_plan(plan, routing_statements) {
+                    self.metrics.query_failed();
+                    results
+                        .error(ErrorKind::ER_PARSE_ERROR, error.to_string().as_bytes())
+                        .await?;
+                    return Ok(());
+                }
+                return self
+                    .execute_scatter_plan(
+                        plan.clone(),
+                        results,
+                        started,
+                        Some(prepared_columns),
+                        Some(values),
+                    )
+                    .await;
             }
         };
         let fanout_targets = self.fanout_targets(&decision);
@@ -2270,7 +2770,13 @@ where
                 if self.config.write_fanout.failure_policy == FanoutFailurePolicy::All {
                     required_failure.get_or_insert_with(|| error.to_string());
                 } else {
-                    warn!(shard = target, %error, "best-effort prepared write fanout failed");
+                    let (category, mysql_code) = fanout_error_metadata(&error);
+                    warn!(
+                        shard = target,
+                        error.category = category,
+                        error.mysql_code = mysql_code,
+                        "best-effort prepared write fanout failed"
+                    );
                 }
             }
         }
@@ -2377,10 +2883,14 @@ where
                 self.metrics.observe_query(started.elapsed());
                 self.record_cache_success(kind, &query, &decision).await;
                 self.state.record_success(kind);
+                self.record_mysql_transaction_outcome(mysql_transaction, true)
+                    .await;
                 if kind == QueryKind::ReplayableSession {
                     self.record_replayable_session_command(&query);
                 }
-                if self.state.should_release_transaction_pin(kind) {
+                if self.state.should_release_transaction_pin(kind)
+                    || (mysql_transaction.implicit_commit && !self.state.is_pinned())
+                {
                     self.pinned.take();
                     self.pinned_shard.take();
                 }
@@ -2391,6 +2901,8 @@ where
                 self.metrics.backend_failed();
                 self.metrics.query_failed();
                 self.metrics.observe_query(started.elapsed());
+                self.record_mysql_transaction_outcome(mysql_transaction, false)
+                    .await;
                 Ok(())
             }
             Ok(Err(error)) => {
@@ -2399,6 +2911,8 @@ where
                 self.metrics.query_failed();
                 self.metrics.observe_query(started.elapsed());
                 source.discard(self).await;
+                self.record_mysql_transaction_outcome(mysql_transaction, false)
+                    .await;
                 Err(error)
             }
             Err(_) => {
@@ -2407,6 +2921,8 @@ where
                 self.metrics.query_timed_out();
                 self.metrics.observe_query(started.elapsed());
                 source.discard(self).await;
+                self.record_mysql_transaction_outcome(mysql_transaction, false)
+                    .await;
                 Err(ProxyError::Protocol(format!(
                     "prepared backend query timed out after {} seconds",
                     timeout.as_secs()
@@ -2628,6 +3144,19 @@ fn cache_safe_sql(query: &str) -> bool {
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_uppercase();
+    normalized.matches("SELECT").count() == 1 && scatter_safe_normalized_sql(&normalized)
+}
+
+fn scatter_safe_sql(query: &str) -> bool {
+    let normalized = query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase();
+    scatter_safe_normalized_sql(&normalized)
+}
+
+fn scatter_safe_normalized_sql(normalized: &str) -> bool {
     const VOLATILE_OR_SESSION_DEPENDENT: [&str; 18] = [
         "@",
         "RAND(",
@@ -2648,10 +3177,9 @@ fn cache_safe_sql(query: &str) -> bool {
         "SQL_CALC_FOUND_ROWS",
         "SQL_NO_CACHE",
     ];
-    normalized.matches("SELECT").count() == 1
-        && !VOLATILE_OR_SESSION_DEPENDENT
-            .iter()
-            .any(|needle| normalized.contains(needle))
+    !VOLATILE_OR_SESSION_DEPENDENT
+        .iter()
+        .any(|needle| normalized.contains(needle))
 }
 
 fn check_result_limits(
@@ -2679,6 +3207,246 @@ fn row_size(row: &mysql_async::Row) -> usize {
         .filter_map(|index| row.as_ref(index))
         .map(value_size)
         .sum()
+}
+
+fn values_size(values: &[Value]) -> usize {
+    values.iter().map(value_size).sum()
+}
+
+#[derive(Clone, Debug)]
+enum MergeNumber {
+    Decimal(BigDecimal),
+    Float(f64),
+}
+
+impl MergeNumber {
+    fn add(self, other: Self) -> Result<Self, ProxyError> {
+        match (self, other) {
+            (Self::Decimal(left), Self::Decimal(right)) => Ok(Self::Decimal(left + right)),
+            (left, right) => Ok(Self::Float(left.into_f64()? + right.into_f64()?)),
+        }
+    }
+
+    fn divide_count(self, count: u64) -> Result<Self, ProxyError> {
+        if count == 0 {
+            return Err(ProxyError::Protocol(
+                "cannot divide an aggregate by zero".to_owned(),
+            ));
+        }
+        match self {
+            Self::Decimal(value) => Ok(Self::Decimal(value / BigDecimal::from(count))),
+            Self::Float(value) => Ok(Self::Float(value / count as f64)),
+        }
+    }
+
+    fn into_f64(self) -> Result<f64, ProxyError> {
+        match self {
+            Self::Decimal(value) => value.to_f64().ok_or_else(|| {
+                ProxyError::Protocol("aggregate cannot be represented as floating point".to_owned())
+            }),
+            Self::Float(value) if value.is_finite() => Ok(value),
+            Self::Float(_) => Err(ProxyError::Protocol(
+                "aggregate produced a non-finite value".to_owned(),
+            )),
+        }
+    }
+
+    fn compare(self, other: Self) -> Result<std::cmp::Ordering, ProxyError> {
+        match (self, other) {
+            (Self::Decimal(left), Self::Decimal(right)) => Ok(left.cmp(&right)),
+            (left, right) => left
+                .into_f64()?
+                .partial_cmp(&right.into_f64()?)
+                .ok_or_else(|| {
+                    ProxyError::Protocol("aggregate values are not comparable".to_owned())
+                }),
+        }
+    }
+
+    fn into_value(self) -> Value {
+        match self {
+            Self::Decimal(value) => Value::Bytes(value.normalized().to_plain_string().into_bytes()),
+            Self::Float(value) => Value::Double(value),
+        }
+    }
+}
+
+fn merge_number(value: &Value) -> Result<Option<MergeNumber>, ProxyError> {
+    match value {
+        Value::NULL => Ok(None),
+        Value::Int(value) => Ok(Some(MergeNumber::Decimal(BigDecimal::from(*value)))),
+        Value::UInt(value) => Ok(Some(MergeNumber::Decimal(BigDecimal::from(*value)))),
+        Value::Float(value) if value.is_finite() => Ok(Some(MergeNumber::Float(f64::from(*value)))),
+        Value::Double(value) if value.is_finite() => Ok(Some(MergeNumber::Float(*value))),
+        Value::Float(_) | Value::Double(_) => Err(ProxyError::Protocol(
+            "aggregate produced a non-finite value".to_owned(),
+        )),
+        Value::Bytes(value) => std::str::from_utf8(value)
+            .ok()
+            .and_then(|value| value.parse::<BigDecimal>().ok())
+            .map(MergeNumber::Decimal)
+            .map(Some)
+            .ok_or_else(|| {
+                ProxyError::Protocol(
+                    "distributed numeric aggregates require numeric backend values".to_owned(),
+                )
+            }),
+        Value::Date(..) | Value::Time(..) => Err(ProxyError::Protocol(
+            "distributed numeric aggregates do not accept temporal values".to_owned(),
+        )),
+    }
+}
+
+fn aggregate_count(value: &Value) -> Result<u64, ProxyError> {
+    match value {
+        Value::UInt(value) => Ok(*value),
+        Value::Int(value) => u64::try_from(*value)
+            .map_err(|_| ProxyError::Protocol("aggregate count is negative".to_owned())),
+        Value::Bytes(value) => std::str::from_utf8(value)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| ProxyError::Protocol("invalid aggregate count".to_owned())),
+        _ => Err(ProxyError::Protocol("invalid aggregate count".to_owned())),
+    }
+}
+
+fn merge_aggregate_rows(
+    plan: &AggregatePlan,
+    results: &[BufferedShardResult],
+) -> Result<Vec<Value>, ProxyError> {
+    for result in results {
+        if result.rows.len() != 1 || result.rows[0].len() < plan.visible_columns {
+            return Err(ProxyError::Protocol(
+                "distributed aggregate shard did not return exactly one compatible row".to_owned(),
+            ));
+        }
+    }
+    let mut output = Vec::with_capacity(plan.visible_columns);
+    for (column, aggregate) in plan.aggregates.iter().enumerate() {
+        let value = match aggregate {
+            AggregateKind::Count => {
+                let count = results.iter().try_fold(0_u64, |total, result| {
+                    total
+                        .checked_add(aggregate_count(&result.rows[0][column])?)
+                        .ok_or_else(|| ProxyError::Protocol("aggregate count overflow".to_owned()))
+                })?;
+                Value::UInt(count)
+            }
+            AggregateKind::Sum => {
+                let mut total: Option<MergeNumber> = None;
+                for result in results {
+                    if let Some(value) = merge_number(&result.rows[0][column])? {
+                        total = Some(match total {
+                            Some(current) => current.add(value)?,
+                            None => value,
+                        });
+                    }
+                }
+                total.map(MergeNumber::into_value).unwrap_or(Value::NULL)
+            }
+            AggregateKind::Average {
+                sum_column,
+                count_column,
+            } => {
+                let mut weighted_total: Option<MergeNumber> = None;
+                let mut total_count = 0_u64;
+                for result in results {
+                    let count =
+                        aggregate_count(result.rows[0].get(*count_column).ok_or_else(|| {
+                            ProxyError::Protocol(
+                                "distributed AVG count column is missing".to_owned(),
+                            )
+                        })?)?;
+                    total_count = total_count.checked_add(count).ok_or_else(|| {
+                        ProxyError::Protocol("aggregate count overflow".to_owned())
+                    })?;
+                    if count > 0
+                        && let Some(sum) =
+                            merge_number(result.rows[0].get(*sum_column).ok_or_else(|| {
+                                ProxyError::Protocol(
+                                    "distributed AVG sum column is missing".to_owned(),
+                                )
+                            })?)?
+                    {
+                        weighted_total = Some(match weighted_total {
+                            Some(current) => current.add(sum)?,
+                            None => sum,
+                        });
+                    }
+                }
+                match (weighted_total, total_count) {
+                    (Some(total), count) if count > 0 => total.divide_count(count)?.into_value(),
+                    _ => Value::NULL,
+                }
+            }
+            AggregateKind::Minimum => merge_extreme(results, column, false)?,
+            AggregateKind::Maximum => merge_extreme(results, column, true)?,
+        };
+        output.push(value);
+    }
+    Ok(output)
+}
+
+fn merge_extreme(
+    results: &[BufferedShardResult],
+    column: usize,
+    maximum: bool,
+) -> Result<Value, ProxyError> {
+    let mut selected: Option<Value> = None;
+    for result in results {
+        let candidate = &result.rows[0][column];
+        if matches!(candidate, Value::NULL) {
+            continue;
+        }
+        let replace = match &selected {
+            None => true,
+            Some(current) => {
+                let ordering = compare_merge_values(candidate, current)?;
+                if maximum {
+                    ordering.is_gt()
+                } else {
+                    ordering.is_lt()
+                }
+            }
+        };
+        if replace {
+            selected = Some(candidate.clone());
+        }
+    }
+    Ok(selected.unwrap_or(Value::NULL))
+}
+
+fn compare_merge_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering, ProxyError> {
+    match (left, right) {
+        (Value::Date(a, b, c, d, e, f, g), Value::Date(h, i, j, k, l, m, n)) => {
+            Ok((a, b, c, d, e, f, g).cmp(&(h, i, j, k, l, m, n)))
+        }
+        (Value::Time(a, b, c, d, e, f), Value::Time(g, h, i, j, k, l)) => {
+            Ok(mysql_time_micros(*a, *b, *c, *d, *e, *f)
+                .cmp(&mysql_time_micros(*g, *h, *i, *j, *k, *l)))
+        }
+        _ => match (merge_number(left)?, merge_number(right)?) {
+            (Some(left), Some(right)) => left.compare(right),
+            _ => Err(ProxyError::Protocol(
+                "distributed MIN/MAX currently supports numeric and temporal values only"
+                    .to_owned(),
+            )),
+        },
+    }
+}
+
+fn mysql_time_micros(
+    negative: bool,
+    days: u32,
+    hours: u8,
+    minutes: u8,
+    seconds: u8,
+    micros: u32,
+) -> i128 {
+    let seconds = ((i128::from(days) * 24 + i128::from(hours)) * 60 + i128::from(minutes)) * 60
+        + i128::from(seconds);
+    let value = seconds * 1_000_000 + i128::from(micros);
+    if negative { -value } else { value }
 }
 
 async fn write_row<W>(
@@ -2805,6 +3573,86 @@ fn frontend_param_to_backend(value: ValueInner<'_>) -> Result<Value, ProxyError>
         ValueInner::Time(value) => decode_binary_time(value),
         ValueInner::Datetime(value) => decode_binary_datetime(value),
     }
+}
+
+fn bind_mysql_routing_statements(
+    template: &[sqlparser::ast::Statement],
+    values: &[Value],
+) -> Result<Vec<sqlparser::ast::Statement>, ProxyError> {
+    struct Binder<'a> {
+        values: &'a [Value],
+        next: usize,
+        missing: bool,
+    }
+
+    impl VisitorMut for Binder<'_> {
+        type Break = ();
+
+        fn pre_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
+            if matches!(&value.value, SqlValue::Placeholder(marker) if marker == "?") {
+                if let Some(parameter) = self.values.get(self.next) {
+                    value.value = mysql_routing_value(parameter);
+                    self.next += 1;
+                } else {
+                    self.missing = true;
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut statements = template.to_vec();
+    let mut binder = Binder {
+        values,
+        next: 0,
+        missing: false,
+    };
+    let _ = statements.visit(&mut binder);
+    if binder.missing {
+        return Err(ProxyError::Protocol(
+            "prepared statement supplied fewer values than placeholders".to_owned(),
+        ));
+    }
+    if binder.next != values.len() {
+        return Err(ProxyError::Protocol(
+            "prepared statement supplied more values than placeholders".to_owned(),
+        ));
+    }
+    Ok(statements)
+}
+
+fn mysql_routing_value(value: &Value) -> SqlValue {
+    match value {
+        Value::NULL => SqlValue::Null,
+        Value::Bytes(value) => match std::str::from_utf8(value) {
+            Ok(value) => SqlValue::SingleQuotedString(value.to_owned()),
+            Err(_) => SqlValue::HexStringLiteral(hex_encode(value)),
+        },
+        Value::Int(value) => SqlValue::Number(value.to_string(), false),
+        Value::UInt(value) => SqlValue::Number(value.to_string(), false),
+        Value::Float(value) => SqlValue::Number(value.to_string(), false),
+        Value::Double(value) => SqlValue::Number(value.to_string(), false),
+        Value::Date(year, month, day, hour, minute, second, micros) => {
+            SqlValue::SingleQuotedString(format_mysql_date(
+                *year, *month, *day, *hour, *minute, *second, *micros,
+            ))
+        }
+        Value::Time(negative, days, hours, minutes, seconds, micros) => {
+            SqlValue::SingleQuotedString(format_mysql_time(
+                *negative, *days, *hours, *minutes, *seconds, *micros,
+            ))
+        }
+    }
+}
+
+fn hex_encode(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len().saturating_mul(2));
+    for byte in value {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn bind_for_routing(query: &str, values: &[Value]) -> Result<String, ProxyError> {
@@ -3053,6 +3901,111 @@ mod tests {
     }
 
     #[test]
+    fn fanout_log_metadata_omits_mysql_server_messages() {
+        let error = ProxyError::Backend(mysql_async::Error::Server(mysql_async::ServerError {
+            code: 1062,
+            message: "Duplicate entry 'customer-secret' for key 'email'".to_owned(),
+            state: "23000".to_owned(),
+        }));
+        assert_eq!(fanout_error_metadata(&error), ("mysql_server", 1062));
+        let metadata = format!("{:?}", fanout_error_metadata(&error));
+        assert!(!metadata.contains("customer-secret"));
+    }
+
+    #[test]
+    fn merges_decomposable_aggregate_rows() {
+        let plan = AggregatePlan {
+            queries: Vec::new(),
+            aggregates: vec![
+                AggregateKind::Count,
+                AggregateKind::Sum,
+                AggregateKind::Average {
+                    sum_column: 5,
+                    count_column: 6,
+                },
+                AggregateKind::Minimum,
+                AggregateKind::Maximum,
+            ],
+            visible_columns: 5,
+        };
+        let results = vec![
+            BufferedShardResult {
+                columns: Vec::new(),
+                wire_metadata: Vec::new(),
+                rows: vec![vec![
+                    Value::UInt(2),
+                    Value::Bytes(b"10.5".to_vec()),
+                    Value::Bytes(b"5".to_vec()),
+                    Value::Int(3),
+                    Value::Int(9),
+                    Value::Bytes(b"10".to_vec()),
+                    Value::UInt(2),
+                ]],
+            },
+            BufferedShardResult {
+                columns: Vec::new(),
+                wire_metadata: Vec::new(),
+                rows: vec![vec![
+                    Value::UInt(3),
+                    Value::Bytes(b"4.5".to_vec()),
+                    Value::Bytes(b"1".to_vec()),
+                    Value::Int(1),
+                    Value::Int(10),
+                    Value::Bytes(b"3".to_vec()),
+                    Value::UInt(1),
+                ]],
+            },
+        ];
+        let merged = merge_aggregate_rows(&plan, &results).unwrap();
+        assert_eq!(merged[0], Value::UInt(5));
+        assert_eq!(merged[1], Value::Bytes(b"15".to_vec()));
+        let Value::Bytes(average) = &merged[2] else {
+            panic!("AVG should preserve decimal output");
+        };
+        let average = std::str::from_utf8(average)
+            .unwrap()
+            .parse::<BigDecimal>()
+            .unwrap();
+        assert_eq!(average, BigDecimal::from(13) / BigDecimal::from(3));
+        assert_eq!(merged[3], Value::Int(1));
+        assert_eq!(merged[4], Value::Int(10));
+        assert_eq!(
+            compare_merge_values(
+                &Value::Time(true, 0, 1, 0, 0, 0),
+                &Value::Time(false, 0, 1, 0, 0, 0),
+            )
+            .unwrap(),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn merges_arbitrary_width_decimal_aggregates() {
+        let plan = AggregatePlan {
+            queries: Vec::new(),
+            aggregates: vec![AggregateKind::Sum],
+            visible_columns: 1,
+        };
+        let result = |value: &[u8]| BufferedShardResult {
+            columns: Vec::new(),
+            wire_metadata: Vec::new(),
+            rows: vec![vec![Value::Bytes(value.to_vec())]],
+        };
+        let merged = merge_aggregate_rows(
+            &plan,
+            &[
+                result(b"999999999999999999999999999999999999999999999999999999999999"),
+                result(b"1"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            merged[0],
+            Value::Bytes(b"1000000000000000000000000000000000000000000000000000000000000".to_vec())
+        );
+    }
+
+    #[test]
     fn decodes_prepared_statement_temporal_parameters() {
         let date = decode_binary_date(&[0xea, 0x07, 7, 24]).unwrap();
         assert_eq!(date, Value::Date(2026, 7, 24, 0, 0, 0, 0));
@@ -3091,6 +4044,41 @@ mod tests {
     }
 
     #[test]
+    fn binds_mysql_prepared_values_into_cached_ast() {
+        let template = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::MySqlDialect {},
+            "SELECT * FROM user_info WHERE userid IN (?, ?)",
+        )
+        .unwrap();
+        let bound = bind_mysql_routing_statements(
+            &template,
+            &[Value::Bytes(b"apw".to_vec()), Value::Bytes(b"bPv".to_vec())],
+        )
+        .unwrap();
+        assert_eq!(
+            bound[0].to_string(),
+            "SELECT * FROM user_info WHERE userid IN ('apw', 'bPv')"
+        );
+        assert!(bind_mysql_routing_statements(&template, &[Value::UInt(1)]).is_err());
+    }
+
+    #[test]
+    fn preserves_binary_prepared_values_in_routing_ast() {
+        let template = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::MySqlDialect {},
+            "SELECT * FROM user_info WHERE payload = ?",
+        )
+        .unwrap();
+        let bound =
+            bind_mysql_routing_statements(&template, &[Value::Bytes(vec![0x00, 0xff, 0x80, b'Z'])])
+                .unwrap();
+        assert_eq!(
+            bound[0].to_string(),
+            "SELECT * FROM user_info WHERE payload = X'00FF805A'"
+        );
+    }
+
+    #[test]
     fn cache_policy_rejects_volatile_and_session_dependent_reads() {
         assert!(cache_safe_sql(
             "SELECT id, name FROM products WHERE id = 42"
@@ -3098,5 +4086,11 @@ mod tests {
         assert!(!cache_safe_sql("SELECT id, NOW() FROM products"));
         assert!(!cache_safe_sql("SELECT id, @tenant FROM products"));
         assert!(!cache_safe_sql("SELECT id, CURRENT_USER FROM products"));
+        assert!(scatter_safe_sql(
+            "SELECT id FROM products UNION ALL SELECT id FROM products"
+        ));
+        assert!(!scatter_safe_sql(
+            "SELECT COUNT(*) FROM products WHERE RAND() > 0.5"
+        ));
     }
 }

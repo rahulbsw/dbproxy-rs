@@ -4,6 +4,33 @@ The admin listener should remain on loopback or behind authenticated network
 policy. It intentionally exposes no credentials, but backend names, shard names,
 health, and capacity are operationally sensitive.
 
+## Sensitive-data contract
+
+DBProxy metrics never use SQL text, prepared parameters, Redis keys or values,
+shard-key values, usernames, passwords, authentication payloads, client
+addresses, or operation IDs as labels. Labels are limited to configured
+backend and shard names, roles, TLS modes, query/operation classes, outcomes,
+and capability names. This keeps cardinality bounded and avoids placing
+application data in Prometheus.
+
+Structured logs similarly omit SQL text, prepared values, Redis command
+arguments and payloads, usernames, passwords, tokens, and shard-key values.
+Redis command names can appear in validation errors, but their keys and values
+do not. Logs can contain random operation IDs, client peer addresses, listener
+endpoints, configured backend/shard/table names, configuration revisions, and
+sanitized error descriptions. Treat those fields as operationally sensitive:
+restrict log access and retention, and keep `debug` disabled unless it is
+needed for a bounded investigation. Secret-bearing configuration structures
+deliberately do not implement `Debug`, invalid TOML diagnostics do not echo
+source lines or values, and credential-bearing URLs are rejected or sanitized
+before errors are logged.
+
+Backend and operating-system errors may still reveal infrastructure details
+such as hostnames, ports, certificate paths, or database object names. The
+admin endpoints expose more topology detail than metrics, including backend
+addresses. Neither logs nor observability endpoints should be published as a
+public service.
+
 Use `proxy.tls.mode = "required"` for client traffic and
 `backends.tls.mode = "verify_identity"` for database traffic in production.
 Mount private keys as read-only secrets and restrict them to the DBProxy process
@@ -54,9 +81,10 @@ or measure replica lag.
 | Routing | `dbproxy_replica_fallbacks_total`, `dbproxy_shard_routing_failures_total` |
 | Fanout | `dbproxy_write_fanout_attempts_total`, `dbproxy_write_fanout_successes_total`, `dbproxy_write_fanout_failures_total`, `dbproxy_write_fanout_timeouts_total` |
 | MySQL XA | `dbproxy_xa_transactions_total`, `dbproxy_xa_prepares_total`, `dbproxy_xa_commit_decisions_total`, `dbproxy_xa_commits_total`, `dbproxy_xa_rollbacks_total`, `dbproxy_xa_recovery_attempts_total`, `dbproxy_xa_recovery_failures_total`, `dbproxy_xa_in_doubt_transactions`, `dbproxy_xa_oldest_in_doubt_age_seconds` |
-| Prepared | `dbproxy_prepared_statements_created_total`, `dbproxy_prepared_statement_executions_total`, `dbproxy_prepared_statements_closed_total` |
+| Prepared | `dbproxy_prepared_statements_created_total`, `dbproxy_prepared_statement_executions_total`, `dbproxy_prepared_statements_closed_total`, and parsed-routing-template hit/miss totals in `dbproxy_prepared_routing_cache_{hits,misses}_total` |
 | Backend | `dbproxy_backend_healthy`, `dbproxy_backend_consecutive_failures`, `dbproxy_backend_health_checks_total{outcome}`, `dbproxy_backend_last_health_check_timestamp_seconds`, `dbproxy_backend_last_success_timestamp_seconds`, backend connection/query totals and duration sums |
 | Pools | shared pool connection/idle/in-use/waiter/pressure metrics, `dbproxy_backend_reserved_pool_enabled`, reserved connection/idle/in-use/waiter metrics, and shared pool failure/reset/discard counters |
+| SQL scatter/gather | `dbproxy_scatter_plans_total`, participating `dbproxy_scatter_shards_total`, failures, and merged row/byte totals for MySQL and PostgreSQL/TimescaleDB |
 | Admin/shutdown | `dbproxy_admin_active_connections`, `dbproxy_admin_requests_total`, `dbproxy_admin_rejected_connections_total`, `dbproxy_forced_shutdowns_total` |
 | Capabilities | `dbproxy_capability_info{capability,status}`; the same contracts are available from `/capabilities` |
 | PostgreSQL clients | active/accepted/rejected/error totals, transparent wire bytes, terminated queries, primary/replica routes, transaction/session pins, read-only rejections, cancellations, and statement/shard-routing failures |
@@ -81,6 +109,8 @@ database values are never used as labels.
   checking the database's total connection budget.
 - Any increase in `dbproxy_write_fanout_failures_total` or
   `dbproxy_write_fanout_timeouts_total`: possible cross-database divergence.
+- Any increase in `dbproxy_scatter_failures_total`: a participating shard
+  failed, exceeded the shared result budget, or returned incompatible metadata.
 - `dbproxy_xa_in_doubt_transactions > 0`: a durable commit or abort decision
   is not resolved everywhere. Do not replay the application write; preserve
   the journal volume and restore participant connectivity.

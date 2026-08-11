@@ -62,6 +62,10 @@ The journal must survive process, container, and node restarts. Mount a durable
 volume at `/var/lib/dbproxy`; never use `emptyDir` for XA. Each active DBProxy
 replica needs its own journal and volume. Do not share one ReadWriteMany file
 between replicas: the exclusive lock will intentionally allow only one writer.
+DBProxy holds that exclusivity through a stable `<journal>.lock` file so atomic
+journal compaction can safely replace the data file without releasing the
+process-level lease. Keep the journal and its lock file on the same persistent
+volume and do not remove either while DBProxy is running.
 
 The supplied Helm chart's `persistence.enabled` mode is deliberately limited to
 one Deployment replica and one PVC. For active-active XA, run separate releases

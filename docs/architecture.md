@@ -107,12 +107,18 @@ replica only when all parsed statements are safe reads. Locking reads,
 state-dependent functions, parse failures, and mixed/mutating batches are
 primary-only. Multi-statement requests are rejected by default.
 
-The classifier and shard router are separate modules. The shard router extracts
-literal equality keys from `SELECT`, `INSERT`, `UPDATE`, and `DELETE`, then uses
-the configured hash, half-open numeric range, or exact-value mapping. Hash mode
-maps integers by modulo and strings by stable FNV-1a plus modulo. Binary prepared
-parameters are bound into a parser-only SQL copy at execute time; the original
-statement and typed values are still sent to MySQL.
+The classifier and shard router are separate modules. MySQL and PostgreSQL
+transaction mode use their respective `sqlparser-rs` dialects to extract literal
+equality/`IN` keys from `SELECT`, `INSERT`, `UPDATE`, and `DELETE`, then use the
+configured hash, half-open numeric range, or exact-value mapping. Hash mode maps
+integers by modulo and strings by stable FNV-1a plus modulo. Signed numeric
+range keys are accepted; shard-key tuple assignments and unsupported statement
+families fail closed. MySQL binary and
+PostgreSQL extended-query prepared statements retain a parsed routing template;
+each execution binds typed parameters into a short-lived cloned AST. The proxy
+therefore avoids repeated parsing while the original statement and typed values
+remain unchanged for backend execution. PostgreSQL caches backend-inferred
+parameter types with the frontend prepared statement.
 
 ## Backend selection
 

@@ -1,3 +1,6 @@
+# Complete illustrative sharding topology. Replace every `.internal` address,
+# then follow docs/sharding-examples.md to validate and exercise each protocol.
+
 [proxy]
 listen = "0.0.0.0:6033"
 auth_plugin = "caching_sha2_password"
@@ -23,7 +26,8 @@ max_connections = 32
 request_timeout_seconds = 5
 
 [postgres]
-enabled = false
+enabled = true
+routing_mode = "transaction"
 read_write_listen = "0.0.0.0:6432"
 read_only_listen = "0.0.0.0:6433"
 max_connections = 1024
@@ -31,6 +35,59 @@ connect_timeout_seconds = 5
 shutdown_grace_seconds = 10
 fallback_to_primary = true
 relay_buffer_bytes = 32768
+shard_key_parameter = "dbproxy.shard_key"
+
+[postgres.sharding]
+enabled = true
+strategy = "hash"
+max_scatter_shards = 16
+scatter_concurrency = 4
+
+[[postgres.sharding.rules]]
+table = "user_info"
+column = "userid"
+
+[[postgres.sharding.shards]]
+name = "tenant-0"
+
+[[postgres.sharding.shards]]
+name = "tenant-1"
+
+[[postgres_backends]]
+name = "tenant-0-primary"
+address = "tenant-0-primary.internal:5432"
+role = "primary"
+shard = "tenant-0"
+username = "proxy"
+password = "${DBPROXY_BACKEND_PASSWORD}"
+database = "app"
+
+[[postgres_backends]]
+name = "tenant-0-replica"
+address = "tenant-0-replica.internal:5432"
+role = "replica"
+shard = "tenant-0"
+username = "proxy"
+password = "${DBPROXY_BACKEND_PASSWORD}"
+database = "app"
+
+[[postgres_backends]]
+name = "tenant-1-primary"
+address = "tenant-1-primary.internal:5432"
+role = "primary"
+shard = "tenant-1"
+username = "proxy"
+password = "${DBPROXY_BACKEND_PASSWORD}"
+database = "app"
+
+[[postgres_backends]]
+name = "tenant-1-replica"
+address = "tenant-1-replica.internal:5432"
+role = "replica"
+shard = "tenant-1"
+username = "proxy"
+password = "${DBPROXY_BACKEND_PASSWORD}"
+database = "app"
 
 [redis]
 enabled = true
@@ -139,6 +196,8 @@ reject_multi_statements = true
 enabled = true
 default_shard = "orders-0"
 missing_key_policy = "reject"
+max_scatter_shards = 16
+scatter_concurrency = 4
 
 [[sharding.rules]]
 table = "orders"

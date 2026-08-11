@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::classifier::QueryKind;
+use crate::classifier::{MysqlTransactionEvaluation, QueryKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteTarget {
@@ -13,6 +13,8 @@ pub enum RouteTarget {
 pub struct SessionState {
     in_transaction: bool,
     session_pinned: bool,
+    autocommit_enabled: bool,
+    table_locks_active: bool,
     last_write: Option<Instant>,
     read_after_write: Duration,
 }
@@ -22,6 +24,8 @@ impl SessionState {
         Self {
             in_transaction: false,
             session_pinned: false,
+            autocommit_enabled: true,
+            table_locks_active: false,
             last_write: None,
             read_after_write,
         }
@@ -46,7 +50,12 @@ impl SessionState {
             QueryKind::TransactionStart => self.in_transaction = true,
             QueryKind::TransactionEnd => self.in_transaction = false,
             QueryKind::Session => self.session_pinned = true,
-            QueryKind::Write => self.last_write = Some(Instant::now()),
+            QueryKind::Write => {
+                self.last_write = Some(Instant::now());
+                if !self.autocommit_enabled {
+                    self.in_transaction = true;
+                }
+            }
             QueryKind::Read | QueryKind::Metadata | QueryKind::ReplayableSession => {}
         }
     }
@@ -61,6 +70,26 @@ impl SessionState {
 
     pub fn in_transaction(&self) -> bool {
         self.in_transaction
+    }
+
+    pub fn autocommit_enabled(&self) -> bool {
+        self.autocommit_enabled
+    }
+
+    pub fn table_locks_active(&self) -> bool {
+        self.table_locks_active
+    }
+
+    pub fn record_mysql_transaction_success(&mut self, evaluation: MysqlTransactionEvaluation) {
+        self.autocommit_enabled = evaluation.autocommit_enabled;
+        self.table_locks_active = evaluation.table_locks_active;
+        if evaluation.implicit_commit {
+            self.in_transaction = evaluation.transaction_active_after_boundary;
+        }
+    }
+
+    pub fn record_implicit_commit(&mut self) {
+        self.in_transaction = false;
     }
 
     fn requires_primary_consistency(&self) -> bool {
@@ -113,5 +142,46 @@ mod tests {
         state.record_success(QueryKind::ReplayableSession);
         assert!(!state.is_pinned());
         assert_eq!(state.route(QueryKind::Read, true), RouteTarget::Replica);
+    }
+
+    #[test]
+    fn implicit_commit_releases_only_the_transaction_pin() {
+        let mut state = SessionState::new(Duration::ZERO);
+        state.record_success(QueryKind::TransactionStart);
+        state.record_implicit_commit();
+        assert!(!state.is_pinned());
+        assert_eq!(state.route(QueryKind::Read, true), RouteTarget::Replica);
+
+        state.record_success(QueryKind::Session);
+        state.record_success(QueryKind::TransactionStart);
+        state.record_implicit_commit();
+        assert!(state.is_pinned());
+        assert_eq!(
+            state.route(QueryKind::Read, true),
+            RouteTarget::PinnedPrimary
+        );
+    }
+
+    #[test]
+    fn autocommit_off_tracks_implicit_transactions() {
+        let mut state = SessionState::new(Duration::ZERO);
+        state.record_mysql_transaction_success(MysqlTransactionEvaluation {
+            implicit_commit: false,
+            autocommit_enabled: false,
+            table_locks_active: false,
+            transaction_active_after_boundary: false,
+        });
+        state.record_success(QueryKind::Write);
+        assert!(state.in_transaction());
+
+        state.record_success(QueryKind::Session);
+        state.record_mysql_transaction_success(MysqlTransactionEvaluation {
+            implicit_commit: true,
+            autocommit_enabled: true,
+            table_locks_active: false,
+            transaction_active_after_boundary: false,
+        });
+        assert!(!state.in_transaction());
+        assert!(state.autocommit_enabled());
     }
 }

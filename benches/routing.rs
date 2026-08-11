@@ -15,6 +15,8 @@ fn shard_router() -> ShardRouter {
         enabled: true,
         default_shard: "s0".to_owned(),
         missing_key_policy: MissingShardKeyPolicy::Reject,
+        max_scatter_shards: 16,
+        scatter_concurrency: 4,
         rules: vec![ShardRuleConfig {
             table: "orders".to_owned(),
             column: "tenant_id".to_owned(),

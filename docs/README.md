@@ -5,6 +5,8 @@ start. The focused guides below describe design and operating contracts.
 
 | Document | Use it for |
 | --- | --- |
+| [Quick start](quick-start.md) | Start, verify, inspect, and stop the disposable multi-protocol demo |
+| [Sharding examples](sharding-examples.md) | End-to-end MySQL, PostgreSQL/TimescaleDB, and Redis/Valkey hash, range, and value examples |
 | [Product positioning](product-positioning.md) | When DBProxy is appropriate, when to choose a distributed platform, and the graduation path |
 | [Deployment](deployment.md) | One-command local and Kubernetes deployment |
 | [Architecture](architecture.md) | Listener, routing, pooling, consistency, failure, and security design |
@@ -26,7 +28,8 @@ start. The focused guides below describe design and operating contracts.
 - [`dbproxy.example.toml`](../config/dbproxy.example.toml): single-shard starter
   with MySQL enabled and PostgreSQL/Redis sections ready to activate.
 - [`dbproxy.sharded.example.toml`](../config/dbproxy.sharded.example.toml):
-  MySQL sharding and guarded write fanout plus Redis command sharding.
+  complete MySQL, PostgreSQL/TimescaleDB, and Redis/Valkey sharding topology,
+  including guarded MySQL write fanout.
 - [`dbproxy.docker.toml`](../config/dbproxy.docker.toml): disposable credentials
   and service names for the local Compose integration topology only.
 

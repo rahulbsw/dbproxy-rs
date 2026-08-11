@@ -46,8 +46,13 @@ instances.
 ## Consistency and invalidation
 
 Successful autocommit writes increment the affected table/shard generation.
-Writes inside an explicit transaction are accumulated and generations advance
-only after a successful `COMMIT`; `ROLLBACK` discards them. Old entries become
+Writes inside an explicit transaction or an `autocommit=0` transaction are
+accumulated and generations advance only after `COMMIT`, a state-confirmed
+`SET autocommit=1`, or another MySQL implicit-commit boundary; `ROLLBACK`
+discards them. Conditional boundaries such as `UNLOCK TABLES` do not advance a
+generation unless the session actually holds table locks. Invalidation happens
+after the backend crosses the boundary, preventing a concurrent old-generation
+fill from becoming current again. Old entries become
 unreachable immediately and expire naturally, so invalidation never scans or
 deletes a keyspace.
 

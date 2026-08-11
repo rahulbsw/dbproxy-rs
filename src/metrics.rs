@@ -42,6 +42,11 @@ pub struct Metrics {
     backend_acquire_timeouts: AtomicU64,
     replica_fallbacks: AtomicU64,
     shard_routing_failures: AtomicU64,
+    scatter_plans: AtomicU64,
+    scatter_shards: AtomicU64,
+    scatter_failures: AtomicU64,
+    scatter_rows: AtomicU64,
+    scatter_bytes: AtomicU64,
     fanout_attempts: AtomicU64,
     fanout_successes: AtomicU64,
     fanout_failures: AtomicU64,
@@ -58,6 +63,8 @@ pub struct Metrics {
     prepared_created: AtomicU64,
     prepared_executed: AtomicU64,
     prepared_closed: AtomicU64,
+    prepared_routing_cache_hits: AtomicU64,
+    prepared_routing_cache_misses: AtomicU64,
     admin_active: AtomicI64,
     admin_requests: AtomicU64,
     admin_rejected: AtomicU64,
@@ -194,6 +201,21 @@ impl Metrics {
         self.shard_routing_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn scatter_planned(&self, shards: usize) {
+        self.scatter_plans.fetch_add(1, Ordering::Relaxed);
+        self.scatter_shards
+            .fetch_add(shards as u64, Ordering::Relaxed);
+    }
+
+    pub fn scatter_failed(&self) {
+        self.scatter_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn scatter_merged(&self, rows: u64, bytes: u64) {
+        self.scatter_rows.fetch_add(rows, Ordering::Relaxed);
+        self.scatter_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub fn fanout_attempted(&self) {
         self.fanout_attempts.fetch_add(1, Ordering::Relaxed);
     }
@@ -265,6 +287,16 @@ impl Metrics {
 
     pub fn prepared_closed(&self) {
         self.prepared_closed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn prepared_routing_cache_hit(&self) {
+        self.prepared_routing_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn prepared_routing_cache_miss(&self) {
+        self.prepared_routing_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn rows_returned(&self, rows: u64) {
@@ -838,6 +870,41 @@ impl Metrics {
         );
         metric(
             &mut output,
+            "dbproxy_scatter_plans_total",
+            "counter",
+            "Bounded SQL scatter/gather plans executed.",
+            self.scatter_plans.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_scatter_shards_total",
+            "counter",
+            "SQL shard branches participating in scatter/gather plans.",
+            self.scatter_shards.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_scatter_failures_total",
+            "counter",
+            "SQL scatter/gather plans that failed after execution planning began.",
+            self.scatter_failures.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_scatter_merge_rows_total",
+            "counter",
+            "Rows emitted after SQL scatter/gather merging.",
+            self.scatter_rows.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_scatter_merge_bytes_total",
+            "counter",
+            "Result bytes emitted after SQL scatter/gather merging.",
+            self.scatter_bytes.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
             "dbproxy_write_fanout_attempts_total",
             "counter",
             "Secondary shard write attempts.",
@@ -956,6 +1023,20 @@ impl Metrics {
             "counter",
             "Prepared statements explicitly closed by clients.",
             self.prepared_closed.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_prepared_routing_cache_hits_total",
+            "counter",
+            "Prepared executions routed from a cached parsed SQL template.",
+            self.prepared_routing_cache_hits.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_prepared_routing_cache_misses_total",
+            "counter",
+            "Prepared executions without an available parsed SQL routing template.",
+            self.prepared_routing_cache_misses.load(Ordering::Relaxed),
         );
         metric(
             &mut output,
@@ -1317,6 +1398,11 @@ mod tests {
         metrics.redis_cross_shard_command(2);
         metrics.redis_command_routing_failed();
         metrics.redis_partial_write_failed();
+        metrics.scatter_planned(3);
+        metrics.scatter_failed();
+        metrics.scatter_merged(7, 42);
+        metrics.prepared_routing_cache_hit();
+        metrics.prepared_routing_cache_miss();
         let output = metrics.encode_prometheus();
         assert!(output.contains("dbproxy_queries_total{kind=\"read\"} 1"));
         assert!(output.contains("dbproxy_query_duration_seconds_bucket{le=\"0.010\"} 1"));
@@ -1337,6 +1423,13 @@ mod tests {
         assert!(output.contains("dbproxy_redis_command_routing_failures_total 1"));
         assert!(output.contains("dbproxy_redis_fanout_subcommands_total 2"));
         assert!(output.contains("dbproxy_redis_partial_write_failures_total 1"));
+        assert!(output.contains("dbproxy_scatter_plans_total 1"));
+        assert!(output.contains("dbproxy_scatter_shards_total 3"));
+        assert!(output.contains("dbproxy_scatter_failures_total 1"));
+        assert!(output.contains("dbproxy_scatter_merge_rows_total 7"));
+        assert!(output.contains("dbproxy_scatter_merge_bytes_total 42"));
+        assert!(output.contains("dbproxy_prepared_routing_cache_hits_total 1"));
+        assert!(output.contains("dbproxy_prepared_routing_cache_misses_total 1"));
     }
 
     #[test]

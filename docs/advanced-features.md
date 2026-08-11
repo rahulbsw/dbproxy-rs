@@ -26,8 +26,9 @@ Completed:
 - transparent Redis read-write and read-only listeners with RESP2/RESP3
   preservation, weighted replica selection, end-to-end AUTH/ACL and unsharded TLS,
   graceful draining, transport health, and metrics
-- connection-level PostgreSQL/TimescaleDB and Redis/Valkey sharding with shared
-  hash, half-open numeric range, and exact-value strategies
+- connection-level PostgreSQL/TimescaleDB and Redis/Valkey sharding plus
+  PostgreSQL transaction-mode SQL rules, with shared hash, half-open numeric
+  range, and exact-value strategies
 - opt-in Redis/Valkey command sharding with CRC16 hash tags, bounded fanout,
   ordered `MGET` merge, integer aggregation, guarded non-atomic writes, and
   command-mode read-only enforcement
@@ -91,9 +92,11 @@ and oldest in-doubt age.
 
 ## Scatter/gather reads
 
-The first release should be opt-in with an explicit
-`/* dbproxy:scatter */` hint. It should accept only read-only queries over one
-configured sharded table. Locking reads, user variables, session-dependent
+The implemented first release accepts only read-only queries over one
+configured MySQL or PostgreSQL/TimescaleDB sharded table when the AST provides
+an explicit safe merge:
+a root-level `UNION ALL`, or an aggregate-only projection using the supported
+decomposable functions. Locking reads, user variables, session-dependent
 functions, cross-shard joins, and writes remain rejected.
 
 Execution must:
@@ -105,24 +108,24 @@ Execution must:
 5. merge results according to an explicit supported merge strategy;
 6. cancel and discard uncertain backend connections on failure.
 
-The initial merge strategy is concatenation, equivalent to `UNION ALL`, for
-queries without global ordering, grouping, aggregation, distinctness, offset,
-or limit. Later strategies require separate implementations:
+The initial merge strategies are root-level `UNION ALL` concatenation and
+aggregate-only `COUNT`, `SUM`, numeric/temporal `MIN` and `MAX`, plus `AVG`
+rewritten as shard-local `SUM` and `COUNT`. All plans share configured shard,
+row, byte, and concurrency limits. Later strategies require separate
+implementations:
 
 - k-way merge for a validated global `ORDER BY`, with deterministic tie-breakers
 - top-N merge for `ORDER BY ... LIMIT`
-- algebraically safe aggregation for `COUNT`, `SUM`, `MIN`, and `MAX`
-- weighted `AVG` represented as shard-local `SUM` plus `COUNT`
+- collation-aware string extrema
 
 `DISTINCT`, arbitrary expressions, window functions, and non-decomposable
 aggregates remain unsupported until their exact global semantics are defined.
-Buffered gather must share one total row/byte budget. Streaming gather may
-concatenate shards, but an error after the first emitted row closes the client
-connection.
+The first implementation buffers every gather—even when ordinary query mode is
+configured for streaming—under one shared row/byte budget so a shard failure is
+reported before any partial client response.
 
-Required metrics include scatter plans, participating shards, shard failures,
-partial-stream disconnects, merge rows/bytes, execution latency, and concurrency
-queue time.
+Metrics cover scatter plans, participating shards, failures, merged rows/bytes,
+and execution latency through the normal query-duration histogram.
 
 ## Online resharding
 

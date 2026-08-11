@@ -1,10 +1,15 @@
 # PostgreSQL, TimescaleDB, Redis, and Valkey sharding
 
+For complete backend declarations and executable client commands, start with
+the [multi-protocol sharding examples](sharding-examples.md). MySQL sharding is
+covered there as well.
+
 PostgreSQL/TimescaleDB transparent mode and the default Redis/Valkey mode remain
 connection-pinned so backend authentication and protocol state retain native
 semantics. PostgreSQL transaction mode routes simple/common-extended statements within a
-startup-selected shard, while Redis/Valkey additionally offers command routing
-for proxy-side key hashing and explicitly supported multi-key operations.
+SQL-selected or startup-selected shard, while Redis/Valkey additionally offers
+command routing for proxy-side key hashing and explicitly supported multi-key
+operations.
 
 Native Redis Cluster mode is separate from DBProxy's logical shard map. It uses
 Redis CRC16 slots directly, publishes only complete `CLUSTER SLOTS` snapshots,
@@ -18,9 +23,44 @@ to that shard's primary.
 
 ## PostgreSQL and TimescaleDB selection
 
-Set `postgres.sharding.enabled = true` and send the configured startup parameter.
-The proxy removes its private parameter before forwarding the StartupMessage.
-Most libpq clients can use `options`:
+Set `postgres.sharding.enabled = true`. Transaction mode supports SQL rules:
+
+```toml
+[postgres]
+routing_mode = "transaction"
+
+[postgres.sharding]
+enabled = true
+strategy = "hash"
+max_scatter_shards = 16
+scatter_concurrency = 4
+
+[[postgres.sharding.rules]]
+table = "user_info"
+column = "userid"
+```
+
+DBProxy parses equality and literal `IN` predicates recursively through CTEs
+and subqueries. All values in an ordinary statement must map to one shard.
+Bounded root `UNION ALL` and decomposable aggregate scatter/gather are supported;
+cross-shard joins and global ordered/grouped merges are rejected. TimescaleDB
+hypertables follow the same rules.
+
+SQL rule names are deliberately unqualified: configure `table = "user_info"`
+and `column = "userid"`, not schema-qualified names. A DBProxy listener must
+therefore use one consistent table-to-shard rule across its PostgreSQL search
+path. Run separate listeners/configurations when identical table names in
+different schemas require different shard keys.
+
+PostgreSQL extended-query parameters are decoded using backend-inferred or
+client-supplied types. Only placeholders used by configured shard-key
+predicates are bound into the cached parsed routing template; unrelated binary
+or extension-type parameters remain untouched for backend decoding. This
+supports same-shard predicates and bounded root `UNION ALL` or decomposable
+aggregate scatter without reparsing SQL on every Bind/Execute. The configured
+startup parameter remains available for connection-scoped routing, transactions,
+and tables without a SQL shard rule. The proxy removes its private parameter
+before transparent forwarding. Most libpq clients can use `options`:
 
 ```bash
 PGOPTIONS='-c dbproxy.shard_key=tenant-42' \

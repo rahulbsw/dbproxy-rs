@@ -28,7 +28,6 @@ pub(super) struct RedisTopologyStats {
     pub redirect_failures: AtomicU64,
 }
 
-#[derive(Debug)]
 pub(super) struct SentinelTopology {
     config: RedisSentinelConfig,
     primaries: HashMap<String, Arc<RedisBackend>>,
@@ -156,7 +155,6 @@ impl SentinelTopology {
     }
 }
 
-#[derive(Debug)]
 pub(super) struct ClusterTopology {
     config: RedisClusterConfig,
     slots: RwLock<Vec<Option<String>>>,

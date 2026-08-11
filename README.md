@@ -16,6 +16,10 @@ copying their GPL-licensed source code.
 > parity with mature proxies. Review [current boundaries](#current-boundaries)
 > and validate failure behavior against your topology before production use.
 
+New here? Run the [three-command quick start](docs/quick-start.md), then use the
+[copy-paste sharding examples](docs/sharding-examples.md) for MySQL,
+PostgreSQL/TimescaleDB, and Redis/Valkey.
+
 DBProxy targets the stage between a single database and a full distributed
 database platform. It is a lightweight routing layer over an existing,
 relatively stable topology—not a replacement for Vitess fleet automation,
@@ -71,6 +75,8 @@ flowchart LR
 
 | Guide | Contents |
 | --- | --- |
+| [Quick start](docs/quick-start.md) | Start, verify, inspect, and stop the complete local demo |
+| [Sharding examples](docs/sharding-examples.md) | Copy-paste hash, range, and value configurations and client commands for every protocol |
 | [Documentation index](docs/README.md) | Map of guides and configuration examples |
 | [Product positioning](docs/product-positioning.md) | DBProxy's scope, alternatives, and graduation to a distributed platform |
 | [Deployment](docs/deployment.md) | One-command local and Kubernetes deployment |
@@ -123,8 +129,9 @@ flowchart LR
   binary types, transactions, cancellation, `COPY`, and unsharded end-to-end TLS
 - separate PostgreSQL read-write and read-only endpoints with weighted,
   health-aware backend selection and optional primary fallback
-- PostgreSQL/TimescaleDB startup-based connection sharding with deterministic
-  hash, numeric range, or exact-value mappings
+- PostgreSQL/TimescaleDB startup-based connection sharding plus transaction-mode
+  SQL-AST routing with equality, `IN`, CTE, bounded `UNION ALL`, and decomposable
+  aggregate support using deterministic hash, numeric range, or exact values
 - TimescaleDB-transparent hypertables, continuous aggregates, extension
   functions, and high-volume ingest/query traffic
 - transparent RESP2/RESP3 Redis/Valkey forwarding with separate read-write and
@@ -140,15 +147,19 @@ flowchart LR
 ## Quick start
 
 Start the complete disposable MySQL, TimescaleDB, Redis, and DBProxy demo with
-one command. A running Podman Compose or Docker Compose implementation is
-required:
+`./deploy.sh`, verify it, and then clean it up. A running Podman Compose or
+Docker Compose implementation is required:
 
 ```bash
 ./deploy.sh
+./scripts/smoke.sh
+./deploy.sh local-down
 ```
 
-See the [deployment guide](docs/deployment.md) for Kubernetes, runtime
-overrides, dry runs, and uninstall behavior.
+The smoke test uses containerized clients when `mysql`, `psql`, or `redis-cli`
+is not installed locally. See the [complete quick start](docs/quick-start.md)
+for endpoints and expected results, and the [deployment guide](docs/deployment.md)
+for Kubernetes, runtime overrides, dry runs, and uninstall behavior.
 
 To build and configure DBProxy directly instead:
 
@@ -346,7 +357,9 @@ backend connection; released connections are reset with `ROLLBACK; DISCARD
 ALL`. This mode accepts exactly one parseable statement per simple or extended
 query and rejects writes on the read-only listener. Extended parameters and
 binary results support common scalar, JSON, numeric, and time types; prepared
-statements are re-prepared on the selected pooled backend. `COPY`, custom or
+statements cache their parsed routing template and inferred parameter metadata,
+bind typed values into a short-lived AST for shard selection, and are re-prepared
+on the selected pooled backend. `COPY`, custom or
 array types, Pub/Sub-like `LISTEN` workflows, and unrestricted extension type
 fidelity should use transparent mode. See
 [PostgreSQL transaction pooling](docs/postgres-pooling.md).
@@ -445,6 +458,8 @@ column to an ordered shard list:
 enabled = true
 default_shard = "orders-0"
 missing_key_policy = "reject"
+max_scatter_shards = 16
+scatter_concurrency = 4
 
 [[sharding.rules]]
 table = "orders"
@@ -456,8 +471,24 @@ strategy = "hash"
 `tenant_id = 10` selects `orders-0`; `tenant_id = 11` selects `orders-1`.
 Integers use modulo. Strings use stable FNV-1a followed by modulo. Supported
 forms include keyed `SELECT`, `UPDATE`, `DELETE`, and `INSERT ... VALUES`.
-Multi-row inserts must resolve entirely to one shard. A missing key, cross-shard
-query, or unrouteable expression is rejected by default.
+Equality and literal `IN` predicates are parsed from the SQL AST. Every value
+may appear in one statement when all values resolve to the same shard;
+otherwise ordinary statements are rejected. CTE predicates are inspected
+recursively, as are expression subqueries; every reference must resolve to the
+same database. Ambiguous sharded-table self-joins are rejected. Multi-row
+inserts must still resolve entirely to one shard. Signed integer literals are
+valid range keys. Tuple assignments and conflict updates that include the shard
+column are rejected, DML source tables such as `INSERT ... SELECT` are
+inspected, and statement families without an implemented shard-key extractor
+fail closed when they touch a sharded table.
+
+Top-level `UNION ALL` branches may target different shards and are executed
+with bounded concurrency, compatible-column validation, and one shared
+row/byte budget. A cross-shard union nested below global `ORDER BY`, `LIMIT`,
+`OFFSET`, `DISTINCT`, or another global operation is rejected. Aggregate-only
+queries over one sharded table support `COUNT`, `SUM`, weighted `AVG` via
+shard-local `SUM`/`COUNT`, and numeric/temporal `MIN`/`MAX`. Grouping, windows,
+cross-shard joins, and collation-sensitive string `MIN`/`MAX` remain rejected.
 
 Set `strategy = "range"` or `"value"` and add mappings when modulo/hash is not
 the intended data layout:
@@ -529,7 +560,8 @@ pipeline for asynchronous cross-system delivery.
 
 See
 [`config/dbproxy.sharded.example.toml`](config/dbproxy.sharded.example.toml)
-for a complete topology.
+for a complete topology and [the sharding examples](docs/sharding-examples.md)
+for client commands, hash/range/value mappings, and failure troubleshooting.
 
 ## Operations
 
@@ -547,6 +579,10 @@ GET /metrics   Prometheus text exposition
 
 Set `RUST_LOG` to override `logging.filter`. Keep the admin listener on loopback
 or behind network policy because it has no application-level authentication.
+Logs omit SQL, Redis keys/values, authentication material, and shard-key values;
+they can include peer addresses and configured topology metadata. See the
+[observability sensitive-data contract](docs/operations.md#sensitive-data-contract)
+before exporting logs or metrics outside the cluster.
 
 Readiness begins false and becomes true only after every shard primary passes a
 health check. `/backends` includes health timestamps, consecutive failures,
@@ -603,9 +639,11 @@ recommendations.
 - PostgreSQL transaction mode supports simple queries and a bounded set of
   extended-query scalar types. `COPY`, custom/array types, and very large
   result streaming remain on transparent mode
-- PostgreSQL/TimescaleDB sharding is startup-selected. Transparent end-to-end TLS
-  hides the selector; transaction mode can terminate frontend TLS and use a
-  separately verified TLS or mTLS backend hop
+- PostgreSQL/TimescaleDB transparent sharding is startup-selected and native
+  end-to-end TLS hides that selector. Transaction mode can route configured
+  table keys from SQL while terminating frontend TLS and using a separately
+  verified TLS or mTLS backend hop. Typed prepared parameters support the same
+  single-shard, root `UNION ALL`, and decomposable aggregate plans as literals
 - PostgreSQL readiness defaults to TCP transport. Authenticated SQL probes can
   use certificate/hostname-verified TLS or mTLS; plaintext probes remain an
   explicit trusted-network option
@@ -618,11 +656,16 @@ recommendations.
   plaintext trusted hop or external TLS termination and currently uses slot
   primaries for reads
 - shard schemas must expose compatible prepared-statement parameter and result
-  metadata
+  metadata. Parameterized PostgreSQL Describe uses a shard compatible with the
+  requested startup database, but full cross-shard metadata fingerprinting
+  remains an operator-enforced schema contract
 - streaming result sets are bounded by configured row and byte totals and do not
   support resuming after a mid-stream backend failure
-- scatter/gather queries, cross-shard joins, and automatic table rewriting are
-  not implemented
+- bounded MySQL and PostgreSQL/TimescaleDB top-level `UNION ALL` and decomposable
+  aggregate scatter/gather are implemented; cross-shard joins, grouped/global
+  ordered merges, and automatic table rewriting are not implemented. Scatter
+  rejects volatile or session-dependent expressions, and exact numeric merges
+  use arbitrary precision
 - runtime etcd generations currently cover MySQL users, routing, sharding,
   fanout, and cache policy; listener, backend, PostgreSQL, and Redis topology
   changes still require restart, and an admin SQL interface is out of scope

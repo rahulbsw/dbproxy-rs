@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 
 use crate::{config::ControlPlaneConfig, error::ProxyError};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct RuntimeValue {
     pub revision: u64,
     pub document: String,

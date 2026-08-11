@@ -41,7 +41,7 @@ pub struct Config {
     pub logging: LoggingConfig,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ControlPlaneConfig {
     pub enabled: bool,
@@ -91,7 +91,7 @@ impl Default for ControlPlaneTlsConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfigDocument {
     pub users: Option<Vec<UserConfig>>,
@@ -101,7 +101,7 @@ pub struct RuntimeConfigDocument {
     pub cache: Option<CacheConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
     pub enabled: bool,
@@ -211,7 +211,7 @@ pub enum PostgresRoutingMode {
     Transaction,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RedisConfig {
     pub enabled: bool,
@@ -273,7 +273,7 @@ impl Default for RedisConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RedisSentinelConfig {
     pub enabled: bool,
@@ -308,7 +308,7 @@ pub struct RedisSentinelMasterConfig {
     pub name: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RedisClusterConfig {
     pub enabled: bool,
@@ -359,13 +359,39 @@ pub enum ProtocolShardStrategy {
     Value,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProtocolShardingConfig {
     pub enabled: bool,
     pub strategy: ProtocolShardStrategy,
     pub default_shard: Option<String>,
     pub shards: Vec<ProtocolShardConfig>,
+    pub rules: Vec<ProtocolSqlShardRuleConfig>,
+    #[serde(default = "default_max_scatter_shards")]
+    pub max_scatter_shards: usize,
+    #[serde(default = "default_scatter_concurrency")]
+    pub scatter_concurrency: usize,
+}
+
+impl Default for ProtocolShardingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strategy: ProtocolShardStrategy::default(),
+            default_shard: None,
+            shards: Vec::new(),
+            rules: Vec::new(),
+            max_scatter_shards: default_max_scatter_shards(),
+            scatter_concurrency: default_scatter_concurrency(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProtocolSqlShardRuleConfig {
+    pub table: String,
+    pub column: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -471,7 +497,7 @@ impl Default for AdminConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
     pub username: String,
@@ -673,6 +699,8 @@ pub struct ShardingConfig {
     pub enabled: bool,
     pub default_shard: String,
     pub missing_key_policy: MissingShardKeyPolicy,
+    pub max_scatter_shards: usize,
+    pub scatter_concurrency: usize,
     pub rules: Vec<ShardRuleConfig>,
 }
 
@@ -682,6 +710,8 @@ impl Default for ShardingConfig {
             enabled: false,
             default_shard: default_shard(),
             missing_key_policy: MissingShardKeyPolicy::Reject,
+            max_scatter_shards: 16,
+            scatter_concurrency: 4,
             rules: Vec::new(),
         }
     }
@@ -799,7 +829,11 @@ impl Config {
         })?;
         let raw = expand_environment(&raw)?;
         let config: Self = toml::from_str(&raw).map_err(|error| {
-            ProxyError::Config(format!("failed to parse {}: {error}", path.display()))
+            ProxyError::Config(format!(
+                "failed to parse {}: {}",
+                path.display(),
+                redacted_toml_error(&error)
+            ))
         })?;
         config.validate()?;
         Ok(config)
@@ -1018,8 +1052,8 @@ impl Config {
             let mapping_config = ProtocolShardingConfig {
                 enabled: true,
                 strategy: rule.strategy,
-                default_shard: None,
                 shards: mappings,
+                ..ProtocolShardingConfig::default()
             };
             let rule_backend_shards = rule
                 .shards
@@ -1036,6 +1070,17 @@ impl Config {
         if self.sharding.enabled && self.sharding.rules.is_empty() {
             return Err(ProxyError::Config(
                 "sharding.enabled requires at least one sharding rule".to_owned(),
+            ));
+        }
+        if self.sharding.max_scatter_shards == 0 || self.sharding.scatter_concurrency == 0 {
+            return Err(ProxyError::Config(
+                "sharding.max_scatter_shards and scatter_concurrency must be greater than zero"
+                    .to_owned(),
+            ));
+        }
+        if self.sharding.scatter_concurrency > self.sharding.max_scatter_shards {
+            return Err(ProxyError::Config(
+                "sharding.scatter_concurrency cannot exceed max_scatter_shards".to_owned(),
             ));
         }
 
@@ -1236,15 +1281,39 @@ impl Config {
         if !self.control_plane.enabled {
             return Ok(());
         }
-        if self.control_plane.endpoints.is_empty()
-            || self.control_plane.endpoints.iter().any(|endpoint| {
-                !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
-            })
-        {
+        if self.control_plane.endpoints.is_empty() {
             return Err(ProxyError::Config(
                 "control_plane.endpoints must contain at least one HTTP(S) etcd endpoint"
                     .to_owned(),
             ));
+        }
+        let mut has_http_endpoint = false;
+        let mut has_https_endpoint = false;
+        for endpoint in &self.control_plane.endpoints {
+            let parsed = reqwest::Url::parse(endpoint).map_err(|_| {
+                ProxyError::Config(
+                    "control_plane.endpoints must contain valid HTTP(S) etcd URLs".to_owned(),
+                )
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                return Err(ProxyError::Config(
+                    "control_plane.endpoints must contain valid HTTP(S) etcd URLs".to_owned(),
+                ));
+            }
+            has_http_endpoint |= parsed.scheme() == "http";
+            has_https_endpoint |= parsed.scheme() == "https";
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                return Err(ProxyError::Config(
+                    "control_plane.endpoints must not contain credentials; use the dedicated username and password fields"
+                        .to_owned(),
+                ));
+            }
+            if parsed.query().is_some() || parsed.fragment().is_some() {
+                return Err(ProxyError::Config(
+                    "control_plane.endpoints must not contain query strings or fragments"
+                        .to_owned(),
+                ));
+            }
         }
         if self.control_plane.key.trim().is_empty() || !self.control_plane.key.starts_with('/') {
             return Err(ProxyError::Config(
@@ -1269,11 +1338,8 @@ impl Config {
                 "control-plane client certificate and key must be configured together".to_owned(),
             ));
         }
-        if self
-            .control_plane
-            .endpoints
-            .iter()
-            .all(|endpoint| endpoint.starts_with("http://"))
+        if has_http_endpoint
+            && !has_https_endpoint
             && (tls.ca_path.is_some()
                 || tls.client_cert_path.is_some()
                 || tls.client_key_path.is_some())
@@ -1282,14 +1348,7 @@ impl Config {
                 "control-plane TLS material requires at least one HTTPS endpoint".to_owned(),
             ));
         }
-        if self
-            .control_plane
-            .endpoints
-            .iter()
-            .any(|endpoint| endpoint.starts_with("https://"))
-            && !tls.use_webpki_roots
-            && tls.ca_path.is_none()
-        {
+        if has_https_endpoint && !tls.use_webpki_roots && tls.ca_path.is_none() {
             return Err(ProxyError::Config(
                 "HTTPS control-plane endpoints require public roots or an explicit CA".to_owned(),
             ));
@@ -1301,7 +1360,8 @@ impl Config {
         let expanded = expand_environment(raw)?;
         let document: RuntimeConfigDocument = toml::from_str(&expanded).map_err(|error| {
             ProxyError::Config(format!(
-                "failed to parse etcd runtime configuration: {error}"
+                "failed to parse etcd runtime configuration: {}",
+                redacted_toml_error(&error)
             ))
         })?;
         let mut candidate = self.clone();
@@ -1331,7 +1391,7 @@ impl Config {
                     "postgres_backends require postgres.enabled = true".to_owned(),
                 ));
             }
-            if self.postgres.sharding.enabled {
+            if self.postgres.sharding.enabled || !self.postgres.sharding.rules.is_empty() {
                 return Err(ProxyError::Config(
                     "postgres.sharding.enabled requires postgres.enabled = true".to_owned(),
                 ));
@@ -1468,6 +1528,14 @@ impl Config {
         }
         validate_protocol_sharding("postgres", &self.postgres.sharding, &backend_shards)
             .map_err(ProxyError::Config)?;
+        if !self.postgres.sharding.rules.is_empty()
+            && self.postgres.routing_mode != PostgresRoutingMode::Transaction
+        {
+            return Err(ProxyError::Config(
+                "postgres.sharding.rules require postgres.routing_mode = \"transaction\""
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -1478,7 +1546,7 @@ impl Config {
                     "redis_backends require redis.enabled = true".to_owned(),
                 ));
             }
-            if self.redis.sharding.enabled {
+            if self.redis.sharding.enabled || !self.redis.sharding.rules.is_empty() {
                 return Err(ProxyError::Config(
                     "redis.sharding.enabled requires redis.enabled = true".to_owned(),
                 ));
@@ -1488,6 +1556,11 @@ impl Config {
         if self.redis_backends.is_empty() {
             return Err(ProxyError::Config(
                 "redis.enabled requires at least one redis_backends entry".to_owned(),
+            ));
+        }
+        if !self.redis.sharding.rules.is_empty() {
+            return Err(ProxyError::Config(
+                "redis.sharding.rules are SQL-only and cannot be configured for Redis".to_owned(),
             ));
         }
         if self.redis.max_connections == 0
@@ -1867,6 +1940,16 @@ fn expand_environment(input: &str) -> Result<String, ProxyError> {
     Ok(output)
 }
 
+fn redacted_toml_error(error: &toml::de::Error) -> String {
+    match error.span() {
+        Some(span) => format!(
+            "invalid TOML syntax or configuration value at byte offset {}",
+            span.start
+        ),
+        None => "invalid TOML syntax or configuration value".to_owned(),
+    }
+}
+
 pub fn parse_backend_address(address: &str) -> Result<(&str, u16), ProxyError> {
     let (host, port) = if let Some(rest) = address.strip_prefix('[') {
         let end = rest.find(']').ok_or_else(|| {
@@ -1989,6 +2072,14 @@ fn default_weight() -> u32 {
 
 fn default_shard() -> String {
     "default".to_owned()
+}
+
+fn default_max_scatter_shards() -> usize {
+    16
+}
+
+fn default_scatter_concurrency() -> usize {
+    4
 }
 
 #[cfg(test)]
@@ -2225,6 +2316,89 @@ mod tests {
                 .to_string()
                 .contains("configured together")
         );
+    }
+
+    #[test]
+    fn control_plane_rejects_credentials_and_tokens_in_endpoint_urls() {
+        let raw = r#"
+            [proxy]
+            listen = "127.0.0.1:3307"
+
+            [[users]]
+            username = "app"
+            password = "secret"
+
+            [[backends]]
+            name = "one"
+            address = "127.0.0.1:3306"
+            role = "primary"
+            username = "root"
+            password = ""
+        "#;
+        let mut base: Config = toml::from_str(raw).unwrap();
+        base.control_plane.enabled = true;
+        base.control_plane.endpoints = vec!["https://dbproxy:secret@etcd.internal:2379".to_owned()];
+        let error = base.validate_control_plane().unwrap_err().to_string();
+        assert!(error.contains("must not contain credentials"));
+        assert!(!error.contains("secret"));
+
+        base.control_plane.endpoints = vec!["https://etcd.internal:2379?token=secret".to_owned()];
+        let error = base.validate_control_plane().unwrap_err().to_string();
+        assert!(error.contains("must not contain query strings"));
+        assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn control_plane_tls_checks_use_the_normalized_url_scheme() {
+        let raw = r#"
+            [proxy]
+            listen = "127.0.0.1:3307"
+
+            [[users]]
+            username = "app"
+            password = "secret"
+
+            [[backends]]
+            name = "one"
+            address = "127.0.0.1:3306"
+            role = "primary"
+            username = "root"
+            password = ""
+        "#;
+        let mut config: Config = toml::from_str(raw).unwrap();
+        config.control_plane.enabled = true;
+        config.control_plane.endpoints = vec!["HTTPS://etcd.internal:2379".to_owned()];
+        config.control_plane.tls.use_webpki_roots = false;
+        assert!(
+            config
+                .validate_control_plane()
+                .unwrap_err()
+                .to_string()
+                .contains("explicit CA")
+        );
+
+        config.control_plane.endpoints = vec!["HTTP://etcd.internal:2379".to_owned()];
+        config.control_plane.tls.ca_path = Some(PathBuf::from("/run/secrets/etcd-ca.pem"));
+        assert!(
+            config
+                .validate_control_plane()
+                .unwrap_err()
+                .to_string()
+                .contains("requires at least one HTTPS endpoint")
+        );
+    }
+
+    #[test]
+    fn toml_diagnostics_do_not_echo_source_lines() {
+        let error = match toml::from_str::<RuntimeConfigDocument>(
+            "[[users]]\nusername = \"app\"\npassword = \"never-log-this\" trailing",
+        ) {
+            Ok(_) => panic!("invalid TOML unexpectedly parsed"),
+            Err(error) => error,
+        };
+        let diagnostic = redacted_toml_error(&error);
+        assert!(!diagnostic.contains("never-log-this"));
+        assert!(diagnostic.contains("byte offset"));
     }
 
     #[test]
@@ -2523,6 +2697,7 @@ mod tests {
 
             [postgres]
             enabled = true
+            routing_mode = "transaction"
             read_write_listen = "127.0.0.1:6432"
             read_only_listen = "127.0.0.1:6433"
 
@@ -2535,6 +2710,10 @@ mod tests {
 
             [[postgres.sharding.shards]]
             name = "pg-1"
+
+            [[postgres.sharding.rules]]
+            table = "user_info"
+            column = "userid"
 
             [redis]
             enabled = true
@@ -2569,12 +2748,18 @@ mod tests {
             address = "127.0.0.1:5432"
             role = "primary"
             shard = "pg-0"
+            username = "proxy"
+            password = "secret"
+            database = "app"
 
             [[postgres_backends]]
             name = "pg-1-primary"
             address = "127.0.0.1:5433"
             role = "primary"
             shard = "pg-1"
+            username = "proxy"
+            password = "secret"
+            database = "app"
 
             [[redis_backends]]
             name = "redis-us-primary"
@@ -2603,6 +2788,10 @@ mod tests {
         assert_eq!(PostgresConfig::default().max_result_bytes, 64 * 1024 * 1024);
         assert_eq!(RedisConfig::default().relay_buffer_bytes, 32 * 1024);
         assert_eq!(WriteFanoutConfig::default().max_concurrency, 8);
+        assert_eq!(ShardingConfig::default().max_scatter_shards, 16);
+        assert_eq!(ShardingConfig::default().scatter_concurrency, 4);
+        assert_eq!(ProtocolShardingConfig::default().max_scatter_shards, 16);
+        assert_eq!(ProtocolShardingConfig::default().scatter_concurrency, 4);
     }
 
     #[test]

@@ -97,8 +97,8 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "scatter_gather",
-        status: CapabilityStatus::Planned,
-        contract: "requires bounded shard plans and explicit merge semantics",
+        status: CapabilityStatus::Constrained,
+        contract: "bounded MySQL and PostgreSQL/TimescaleDB root UNION ALL concatenation and decomposable aggregate-only merges with compatible metadata; global ordering, grouping, windows, distinctness, and joins remain rejected",
     },
     Capability {
         name: "cross_shard_joins",

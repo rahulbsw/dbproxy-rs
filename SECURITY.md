@@ -39,5 +39,13 @@ DBProxy is not a database authorization boundary. Operators should:
 - protect configuration files, environment variables, logs, and metrics from
   credential exposure.
 
+DBProxy deliberately excludes queries, application values, Redis keys,
+credentials, tokens, and shard-key values from logs and Prometheus labels.
+Logs may contain client addresses and configured topology metadata, while the
+admin API also reports backend addresses. Protect all three observability
+channels as internal operational data. See the
+[sensitive-data contract](docs/operations.md#sensitive-data-contract) for the
+exact fields and limitations.
+
 See [Architecture](docs/architecture.md#security-model) and
 [Operations](docs/operations.md) for the complete trust and monitoring model.

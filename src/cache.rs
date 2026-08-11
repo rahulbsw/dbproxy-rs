@@ -50,14 +50,14 @@ impl CacheManager {
         metrics: Arc<Metrics>,
     ) -> Result<Arc<Self>, ProxyError> {
         let client = redis_client::Client::open(config.redis_url.as_str())
-            .map_err(|error| ProxyError::Config(format!("invalid cache.redis_url: {error}")))?;
+            .map_err(|_| ProxyError::Config("invalid cache.redis_url".to_owned()))?;
         let connection = time::timeout(
             Duration::from_millis(config.request_timeout_milliseconds),
             client.get_connection_manager(),
         )
         .await
         .map_err(|_| ProxyError::Protocol("cache connection timed out".to_owned()))?
-        .map_err(|error| ProxyError::Protocol(format!("cache connection failed: {error}")))?;
+        .map_err(|_| ProxyError::Protocol("cache connection failed".to_owned()))?;
         let rules = config
             .rules
             .iter()
