@@ -4,7 +4,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use sqlparser::ast::Statement;
+
 use crate::classifier::QueryKind;
+use crate::query_registry::{
+    CacheOutcome, CacheStatus, QueryIdentity, QueryRegistry, QuerySnapshot,
+};
 
 const QUERY_BUCKETS_MICROS: [u64; 10] = [
     1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000,
@@ -12,6 +17,7 @@ const QUERY_BUCKETS_MICROS: [u64; 10] = [
 
 #[derive(Debug, Default)]
 pub struct Metrics {
+    query_registry: QueryRegistry,
     active_clients: AtomicI64,
     accepted_clients: AtomicU64,
     rejected_clients: AtomicU64,
@@ -42,6 +48,11 @@ pub struct Metrics {
     backend_acquire_timeouts: AtomicU64,
     replica_fallbacks: AtomicU64,
     shard_routing_failures: AtomicU64,
+    scatter_plans: AtomicU64,
+    scatter_shards: AtomicU64,
+    scatter_failures: AtomicU64,
+    scatter_rows: AtomicU64,
+    scatter_bytes: AtomicU64,
     fanout_attempts: AtomicU64,
     fanout_successes: AtomicU64,
     fanout_failures: AtomicU64,
@@ -58,6 +69,8 @@ pub struct Metrics {
     prepared_created: AtomicU64,
     prepared_executed: AtomicU64,
     prepared_closed: AtomicU64,
+    prepared_routing_cache_hits: AtomicU64,
+    prepared_routing_cache_misses: AtomicU64,
     admin_active: AtomicI64,
     admin_requests: AtomicU64,
     admin_rejected: AtomicU64,
@@ -106,6 +119,12 @@ pub struct Metrics {
     cache_invalidations: AtomicU64,
     cache_invalidation_failures: AtomicU64,
     cache_singleflight_waiters: AtomicU64,
+    cache_refreshes_due: AtomicU64,
+    cache_stale_while_refresh: AtomicU64,
+    cache_distributed_leases: AtomicU64,
+    cache_distributed_waiters: AtomicU64,
+    cache_distributed_wait_timeouts: AtomicU64,
+    cache_distributed_release_failures: AtomicU64,
     cache_bytes_served: AtomicU64,
     config_epoch: AtomicU64,
     config_reload_successes: AtomicU64,
@@ -114,6 +133,56 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    pub fn begin_query_shape(
+        &self,
+        protocol: &str,
+        kind: &str,
+        statements: Option<&[Statement]>,
+    ) -> String {
+        self.query_registry.begin(protocol, kind, statements)
+    }
+
+    pub fn query_identity(
+        &self,
+        protocol: &str,
+        kind: &str,
+        statements: Option<&[Statement]>,
+    ) -> QueryIdentity {
+        self.query_registry.identity(protocol, kind, statements)
+    }
+
+    pub fn begin_query_identity(&self, identity: &QueryIdentity) {
+        self.query_registry.begin_identity(identity);
+    }
+
+    pub fn record_query_cache(&self, query_id: &str, status: CacheStatus, outcome: CacheOutcome) {
+        self.query_registry.record_cache(query_id, status, outcome);
+    }
+
+    pub fn observe_query_shape(
+        &self,
+        protocol: &str,
+        kind: &str,
+        statements: Option<&[Statement]>,
+        status: CacheStatus,
+        outcome: CacheOutcome,
+    ) -> String {
+        self.query_registry
+            .observe(protocol, kind, statements, status, outcome)
+    }
+
+    pub fn query_registry_snapshot(&self) -> Vec<QuerySnapshot> {
+        self.query_registry.snapshot()
+    }
+
+    pub fn cache_candidates(&self) -> Vec<QuerySnapshot> {
+        self.query_registry.candidates()
+    }
+
+    pub fn explain_query(&self, query_id: &str) -> Option<QuerySnapshot> {
+        self.query_registry.explain(query_id)
+    }
+
     pub fn client_accepted(&self) {
         self.accepted_clients.fetch_add(1, Ordering::Relaxed);
         self.active_clients.fetch_add(1, Ordering::Relaxed);
@@ -194,6 +263,21 @@ impl Metrics {
         self.shard_routing_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn scatter_planned(&self, shards: usize) {
+        self.scatter_plans.fetch_add(1, Ordering::Relaxed);
+        self.scatter_shards
+            .fetch_add(shards as u64, Ordering::Relaxed);
+    }
+
+    pub fn scatter_failed(&self) {
+        self.scatter_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn scatter_merged(&self, rows: u64, bytes: u64) {
+        self.scatter_rows.fetch_add(rows, Ordering::Relaxed);
+        self.scatter_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub fn fanout_attempted(&self) {
         self.fanout_attempts.fetch_add(1, Ordering::Relaxed);
     }
@@ -265,6 +349,16 @@ impl Metrics {
 
     pub fn prepared_closed(&self) {
         self.prepared_closed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn prepared_routing_cache_hit(&self) {
+        self.prepared_routing_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn prepared_routing_cache_miss(&self) {
+        self.prepared_routing_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn rows_returned(&self, rows: u64) {
@@ -518,6 +612,35 @@ impl Metrics {
 
     pub fn cache_singleflight_waiter(&self) {
         self.cache_singleflight_waiters
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_refresh_due(&self) {
+        self.cache_refreshes_due.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_stale_while_refresh(&self) {
+        self.cache_stale_while_refresh
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_distributed_lease_acquired(&self) {
+        self.cache_distributed_leases
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_distributed_waiter(&self) {
+        self.cache_distributed_waiters
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_distributed_wait_timed_out(&self) {
+        self.cache_distributed_wait_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_distributed_release_failed(&self) {
+        self.cache_distributed_release_failures
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -782,6 +905,76 @@ impl Metrics {
         );
         metric(
             &mut output,
+            "dbproxy_cache_refreshes_due_total",
+            "counter",
+            "Cache entries selected for refresh-ahead before Redis expiry.",
+            self.cache_refreshes_due.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_stale_while_refresh_total",
+            "counter",
+            "Near-expiry cache entries served while another DBProxy instance owns the fill lease.",
+            self.cache_stale_while_refresh.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_distributed_fill_leases_total",
+            "counter",
+            "Redis-backed cache fill leases acquired by this DBProxy instance.",
+            self.cache_distributed_leases.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_distributed_waiters_total",
+            "counter",
+            "Cold misses waiting for a cache fill lease owner in another DBProxy instance.",
+            self.cache_distributed_waiters.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_distributed_wait_timeouts_total",
+            "counter",
+            "Cold misses that stopped waiting before another instance published a fill.",
+            self.cache_distributed_wait_timeouts.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_distributed_release_failures_total",
+            "counter",
+            "Compare-and-delete cache fill lease releases that failed; leases remain expiry-bounded.",
+            self.cache_distributed_release_failures
+                .load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_query_registry_entries",
+            "gauge",
+            "Privacy-safe normalized query shapes currently retained in the bounded registry.",
+            self.query_registry.len(),
+        );
+        metric(
+            &mut output,
+            "dbproxy_query_registry_evictions_total",
+            "counter",
+            "Normalized query shapes evicted from the bounded registry.",
+            self.query_registry.evictions(),
+        );
+        let _ = writeln!(
+            output,
+            "# HELP dbproxy_query_registry_calls Retained query calls by bounded cacheability status; query identifiers are intentionally not metric labels."
+        );
+        let _ = writeln!(output, "# TYPE dbproxy_query_registry_calls gauge");
+        for status in CacheStatus::ALL {
+            let _ = writeln!(
+                output,
+                "dbproxy_query_registry_calls{{cache_status=\"{}\"}} {}",
+                status.as_str(),
+                self.query_registry.status_calls(status)
+            );
+        }
+        metric(
+            &mut output,
             "dbproxy_config_epoch",
             "gauge",
             "Active immutable etcd routing-configuration revision (zero for local config).",
@@ -835,6 +1028,41 @@ impl Metrics {
             "counter",
             "Queries rejected because a safe shard could not be selected.",
             self.shard_routing_failures.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_scatter_plans_total",
+            "counter",
+            "Bounded SQL scatter/gather plans executed.",
+            self.scatter_plans.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_scatter_shards_total",
+            "counter",
+            "SQL shard branches participating in scatter/gather plans.",
+            self.scatter_shards.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_scatter_failures_total",
+            "counter",
+            "SQL scatter/gather plans that failed after execution planning began.",
+            self.scatter_failures.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_scatter_merge_rows_total",
+            "counter",
+            "Rows emitted after SQL scatter/gather merging.",
+            self.scatter_rows.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_scatter_merge_bytes_total",
+            "counter",
+            "Result bytes emitted after SQL scatter/gather merging.",
+            self.scatter_bytes.load(Ordering::Relaxed),
         );
         metric(
             &mut output,
@@ -956,6 +1184,20 @@ impl Metrics {
             "counter",
             "Prepared statements explicitly closed by clients.",
             self.prepared_closed.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_prepared_routing_cache_hits_total",
+            "counter",
+            "Prepared executions routed from a cached parsed SQL template.",
+            self.prepared_routing_cache_hits.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_prepared_routing_cache_misses_total",
+            "counter",
+            "Prepared executions without an available parsed SQL routing template.",
+            self.prepared_routing_cache_misses.load(Ordering::Relaxed),
         );
         metric(
             &mut output,
@@ -1317,6 +1559,11 @@ mod tests {
         metrics.redis_cross_shard_command(2);
         metrics.redis_command_routing_failed();
         metrics.redis_partial_write_failed();
+        metrics.scatter_planned(3);
+        metrics.scatter_failed();
+        metrics.scatter_merged(7, 42);
+        metrics.prepared_routing_cache_hit();
+        metrics.prepared_routing_cache_miss();
         let output = metrics.encode_prometheus();
         assert!(output.contains("dbproxy_queries_total{kind=\"read\"} 1"));
         assert!(output.contains("dbproxy_query_duration_seconds_bucket{le=\"0.010\"} 1"));
@@ -1337,6 +1584,13 @@ mod tests {
         assert!(output.contains("dbproxy_redis_command_routing_failures_total 1"));
         assert!(output.contains("dbproxy_redis_fanout_subcommands_total 2"));
         assert!(output.contains("dbproxy_redis_partial_write_failures_total 1"));
+        assert!(output.contains("dbproxy_scatter_plans_total 1"));
+        assert!(output.contains("dbproxy_scatter_shards_total 3"));
+        assert!(output.contains("dbproxy_scatter_failures_total 1"));
+        assert!(output.contains("dbproxy_scatter_merge_rows_total 7"));
+        assert!(output.contains("dbproxy_scatter_merge_bytes_total 42"));
+        assert!(output.contains("dbproxy_prepared_routing_cache_hits_total 1"));
+        assert!(output.contains("dbproxy_prepared_routing_cache_misses_total 1"));
     }
 
     #[test]
@@ -1348,5 +1602,20 @@ mod tests {
         assert!(output.contains("dbproxy_query_duration_seconds_bucket{le=\"0.010\"} 1"));
         assert!(output.contains("dbproxy_query_duration_seconds_bucket{le=\"0.025\"} 2"));
         assert!(output.contains("dbproxy_query_duration_seconds_count 2"));
+    }
+
+    #[test]
+    fn query_registry_metrics_use_only_bounded_status_labels() {
+        let metrics = Metrics::default();
+        let query_id = metrics.observe_query_shape(
+            "mysql",
+            "read",
+            None,
+            CacheStatus::CacheDisabled,
+            CacheOutcome::Bypass,
+        );
+        let output = metrics.encode_prometheus();
+        assert!(output.contains("dbproxy_query_registry_calls{cache_status=\"cache_disabled\"} 1"));
+        assert!(!output.contains(&query_id));
     }
 }

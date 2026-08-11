@@ -53,6 +53,7 @@ struct JournalState {
 struct JournalInner {
     path: PathBuf,
     max_bytes: u64,
+    _lock_file: File,
     state: Mutex<JournalState>,
 }
 
@@ -72,6 +73,24 @@ impl XaJournal {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| journal_io(&path, error))?;
         }
+        let lock_path = journal_lock_path(&path);
+        let mut lock_options = OpenOptions::new();
+        lock_options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_options.mode(0o600);
+        }
+        let lock_file = lock_options
+            .open(&lock_path)
+            .map_err(|error| journal_io(&lock_path, error))?;
+        lock_file.try_lock_exclusive().map_err(|error| {
+            ProxyError::Config(format!(
+                "cannot acquire exclusive XA journal lock for {}: {error}",
+                path.display()
+            ))
+        })?;
+
         let mut options = OpenOptions::new();
         options.create(true).read(true).write(true);
         #[cfg(unix)]
@@ -82,12 +101,6 @@ impl XaJournal {
         let file = options
             .open(&path)
             .map_err(|error| journal_io(&path, error))?;
-        file.try_lock_exclusive().map_err(|error| {
-            ProxyError::Config(format!(
-                "cannot acquire exclusive XA journal lock for {}: {error}",
-                path.display()
-            ))
-        })?;
 
         let mut outstanding = HashMap::new();
         for (index, line) in BufReader::new(&file).lines().enumerate() {
@@ -114,6 +127,7 @@ impl XaJournal {
             inner: Arc::new(JournalInner {
                 path,
                 max_bytes,
+                _lock_file: lock_file,
                 state: Mutex::new(JournalState { file, outstanding }),
             }),
         })
@@ -211,33 +225,70 @@ fn append_blocking(
 }
 
 fn compact(path: &Path, state: &mut JournalState) -> Result<(), ProxyError> {
-    state
-        .file
-        .set_len(0)
-        .map_err(|error| journal_io(path, error))?;
-    state
-        .file
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| journal_io(path, error))?;
     let mut records = state.outstanding.values().cloned().collect::<Vec<_>>();
     records.sort_by(|left, right| left.xid.cmp(&right.xid));
-    for record in records {
-        serde_json::to_writer(&mut state.file, &record).map_err(|error| {
-            ProxyError::Protocol(format!(
-                "cannot compact XA journal {}: {error}",
-                path.display()
-            ))
-        })?;
-        state
-            .file
-            .write_all(b"\n")
-            .map_err(|error| journal_io(path, error))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("xa-journal");
+    let mut temporary = None;
+    for attempt in 0..16_u8 {
+        let candidate = parent.join(format!(
+            ".{file_name}.compact.{}.{}.tmp",
+            std::process::id(),
+            unix_millis().saturating_add(u64::from(attempt))
+        ));
+        let mut options = OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(journal_io(&candidate, error)),
+        }
     }
-    state
-        .file
-        .flush()
-        .and_then(|_| state.file.sync_data())
-        .map_err(|error| journal_io(path, error))
+    let Some((temporary_path, mut temporary_file)) = temporary else {
+        return Err(ProxyError::Config(format!(
+            "cannot allocate a temporary file to compact XA journal {}",
+            path.display()
+        )));
+    };
+
+    let result = (|| {
+        for record in records {
+            serde_json::to_writer(&mut temporary_file, &record).map_err(|error| {
+                ProxyError::Protocol(format!(
+                    "cannot compact XA journal {}: {error}",
+                    path.display()
+                ))
+            })?;
+            temporary_file
+                .write_all(b"\n")
+                .map_err(|error| journal_io(&temporary_path, error))?;
+        }
+        temporary_file
+            .flush()
+            .and_then(|_| temporary_file.sync_all())
+            .map_err(|error| journal_io(&temporary_path, error))?;
+        std::fs::rename(&temporary_path, path).map_err(|error| journal_io(path, error))?;
+        let previous_file = std::mem::replace(&mut state.file, temporary_file);
+        drop(previous_file);
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| journal_io(parent, error))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
 }
 
 fn validate_record(path: &Path, line: usize, record: &XaRecord) -> Result<(), ProxyError> {
@@ -276,6 +327,12 @@ fn unix_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn journal_lock_path(path: &Path) -> PathBuf {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    PathBuf::from(lock_path)
 }
 
 fn journal_io(path: &Path, error: std::io::Error) -> ProxyError {
@@ -333,5 +390,43 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, contents.replace("started", "prepared")).unwrap();
         assert!(XaJournal::open(path, 1_048_576).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn compaction_replaces_the_journal_and_preserves_recovery_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("xa.jsonl");
+        let journal = XaJournal::open(path.clone(), 1_048_576).await.unwrap();
+        journal
+            .append(
+                "x1",
+                &["primary".to_owned(), "mirror".to_owned()],
+                XaState::CommitDecided,
+            )
+            .await
+            .unwrap();
+
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&path).unwrap().ino()
+        };
+        {
+            let mut state = journal.inner.state.lock().unwrap();
+            compact(&path, &mut state).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(inode_before, std::fs::metadata(&path).unwrap().ino());
+        }
+        assert!(XaJournal::open(path.clone(), 1_048_576).await.is_err());
+        drop(journal);
+
+        let reopened = XaJournal::open(path, 1_048_576).await.unwrap();
+        let outstanding = reopened.outstanding().unwrap();
+        assert_eq!(outstanding.len(), 1);
+        assert_eq!(outstanding[0].xid, "x1");
+        assert_eq!(outstanding[0].state, XaState::CommitDecided);
     }
 }

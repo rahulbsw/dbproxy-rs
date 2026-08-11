@@ -172,6 +172,38 @@ async fn handle(
                 "application/json",
                 format!("{}\n", capabilities::json()),
             ),
+            "/queries" => (
+                "200 OK",
+                "application/json",
+                json_body(&metrics.query_registry_snapshot()),
+            ),
+            "/cache/candidates" => (
+                "200 OK",
+                "application/json",
+                json_body(&metrics.cache_candidates()),
+            ),
+            path if path.starts_with("/cache/explain/") => {
+                let query_id = path.trim_start_matches("/cache/explain/");
+                if query_id.is_empty()
+                    || !query_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                {
+                    (
+                        "400 Bad Request",
+                        "application/json",
+                        "{\"error\":\"invalid_query_id\"}\n".to_owned(),
+                    )
+                } else if let Some(explanation) = metrics.explain_query(query_id) {
+                    ("200 OK", "application/json", json_body(&explanation))
+                } else {
+                    (
+                        "404 Not Found",
+                        "application/json",
+                        "{\"error\":\"query_not_found\"}\n".to_owned(),
+                    )
+                }
+            }
             "/metrics" => ("200 OK", "text/plain; version=0.0.4", {
                 let mut output = metrics.encode_prometheus();
                 capabilities::encode_prometheus(&mut output);
@@ -198,6 +230,14 @@ async fn handle(
     );
     stream.write_all(response.as_bytes()).await?;
     stream.shutdown().await
+}
+
+fn json_body(value: &impl serde::Serialize) -> String {
+    format!(
+        "{}\n",
+        serde_json::to_string(value)
+            .unwrap_or_else(|_| "{\"error\":\"serialization_failed\"}".to_owned())
+    )
 }
 
 async fn read_request_line(stream: &mut TcpStream) -> io::Result<String> {

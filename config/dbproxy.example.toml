@@ -35,7 +35,7 @@ key = "/dbproxy/production/runtime"
 poll_interval_seconds = 5
 request_timeout_seconds = 3
 # username = "dbproxy"
-# password = "replace-with-an-environment-reference-in-your-private-config"
+# password = "${DBPROXY_ETCD_PASSWORD}"
 
 [control_plane.tls]
 use_webpki_roots = false
@@ -71,6 +71,13 @@ shard_key_parameter = "dbproxy.shard_key"
 enabled = false
 # "hash", "range", or "value". See README for complete mappings.
 strategy = "hash"
+# SQL table rules require routing_mode = "transaction". Equality, literal IN,
+# CTEs, root UNION ALL, and decomposable aggregates are then routed from the AST.
+max_scatter_shards = 16
+scatter_concurrency = 4
+# [[postgres.sharding.rules]]
+# table = "user_info"
+# column = "userid"
 
 # [[postgres_backends]]
 # name = "timescale-primary"
@@ -80,7 +87,7 @@ strategy = "hash"
 # shard = "default"
 # Required only with routing_mode = "transaction":
 # username = "dbproxy_pool"
-# password = "replace-with-secret-injected-at-deploy-time"
+# password = "${DBPROXY_POSTGRES_POOL_PASSWORD}"
 # database = "app"
 # [postgres_backends.tls]
 # enabled = true
@@ -88,7 +95,7 @@ strategy = "hash"
 # ca_path = "/etc/dbproxy/tls/postgres-ca.pem"
 #
 # Optional authenticated SQL readiness. Without this block DBProxy uses a TCP
-# transport probe. Environment expansion keeps the password out of this file.
+# transport probe. Use an environment reference after uncommenting this block.
 # [postgres_backends.readiness_probe]
 # username = "dbproxy_health"
 # password = "${DBPROXY_POSTGRES_HEALTH_PASSWORD}"
@@ -156,7 +163,7 @@ strategy = "hash"
 # quorum = 2
 # refresh_interval_seconds = 5
 # request_timeout_seconds = 2
-# password = "replace-with-sentinel-secret"
+# password = "${DBPROXY_SENTINEL_PASSWORD}"
 # [[redis.sentinel.masters]]
 # shard = "default"
 # name = "app-primary"
@@ -169,7 +176,7 @@ strategy = "hash"
 # refresh_interval_seconds = 15
 # request_timeout_seconds = 2
 # max_redirects = 3
-# password = "replace-with-cluster-secret"
+# password = "${DBPROXY_REDIS_CLUSTER_PASSWORD}"
 
 [cache]
 # Optional MySQL read-through result cache. This is separate from the Redis
@@ -182,6 +189,12 @@ max_value_bytes = 1048576
 # Cache failures bypass Redis and read from MySQL. Set false only when the cache
 # is a required service dependency.
 fail_open = true
+# Optional cluster-wide miss coalescing. The lease is stored in the same
+# Redis/Valkey service and is always expiry-bounded.
+distributed_singleflight = false
+fill_lease_milliseconds = 2000
+fill_wait_milliseconds = 250
+fill_poll_milliseconds = 10
 
 # Rules are explicit: arbitrary SELECT statements are never cached globally.
 # [[cache.rules]]
@@ -189,6 +202,9 @@ fail_open = true
 # ttl_seconds = 30
 # negative_ttl_seconds = 5
 # ttl_jitter_percent = 10
+# Set above zero to synchronously refresh near-expiry entries. Other DBProxy
+# instances serve the still-valid value while the lease owner refreshes it.
+# refresh_ahead_seconds = 5
 # max_rows = 1000
 # max_bytes = 1048576
 
@@ -294,6 +310,8 @@ deny = [
 enabled = false
 default_shard = "default"
 missing_key_policy = "reject"
+max_scatter_shards = 16
+scatter_concurrency = 4
 
 [write_fanout]
 enabled = false

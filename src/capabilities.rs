@@ -97,8 +97,8 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "scatter_gather",
-        status: CapabilityStatus::Planned,
-        contract: "requires bounded shard plans and explicit merge semantics",
+        status: CapabilityStatus::Constrained,
+        contract: "bounded MySQL and PostgreSQL/TimescaleDB root UNION ALL concatenation and decomposable aggregate-only merges with compatible metadata; global ordering, grouping, windows, distinctness, and joins remain rejected",
     },
     Capability {
         name: "cross_shard_joins",
@@ -118,7 +118,17 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         name: "query_cache",
         status: CapabilityStatus::Constrained,
-        contract: "explicit MySQL table rules, bounded Redis/Valkey values, singleflight fills, and commit-aware generation invalidation",
+        contract: "explicit MySQL table rules, bounded Redis/Valkey values, local and opt-in distributed singleflight, refresh-ahead, and commit-aware generation invalidation",
+    },
+    Capability {
+        name: "query_observatory",
+        status: CapabilityStatus::Constrained,
+        contract: "bounded per-pod salted AST fingerprints, cacheability explanations, and candidate ranking without raw SQL or query-id metric labels",
+    },
+    Capability {
+        name: "cdc_cache_invalidation",
+        status: CapabilityStatus::Planned,
+        contract: "requires durable MySQL/PostgreSQL source offsets, idempotent generation application, watermarks, and cache bypass while disconnected or lagged",
     },
     Capability {
         name: "admin_sql",

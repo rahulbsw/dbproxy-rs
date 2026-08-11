@@ -63,6 +63,84 @@ pub struct Classification {
 pub struct SqlAnalysis {
     pub classification: Classification,
     statements: Option<Vec<Statement>>,
+    mysql_transaction_semantics: MysqlTransactionSemantics,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MysqlTransactionEffect {
+    ImplicitCommit,
+    SetAutocommit(bool),
+    LockTables,
+    UnlockTables,
+    StartTransaction,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MysqlTransactionSemantics {
+    effects: Vec<MysqlTransactionEffect>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MysqlTransactionEvaluation {
+    pub implicit_commit: bool,
+    pub autocommit_enabled: bool,
+    pub table_locks_active: bool,
+    pub transaction_active_after_boundary: bool,
+}
+
+impl MysqlTransactionSemantics {
+    pub fn evaluate(
+        &self,
+        mut autocommit_enabled: bool,
+        mut table_locks_active: bool,
+    ) -> MysqlTransactionEvaluation {
+        let mut implicit_commit = false;
+        let mut transaction_active_after_boundary = false;
+        for effect in &self.effects {
+            match effect {
+                MysqlTransactionEffect::ImplicitCommit => {
+                    implicit_commit = true;
+                    transaction_active_after_boundary = false;
+                }
+                MysqlTransactionEffect::SetAutocommit(enabled) => {
+                    if *enabled && !autocommit_enabled {
+                        implicit_commit = true;
+                        transaction_active_after_boundary = false;
+                    }
+                    autocommit_enabled = *enabled;
+                }
+                MysqlTransactionEffect::LockTables => {
+                    implicit_commit = true;
+                    transaction_active_after_boundary = false;
+                    table_locks_active = true;
+                }
+                MysqlTransactionEffect::UnlockTables => {
+                    if table_locks_active {
+                        implicit_commit = true;
+                        transaction_active_after_boundary = false;
+                    }
+                    table_locks_active = false;
+                }
+                MysqlTransactionEffect::StartTransaction => {
+                    implicit_commit = true;
+                    transaction_active_after_boundary = true;
+                    table_locks_active = false;
+                }
+            }
+        }
+        MysqlTransactionEvaluation {
+            implicit_commit,
+            autocommit_enabled,
+            table_locks_active,
+            transaction_active_after_boundary,
+        }
+    }
+
+    fn may_implicitly_commit(&self) -> bool {
+        self.effects
+            .iter()
+            .any(|effect| !matches!(effect, MysqlTransactionEffect::SetAutocommit(false)))
+    }
 }
 
 impl SqlAnalysis {
@@ -75,6 +153,14 @@ impl SqlAnalysis {
             self.statements.as_deref(),
             Some([Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)])
         )
+    }
+
+    pub fn implicitly_commits_transaction(&self) -> bool {
+        self.mysql_transaction_semantics.may_implicitly_commit()
+    }
+
+    pub fn mysql_transaction_semantics(&self) -> &MysqlTransactionSemantics {
+        &self.mysql_transaction_semantics
     }
 }
 
@@ -125,6 +211,7 @@ impl SqlClassifier {
                         reason: "parse failure: conservatively routed to primary",
                     },
                     statements: None,
+                    mysql_transaction_semantics: mysql_transaction_semantics(&normalized),
                 });
             }
         };
@@ -139,6 +226,12 @@ impl SqlClassifier {
             .max_by_key(|kind| routing_risk(*kind))
             .unwrap_or(QueryKind::Write);
 
+        let mysql_transaction_semantics = MysqlTransactionSemantics {
+            effects: statements
+                .iter()
+                .filter_map(mysql_transaction_effect)
+                .collect(),
+        };
         Ok(SqlAnalysis {
             classification: Classification {
                 kind,
@@ -147,6 +240,7 @@ impl SqlClassifier {
                 reason: reason_for(kind),
             },
             statements: Some(statements),
+            mysql_transaction_semantics,
         })
     }
 
@@ -197,6 +291,142 @@ fn classify_statement(statement: &Statement, normalized: &str) -> QueryKind {
         | Statement::UnlockTables => QueryKind::Session,
         _ => QueryKind::Write,
     }
+}
+
+fn mysql_transaction_effect(statement: &Statement) -> Option<MysqlTransactionEffect> {
+    mysql_transaction_effect_normalized(&statement.to_string().to_ascii_uppercase())
+}
+
+fn mysql_transaction_semantics(normalized: &str) -> MysqlTransactionSemantics {
+    MysqlTransactionSemantics {
+        effects: mysql_transaction_effect_normalized(normalized)
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn mysql_transaction_effect_normalized(normalized: &str) -> Option<MysqlTransactionEffect> {
+    if normalized.starts_with("CREATE TEMPORARY TABLE ")
+        || normalized.starts_with("DROP TEMPORARY TABLE ")
+    {
+        return None;
+    }
+
+    if let Some(enabled) = autocommit_setting(normalized) {
+        return Some(MysqlTransactionEffect::SetAutocommit(enabled));
+    }
+    if normalized.starts_with("LOCK TABLES ") {
+        return Some(MysqlTransactionEffect::LockTables);
+    }
+    if normalized.starts_with("UNLOCK TABLES") {
+        return Some(MysqlTransactionEffect::UnlockTables);
+    }
+    if normalized.starts_with("START TRANSACTION") || normalized.starts_with("BEGIN") {
+        return Some(MysqlTransactionEffect::StartTransaction);
+    }
+
+    const IMPLICIT_COMMIT_PREFIXES: &[&str] = &[
+        "ALTER DATABASE ",
+        "ALTER EVENT ",
+        "ALTER FUNCTION ",
+        "ALTER INSTANCE ",
+        "ALTER LOGFILE GROUP ",
+        "ALTER PROCEDURE ",
+        "ALTER RESOURCE GROUP ",
+        "ALTER SERVER ",
+        "ALTER TABLE ",
+        "ALTER TABLESPACE ",
+        "ALTER USER ",
+        "ALTER VIEW ",
+        "ANALYZE TABLE ",
+        "CACHE INDEX ",
+        "CHANGE MASTER TO ",
+        "CHANGE REPLICATION SOURCE TO ",
+        "CHECK TABLE ",
+        "CREATE DATABASE ",
+        "CREATE EVENT ",
+        "CREATE FUNCTION ",
+        "CREATE INDEX ",
+        "CREATE LOGFILE GROUP ",
+        "CREATE PROCEDURE ",
+        "CREATE RESOURCE GROUP ",
+        "CREATE ROLE ",
+        "CREATE SERVER ",
+        "CREATE SPATIAL REFERENCE SYSTEM ",
+        "CREATE TABLE ",
+        "CREATE TABLESPACE ",
+        "CREATE TRIGGER ",
+        "CREATE USER ",
+        "CREATE VIEW ",
+        "DROP DATABASE ",
+        "DROP EVENT ",
+        "DROP FUNCTION ",
+        "DROP INDEX ",
+        "DROP LOGFILE GROUP ",
+        "DROP PROCEDURE ",
+        "DROP RESOURCE GROUP ",
+        "DROP ROLE ",
+        "DROP SERVER ",
+        "DROP SPATIAL REFERENCE SYSTEM ",
+        "DROP TABLE ",
+        "DROP TABLESPACE ",
+        "DROP TRIGGER ",
+        "DROP USER ",
+        "DROP VIEW ",
+        "GRANT ",
+        "FLUSH ",
+        "INSTALL PLUGIN ",
+        "LOAD INDEX INTO CACHE ",
+        "OPTIMIZE TABLE ",
+        "RENAME TABLE ",
+        "RENAME USER ",
+        "REPAIR TABLE ",
+        "RESET MASTER",
+        "RESET REPLICA",
+        "RESET SLAVE",
+        "REVOKE ",
+        "SET PASSWORD ",
+        "START REPLICA",
+        "START SLAVE",
+        "STOP REPLICA",
+        "STOP SLAVE",
+        "TRUNCATE TABLE ",
+        "UNINSTALL PLUGIN ",
+    ];
+    IMPLICIT_COMMIT_PREFIXES
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+        .then_some(MysqlTransactionEffect::ImplicitCommit)
+}
+
+fn autocommit_setting(normalized: &str) -> Option<bool> {
+    let assignment = normalized.strip_prefix("SET ")?;
+    let compact = assignment
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>();
+    let compact = compact.trim_end_matches(';');
+    for assignment in compact.split(',') {
+        let Some((name, value)) = assignment.split_once('=') else {
+            continue;
+        };
+        if matches!(
+            name,
+            "AUTOCOMMIT"
+                | "@@AUTOCOMMIT"
+                | "SESSIONAUTOCOMMIT"
+                | "LOCALAUTOCOMMIT"
+                | "@@SESSION.AUTOCOMMIT"
+                | "@@LOCAL.AUTOCOMMIT"
+        ) {
+            return match value {
+                "1" | "ON" | "TRUE" => Some(true),
+                "0" | "OFF" | "FALSE" => Some(false),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 fn is_replayable_session_statement(normalized: &str) -> bool {
@@ -279,6 +509,98 @@ mod tests {
             .unwrap();
         assert_eq!(analysis.classification.kind, QueryKind::Read);
         assert_eq!(analysis.statements().expect("parsed statements").len(), 1);
+    }
+
+    #[test]
+    fn identifies_mysql_implicit_commit_boundaries() {
+        for sql in [
+            "ALTER TABLE orders ADD COLUMN note text",
+            "TRUNCATE TABLE orders",
+            "SET autocommit = 1",
+            "SET autocommit = ON",
+            "SET @@SESSION.autocommit = TRUE",
+            "SET LOCAL autocommit = ON",
+            "FLUSH TABLES",
+            "CHECK TABLE orders",
+            "RESET REPLICA",
+            "CHANGE REPLICATION SOURCE TO SOURCE_HOST = 'primary'",
+            "BEGIN",
+        ] {
+            assert!(
+                classifier()
+                    .analyze(sql)
+                    .unwrap()
+                    .implicitly_commits_transaction(),
+                "{sql} should commit an existing transaction"
+            );
+        }
+        for sql in [
+            "UPDATE orders SET status = 'ready'",
+            "CREATE TEMPORARY TABLE scratch (id int)",
+            "SET autocommit = 0",
+            "SET autocommit = OFF",
+            "SET GLOBAL autocommit = ON",
+            "RESET PERSIST max_connections",
+        ] {
+            assert!(
+                !classifier()
+                    .analyze(sql)
+                    .unwrap()
+                    .implicitly_commits_transaction(),
+                "{sql} should not implicitly commit"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_an_implicit_commit_inside_an_allowed_statement_batch() {
+        let classifier = SqlClassifier::new(false, &[]);
+        assert!(
+            classifier
+                .analyze("UPDATE orders SET status = 'ready'; FLUSH TABLES")
+                .unwrap()
+                .implicitly_commits_transaction()
+        );
+    }
+
+    #[test]
+    fn conditional_mysql_boundaries_use_session_state() {
+        let set_autocommit = classifier().analyze("SET autocommit = 1").unwrap();
+        assert!(
+            !set_autocommit
+                .mysql_transaction_semantics()
+                .evaluate(true, false)
+                .implicit_commit
+        );
+        assert!(
+            set_autocommit
+                .mysql_transaction_semantics()
+                .evaluate(false, false)
+                .implicit_commit
+        );
+        let set_multiple = classifier()
+            .analyze("SET sql_mode = 'STRICT_ALL_TABLES', autocommit = 1")
+            .unwrap();
+        assert!(
+            set_multiple
+                .mysql_transaction_semantics()
+                .evaluate(false, false)
+                .implicit_commit
+        );
+
+        let unlock = classifier().analyze("UNLOCK TABLES").unwrap();
+        assert!(
+            !unlock
+                .mysql_transaction_semantics()
+                .evaluate(true, false)
+                .implicit_commit
+        );
+        assert!(
+            unlock
+                .mysql_transaction_semantics()
+                .evaluate(true, true)
+                .implicit_commit
+        );
     }
 
     #[test]

@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use crate::config::{ProtocolShardStrategy, ProtocolShardingConfig};
 
@@ -12,18 +15,30 @@ pub struct ProtocolShardRouter {
     ranges: Vec<(i64, i64, String)>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Eq, PartialEq, thiserror::Error)]
 pub enum ProtocolShardError {
     #[error("a shard key is required")]
     MissingKey,
-    #[error("shard key {0:?} does not match a configured value mapping")]
+    #[error("shard key does not match a configured value mapping")]
     UnmappedValue(String),
-    #[error("range shard key {0:?} is not a signed 64-bit integer")]
+    #[error("range shard key is not a signed 64-bit integer")]
     InvalidRangeValue(String),
-    #[error("range shard key {0} is outside all configured ranges")]
+    #[error("range shard key is outside all configured ranges")]
     RangeMiss(i64),
     #[error("value and range shard keys must be UTF-8")]
     NonUtf8Key,
+}
+
+impl fmt::Debug for ProtocolShardError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingKey => "MissingKey",
+            Self::UnmappedValue(_) => "UnmappedValue(<redacted>)",
+            Self::InvalidRangeValue(_) => "InvalidRangeValue(<redacted>)",
+            Self::RangeMiss(_) => "RangeMiss(<redacted>)",
+            Self::NonUtf8Key => "NonUtf8Key",
+        })
+    }
 }
 
 impl ProtocolShardRouter {
@@ -127,8 +142,18 @@ pub fn validate_protocol_sharding(
     config: &ProtocolShardingConfig,
     backend_shards: &HashSet<&str>,
 ) -> Result<(), String> {
+    if config.max_scatter_shards == 0 || config.scatter_concurrency == 0 {
+        return Err(format!(
+            "{label}.sharding scatter limits must be greater than zero"
+        ));
+    }
+    if config.scatter_concurrency > config.max_scatter_shards {
+        return Err(format!(
+            "{label}.sharding.scatter_concurrency cannot exceed max_scatter_shards"
+        ));
+    }
     if !config.enabled {
-        if !config.shards.is_empty() || config.default_shard.is_some() {
+        if !config.shards.is_empty() || config.default_shard.is_some() || !config.rules.is_empty() {
             return Err(format!(
                 "{label}.sharding mappings require sharding.enabled = true"
             ));
@@ -175,6 +200,26 @@ pub fn validate_protocol_sharding(
         return Err(format!(
             "{label}.sharding.default_shard {default:?} has no mapping"
         ));
+    }
+
+    let mut tables = HashSet::new();
+    for rule in &config.rules {
+        let raw_table = rule.table.trim();
+        let raw_column = rule.column.trim();
+        if raw_table.is_empty() || raw_column.is_empty() {
+            return Err(format!(
+                "{label}.sharding SQL rules require non-empty table and column names"
+            ));
+        }
+        if raw_table.contains('.') || raw_column.contains('.') {
+            return Err(format!(
+                "{label}.sharding SQL rules require unqualified table and column names"
+            ));
+        }
+        let table = raw_table.trim_matches(['`', '"']).to_ascii_lowercase();
+        if !tables.insert(table) {
+            return Err(format!("{label}.sharding repeats a SQL rule table"));
+        }
     }
 
     match config.strategy {
@@ -283,6 +328,7 @@ mod tests {
                     range_end: Some(200),
                 },
             ],
+            ..ProtocolShardingConfig::default()
         }
     }
 
@@ -338,6 +384,31 @@ mod tests {
     }
 
     #[test]
+    fn routing_errors_do_not_display_shard_values() {
+        let mut value_config = config(ProtocolShardStrategy::Value);
+        for shard in &mut value_config.shards {
+            shard.range_start = None;
+            shard.range_end = None;
+        }
+        let value_error = ProtocolShardRouter::new(&value_config)
+            .route(Some("customer-secret-42"))
+            .unwrap_err();
+
+        let mut range_config = config(ProtocolShardStrategy::Range);
+        for shard in &mut range_config.shards {
+            shard.values.clear();
+        }
+        let range_error = ProtocolShardRouter::new(&range_config)
+            .route(Some("account-secret-73"))
+            .unwrap_err();
+
+        assert!(!value_error.to_string().contains("customer-secret-42"));
+        assert!(!format!("{value_error:?}").contains("customer-secret-42"));
+        assert!(!range_error.to_string().contains("account-secret-73"));
+        assert!(!format!("{range_error:?}").contains("account-secret-73"));
+    }
+
+    #[test]
     fn validation_rejects_overlapping_ranges() {
         let mut config = config(ProtocolShardStrategy::Range);
         config.shards[0].values.clear();
@@ -348,6 +419,26 @@ mod tests {
             validate_protocol_sharding("test", &config, &backends)
                 .unwrap_err()
                 .contains("must not overlap")
+        );
+    }
+
+    #[test]
+    fn validation_rejects_schema_qualified_sql_rules() {
+        let mut config = config(ProtocolShardStrategy::Hash);
+        for shard in &mut config.shards {
+            shard.values.clear();
+            shard.range_start = None;
+            shard.range_end = None;
+        }
+        config.rules = vec![crate::config::ProtocolSqlShardRuleConfig {
+            table: "public.user_info".to_owned(),
+            column: "userid".to_owned(),
+        }];
+        let backends = HashSet::from(["s0", "s1"]);
+        assert!(
+            validate_protocol_sharding("postgres", &config, &backends)
+                .unwrap_err()
+                .contains("unqualified table")
         );
     }
 }

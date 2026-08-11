@@ -161,7 +161,6 @@ impl RedisBackend {
     }
 }
 
-#[derive(Debug)]
 pub struct RedisBackendManager {
     shards: HashMap<String, RedisShard>,
     default_shard: String,
@@ -1377,6 +1376,7 @@ mod tests {
                         ..ProtocolShardConfig::default()
                     })
                     .collect(),
+                ..ProtocolShardingConfig::default()
             },
             ..RedisConfig::default()
         };

@@ -7,6 +7,9 @@ for production-oriented Helm installations:
 ./deploy.sh
 ```
 
+For the exact start, smoke-test, endpoint, and cleanup commands, begin with the
+[quick start](quick-start.md).
+
 With no arguments, the command detects a running Podman Compose or Docker
 Compose implementation, builds DBProxy, and starts disposable MySQL,
 TimescaleDB, Redis, and DBProxy containers. Re-running it updates the existing

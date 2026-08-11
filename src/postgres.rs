@@ -29,6 +29,7 @@ use crate::{
     operation_id, tls,
 };
 
+mod numeric;
 mod terminate;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1394,6 +1395,7 @@ mod tests {
                         ..ProtocolShardConfig::default()
                     },
                 ],
+                ..ProtocolShardingConfig::default()
             },
             ..PostgresConfig::default()
         };

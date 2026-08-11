@@ -17,6 +17,9 @@
   unsafe state such as user variables still causes explicit pinning.
 - Prepared routing ignores placeholders inside quoted strings and SQL comments.
 - Shard-key mutations are rejected, including conflict-update clauses.
+- Tuple-form shard-key assignments are rejected, source tables in DML are
+  inspected, unsupported statements touching a sharded table fail closed, and
+  signed numeric literals participate in range routing.
 - Fanout targets for sharded tables must be dedicated shards, ensuring the
   routed shard cannot silently collapse a configured multi-write into one copy.
 - IPv6 backend addresses in `[address]:port` form are accepted.
@@ -32,6 +35,25 @@
   TLS.
 - PostgreSQL and TimescaleDB can select a connection-pinned shard from a
   stripped startup parameter using hash, numeric range, or exact-value maps.
+- PostgreSQL transaction mode can route configured table keys from parsed SQL
+  and perform bounded root `UNION ALL` and decomposable aggregate merges.
+- PostgreSQL scatter branches reserve the shared row/byte budget while backend
+  rows are consumed, prepared routing binds only shard-key parameters, partial
+  Parse type lists follow PostgreSQL inference semantics, and merge metrics
+  describe emitted output rather than hidden branch rows.
+- PostgreSQL scatter rejects volatile, clock-, backend-, and session-dependent
+  expressions before fanout. Parameterized Describe selects a backend whose
+  configured database matches the frontend startup database.
+- Distributed MySQL and PostgreSQL numeric aggregates use arbitrary-precision
+  decimals; PostgreSQL text and binary NUMERIC encoding no longer imposes the
+  narrower client-decimal width.
+- MySQL implicit-commit tracking models autocommit and table-lock state.
+  Transactional cache generations advance after the backend commit boundary,
+  including failed DDL whose leading implicit commit already occurred.
+- PostgreSQL SQL shard rules reject schema-qualified names instead of silently
+  collapsing distinct schemas onto one routing rule.
+- XA journal compaction replaces only the data file while a separate stable
+  lock file preserves process exclusivity across inode replacement.
 - Redis uses transparent RESP2/RESP3 forwarding with separate read-write and
   read-only listeners, weighted healthy replicas, optional primary fallback,
   graceful draining, directional byte counters, and backend transport metrics.
@@ -65,8 +87,10 @@
 - Default synchronous fanout is non-atomic. Optional MySQL XA provides durable
   atomicity only for allowlisted autocommit DML; it does not span a client
   transaction or remove schema/application idempotency requirements.
-- Scatter/gather, cross-shard aggregation, general distributed transactions,
-  and online resharding are not implemented.
+- Bounded MySQL root-level `UNION ALL` concatenation and decomposable
+  `COUNT`/`SUM`/`AVG`/numeric-or-temporal-`MIN`/`MAX` merges are implemented.
+  Cross-shard joins, ordered/grouped distributed merges, general distributed
+  transactions, and online resharding are not implemented.
 - Streaming mode cannot replace a partially emitted result with a MySQL error;
   mid-stream failures close the client connection and require application retry.
 - etcd can reload scoped MySQL policy. XA durability, listeners, and backend or

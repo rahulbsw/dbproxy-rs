@@ -148,6 +148,46 @@ async fn mysql_cache_invalidation_advances_only_on_commit() {
         .await
         .expect("commit transaction");
     assert_eq!(redis_optional_u64(version_key).await, before + 1);
+
+    connection
+        .query_drop("SET autocommit = 0")
+        .await
+        .expect("disable autocommit");
+    connection
+        .query_drop(
+            "INSERT INTO proxy_write_test(id, message) VALUES (9103, 'autocommit cache test') \
+             ON DUPLICATE KEY UPDATE message = VALUES(message)",
+        )
+        .await
+        .expect("write inside implicit autocommit-off transaction");
+    assert_eq!(redis_optional_u64(version_key).await, before + 1);
+    connection
+        .query_drop("SET autocommit = 1")
+        .await
+        .expect("enable autocommit and commit");
+    assert_eq!(redis_optional_u64(version_key).await, before + 2);
+
+    connection
+        .query_drop("START TRANSACTION")
+        .await
+        .expect("start transaction before conditional unlock");
+    connection
+        .query_drop(
+            "INSERT INTO proxy_write_test(id, message) VALUES (9104, 'unlock cache test') \
+             ON DUPLICATE KEY UPDATE message = VALUES(message)",
+        )
+        .await
+        .expect("write before unlock without table locks");
+    connection
+        .query_drop("UNLOCK TABLES")
+        .await
+        .expect("unlock with no active table locks");
+    assert_eq!(redis_optional_u64(version_key).await, before + 2);
+    connection
+        .query_drop("ROLLBACK")
+        .await
+        .expect("rollback after non-committing unlock");
+    assert_eq!(redis_optional_u64(version_key).await, before + 2);
     connection.disconnect().await.expect("disconnect cleanly");
 }
 

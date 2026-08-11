@@ -82,8 +82,10 @@ Simple-query results use PostgreSQL text columns. Extended queries preserve
 text/binary formats for booleans, signed integers, floating point, text,
 `bytea`, OID/char, JSON/JSONB, numeric, date, time, timestamp, and timestamp with
 time zone. Named prepared statements are owned by the frontend session and
-re-prepared on the selected pooled connection; backend prepared state is never
-leaked between clients. It intentionally fails closed on multiple statements,
+retain a parsed routing template plus inferred parameter types. Bind/Execute
+clones that AST for shard selection and re-prepares the original SQL on the
+selected pooled connection; backend prepared state is never leaked between
+clients. It intentionally fails closed on multiple statements,
 SQL it cannot classify safely, or types it cannot encode without loss.
 
 Use transparent mode for:
