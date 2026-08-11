@@ -31,6 +31,8 @@ Completed:
 - opt-in Redis/Valkey command sharding with CRC16 hash tags, bounded fanout,
   ordered `MGET` merge, integer aggregation, guarded non-atomic writes, and
   command-mode read-only enforcement
+- Redis Sentinel primary discovery with configurable address quorum, plus
+  native Redis Cluster full-slot snapshots and bounded MOVED/ASK handling
 - NanoID operation identifiers for bounded-cardinality log correlation
 - a hardened active-active Helm deployment with independent stateless replicas
 - constrained MySQL XA fanout for allowlisted autocommit DML, with a checksummed

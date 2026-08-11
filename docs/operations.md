@@ -33,10 +33,13 @@ plaintext PostgreSQL unless `readiness_probe.tls.enabled = true`. TLS probes
 verify both the trust chain and hostname and can use an explicit CA and client
 identity.
 
-When Redis is enabled, readiness also requires TCP transport health to its
-every configured shard primary. `/redis/backends` reports Redis/Valkey transport state and
-connection counters. These transport probes do not authenticate, issue `PING`,
-validate replication role, or measure replica lag.
+When Redis is enabled, readiness also requires TCP transport health to every
+configured shard primary. Sentinel mode additionally requires the most recent
+refresh to reach its configured address quorum. Cluster mode instead requires a
+complete current 16,384-slot snapshot. `/redis/backends` reports dynamic
+Sentinel primary addresses plus transport and connection counters. Static
+transport probes do not authenticate, issue `PING`, validate replication role,
+or measure replica lag.
 
 ## Prometheus groups
 
@@ -59,7 +62,7 @@ validate replication role, or measure replica lag.
 | PostgreSQL clients | active/accepted/rejected/error totals, transparent wire bytes, terminated queries, primary/replica routes, transaction/session pins, read-only rejections, cancellations, and statement/shard-routing failures |
 | PostgreSQL backends | health and SQL-probe metrics, connection totals/failures, and transaction-pool total/idle/in-use/waiter/pressure/checkouts/acquire-timeout/reset-failure metrics |
 | Redis/Valkey clients | `dbproxy_redis_active_clients`, accepted/rejected/error totals, directional forwarded bytes, connection failures, replica fallbacks, shard routes, command totals, read-only rejections, cross-shard commands, routing failures, generated fanout subcommands, partial-write failures |
-| Redis backends | `dbproxy_redis_backend_transport_healthy`, `dbproxy_redis_backend_connections_total`, `dbproxy_redis_backend_connection_failures_total`, active connections, health-check outcomes, and health timestamps |
+| Redis backends/topology | transport connection/health metrics; topology epoch; Sentinel refresh/failure/failover totals; Cluster refresh/failure, MOVED, ASK, and redirect-failure totals |
 
 Per-backend metrics use bounded `backend`, `shard`, and `role` labels sourced
 only from static configuration. SQL text, usernames, client addresses, and
@@ -103,6 +106,12 @@ database values are never used as labels.
   primary cannot accept TCP connections.
 - Rising `dbproxy_redis_replica_fallbacks_total`: unavailable Redis replicas or
   an incorrect read-only topology.
+- Any `dbproxy_redis_sentinel_refresh_failures_total` increase: Sentinel
+  endpoints did not agree at quorum; readiness is withdrawn.
+- Any `dbproxy_redis_cluster_refresh_failures_total` or
+  `dbproxy_redis_cluster_redirect_failures_total` increase: the native slot map
+  or a redirection could not be proven safe. A MOVED spike without refresh
+  recovery usually indicates active resharding or unreachable announced nodes.
 - Any sustained increase in
   `dbproxy_postgres_shard_routing_failures_total` or
   `dbproxy_redis_shard_routing_failures_total`: missing client initialization,

@@ -400,10 +400,18 @@ command set plus connection-local authentication/state commands. Writes,
 scripts not declared read-only, and unknown module commands receive a Redis
 `READONLY` error before DBProxy opens a backend route.
 
-This mode targets standalone primary/replica deployments. It does not discover
-Sentinel leaders, rewrite Redis Cluster `MOVED`/`ASK` responses, or hide cluster
-node addresses. Connection mode remains byte-transparent and cannot inspect
-writes, so Redis replica read-only mode and ACLs remain its permission boundary.
+Optional Sentinel mode requires a configured quorum to agree on each monitored
+primary before atomically replacing shard endpoints. Native Redis Cluster mode
+requires command routing, computes the 16,384 CRC16 slots, accepts only complete
+`CLUSTER SLOTS` snapshots, splits supported multi-key commands by slot, and
+follows validated `MOVED`/`ASK` responses with bounded retries and correct
+`ASKING` ordering. See [Redis/Valkey topology](docs/redis-topology.md).
+
+Connection mode remains byte-transparent and cannot inspect writes, so Redis
+replica read-only mode and ACLs remain its permission boundary. Cluster command
+mode currently routes reads through slot primaries; it does not issue `READONLY`
+to discovered replicas. Announced node addresses must be directly reachable
+from DBProxy.
 
 ## Routing behavior
 
@@ -600,8 +608,10 @@ recommendations.
   Command mode supports a documented safe command subset, but transactions,
   Pub/Sub, blocking commands, unknown modules, RESP streaming, and payloads
   above configured frame limits must use connection mode
-- Redis/Valkey does not provide Sentinel discovery or Redis Cluster topology
-  management and does not rewrite `MOVED`/`ASK` responses
+- Sentinel discovery updates primaries only; replica discovery and Sentinel
+  TLS are not yet implemented. Cluster mode uses command routing over a
+  plaintext trusted hop or external TLS termination and currently uses slot
+  primaries for reads
 - shard schemas must expose compatible prepared-statement parameter and result
   metadata
 - streaming result sets are bounded by configured row and byte totals and do not

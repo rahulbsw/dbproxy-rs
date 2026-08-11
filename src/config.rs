@@ -230,6 +230,8 @@ pub struct RedisConfig {
     pub relay_buffer_bytes: usize,
     pub shard_command: String,
     pub sharding: ProtocolShardingConfig,
+    pub sentinel: RedisSentinelConfig,
+    pub cluster: RedisClusterConfig,
 }
 
 impl Default for RedisConfig {
@@ -261,6 +263,69 @@ impl Default for RedisConfig {
             relay_buffer_bytes: default_relay_buffer_bytes(),
             shard_command: "DBPROXY.SHARD".to_owned(),
             sharding: ProtocolShardingConfig::default(),
+            sentinel: RedisSentinelConfig::default(),
+            cluster: RedisClusterConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RedisSentinelConfig {
+    pub enabled: bool,
+    pub endpoints: Vec<String>,
+    pub username: String,
+    pub password: String,
+    pub refresh_interval_seconds: u64,
+    pub request_timeout_seconds: u64,
+    pub quorum: usize,
+    pub masters: Vec<RedisSentinelMasterConfig>,
+}
+
+impl Default for RedisSentinelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoints: Vec::new(),
+            username: String::new(),
+            password: String::new(),
+            refresh_interval_seconds: 5,
+            request_timeout_seconds: 2,
+            quorum: 2,
+            masters: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisSentinelMasterConfig {
+    pub shard: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RedisClusterConfig {
+    pub enabled: bool,
+    pub seeds: Vec<String>,
+    pub username: String,
+    pub password: String,
+    pub refresh_interval_seconds: u64,
+    pub request_timeout_seconds: u64,
+    pub max_redirects: usize,
+}
+
+impl Default for RedisClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            seeds: Vec::new(),
+            username: String::new(),
+            password: String::new(),
+            refresh_interval_seconds: 15,
+            request_timeout_seconds: 2,
+            max_redirects: 3,
         }
     }
 }
@@ -1446,13 +1511,32 @@ impl Config {
                     .to_owned(),
             ));
         }
-        if self.redis.routing_mode == RedisRoutingMode::Command && !self.redis.sharding.enabled {
+        if self.redis.sentinel.enabled && self.redis.cluster.enabled {
             return Err(ProxyError::Config(
-                "redis.routing_mode = \"command\" requires redis.sharding.enabled = true"
-                    .to_owned(),
+                "redis.sentinel and redis.cluster cannot both be enabled".to_owned(),
+            ));
+        }
+        if self.redis.routing_mode == RedisRoutingMode::Command
+            && !self.redis.sharding.enabled
+            && !self.redis.cluster.enabled
+        {
+            return Err(ProxyError::Config(
+                "redis.routing_mode = \"command\" requires sharding or Redis Cluster".to_owned(),
+            ));
+        }
+        if self.redis.cluster.enabled && self.redis.routing_mode != RedisRoutingMode::Command {
+            return Err(ProxyError::Config(
+                "redis.cluster.enabled requires redis.routing_mode = \"command\"".to_owned(),
+            ));
+        }
+        if self.redis.cluster.enabled && self.redis.hash_algorithm != RedisHashAlgorithm::RedisCrc16
+        {
+            return Err(ProxyError::Config(
+                "redis.cluster.enabled requires redis.hash_algorithm = \"redis_crc16\"".to_owned(),
             ));
         }
         if self.redis.hash_algorithm == RedisHashAlgorithm::RedisCrc16
+            && !self.redis.cluster.enabled
             && self.redis.sharding.strategy != ProtocolShardStrategy::Hash
         {
             return Err(ProxyError::Config(
@@ -1527,6 +1611,71 @@ impl Config {
             .iter()
             .map(|backend| backend.shard.as_str())
             .collect::<HashSet<_>>();
+        if self.redis.sentinel.enabled {
+            if self.redis.sentinel.endpoints.is_empty()
+                || self.redis.sentinel.refresh_interval_seconds == 0
+                || self.redis.sentinel.request_timeout_seconds == 0
+                || self.redis.sentinel.quorum == 0
+                || self.redis.sentinel.quorum > self.redis.sentinel.endpoints.len()
+            {
+                return Err(ProxyError::Config(
+                    "redis.sentinel requires endpoints, non-zero timeouts, and a quorum no larger than the endpoint count".to_owned(),
+                ));
+            }
+            if !self.redis.sentinel.username.is_empty() && self.redis.sentinel.password.is_empty() {
+                return Err(ProxyError::Config(
+                    "redis.sentinel.username requires redis.sentinel.password".to_owned(),
+                ));
+            }
+            for endpoint in &self.redis.sentinel.endpoints {
+                parse_backend_address(endpoint)?;
+            }
+            let mut mapped_shards = HashSet::new();
+            let mut master_names = HashSet::new();
+            for master in &self.redis.sentinel.masters {
+                if master.name.trim().is_empty() || !backend_shards.contains(master.shard.as_str())
+                {
+                    return Err(ProxyError::Config(format!(
+                        "redis.sentinel master {:?} must name a configured shard and non-empty service",
+                        master.shard
+                    )));
+                }
+                if !mapped_shards.insert(master.shard.as_str())
+                    || !master_names.insert(master.name.as_str())
+                {
+                    return Err(ProxyError::Config(
+                        "redis.sentinel master shard and service mappings must be unique"
+                            .to_owned(),
+                    ));
+                }
+            }
+            if mapped_shards != backend_shards {
+                return Err(ProxyError::Config(
+                    "redis.sentinel.masters must map every configured Redis shard exactly once"
+                        .to_owned(),
+                ));
+            }
+        }
+        if self.redis.cluster.enabled {
+            if self.redis.cluster.seeds.is_empty()
+                || self.redis.cluster.refresh_interval_seconds == 0
+                || self.redis.cluster.request_timeout_seconds == 0
+                || self.redis.cluster.max_redirects == 0
+            {
+                return Err(ProxyError::Config(
+                    "redis.cluster requires seeds and non-zero refresh/request/redirect limits"
+                        .to_owned(),
+                ));
+            }
+            if !self.redis.cluster.username.is_empty() && self.redis.cluster.password.is_empty() {
+                return Err(ProxyError::Config(
+                    "redis.cluster.username requires redis.cluster.password".to_owned(),
+                ));
+            }
+            for seed in &self.redis.cluster.seeds {
+                parse_backend_address(seed)?;
+            }
+        }
         for shard in &backend_shards {
             let primaries = primaries_by_shard.get(shard).copied().unwrap_or_default();
             if primaries != 1 {
@@ -2542,7 +2691,96 @@ mod tests {
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("requires redis.sharding.enabled")
+                .contains("requires sharding or Redis Cluster")
+        );
+    }
+
+    #[test]
+    fn validates_redis_cluster_and_sentinel_topology_contracts() {
+        let cluster_raw = r#"
+            [proxy]
+            listen = "127.0.0.1:3307"
+
+            [redis]
+            enabled = true
+            routing_mode = "command"
+            hash_algorithm = "redis_crc16"
+            read_write_listen = "127.0.0.1:6380"
+
+            [redis.cluster]
+            enabled = true
+            seeds = ["127.0.0.1:7000", "127.0.0.1:7001"]
+            max_redirects = 3
+
+            [[users]]
+            username = "app"
+            password = "secret"
+
+            [[backends]]
+            name = "mysql"
+            address = "127.0.0.1:3306"
+            role = "primary"
+            username = "root"
+            password = ""
+
+            [[redis_backends]]
+            name = "cluster-seed"
+            address = "127.0.0.1:7000"
+            role = "primary"
+        "#;
+        let mut cluster: Config = toml::from_str(cluster_raw).unwrap();
+        cluster.validate().unwrap();
+        cluster.redis.hash_algorithm = RedisHashAlgorithm::StableFnv;
+        assert!(
+            cluster
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("redis_crc16")
+        );
+
+        let sentinel_raw = r#"
+            [proxy]
+            listen = "127.0.0.1:3307"
+
+            [redis]
+            enabled = true
+            read_write_listen = "127.0.0.1:6380"
+
+            [redis.sentinel]
+            enabled = true
+            endpoints = ["127.0.0.1:26379"]
+            quorum = 1
+
+            [[redis.sentinel.masters]]
+            shard = "default"
+            name = "app-primary"
+
+            [[users]]
+            username = "app"
+            password = "secret"
+
+            [[backends]]
+            name = "mysql"
+            address = "127.0.0.1:3306"
+            role = "primary"
+            username = "root"
+            password = ""
+
+            [[redis_backends]]
+            name = "redis-primary"
+            address = "127.0.0.1:6379"
+            role = "primary"
+        "#;
+        let mut sentinel: Config = toml::from_str(sentinel_raw).unwrap();
+        sentinel.validate().unwrap();
+        sentinel.redis.sentinel.masters[0].shard = "missing".to_owned();
+        assert!(
+            sentinel
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("configured shard")
         );
     }
 }

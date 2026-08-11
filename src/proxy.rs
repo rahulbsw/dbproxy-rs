@@ -78,7 +78,8 @@ impl Proxy {
         let frontend_tls = tls::frontend_server_config(&config.proxy.tls)?;
         let postgres_backends =
             PostgresBackendManager::from_config(&config.postgres_backends, &config.postgres)?;
-        let redis_backends = RedisBackendManager::from_config(&config.redis_backends)?;
+        let redis_backends =
+            RedisBackendManager::from_config(&config.redis_backends, &config.redis)?;
         Ok(Self {
             config: Arc::new(config),
             backends,

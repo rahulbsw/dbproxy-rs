@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io,
     sync::Arc,
     time::Duration,
@@ -33,6 +33,7 @@ pub(super) async fn run(
     config: RedisConfig,
     router: Arc<ProtocolShardRouter>,
 ) -> io::Result<CommandStats> {
+    let topology_epoch = manager.topology_epoch();
     let mut session = CommandSession {
         endpoint,
         manager,
@@ -46,6 +47,7 @@ pub(super) async fn run(
             backend_request_bytes: 0,
             backend_response_bytes: 0,
         },
+        topology_epoch,
     };
 
     loop {
@@ -68,6 +70,11 @@ pub(super) async fn run(
             break;
         };
         session.metrics.redis_command();
+        let topology_epoch = session.manager.topology_epoch();
+        if topology_epoch != session.topology_epoch {
+            session.backends.clear();
+            session.topology_epoch = topology_epoch;
+        }
         let action = session.execute(command).await;
         client.write_all(&action.response).await?;
         if action.close {
@@ -87,12 +94,13 @@ struct CommandSession {
     backends: HashMap<String, CommandBackend>,
     state: Vec<StateCommand>,
     stats: CommandStats,
+    topology_epoch: u64,
 }
 
 struct CommandBackend {
     stream: TcpStream,
     read_buffer: BytesMut,
-    _active: ActiveRedisBackend,
+    _active: Option<ActiveRedisBackend>,
 }
 
 #[derive(Clone)]
@@ -534,9 +542,13 @@ impl CommandSession {
                 .args
                 .get(*index)
                 .ok_or_else(|| "command is missing a declared key".to_owned())?;
-            let shard = route_redis_key(&self.router, &self.config, key)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "Redis command sharding is not enabled".to_owned())?;
+            let shard = if let Some(target) = self.manager.cluster_target_for_key(key) {
+                target
+            } else {
+                route_redis_key(&self.router, &self.config, key)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "Redis command sharding is not enabled".to_owned())?
+            };
             groups.entry(shard).or_default().push(*index);
         }
         Ok(groups)
@@ -553,18 +565,60 @@ impl CommandSession {
     }
 
     fn default_shard(&self) -> String {
-        self.config
-            .sharding
-            .default_shard
-            .clone()
-            .unwrap_or_else(|| self.manager.default_shard.clone())
+        self.manager.cluster_seed_target().unwrap_or_else(|| {
+            self.config
+                .sharding
+                .default_shard
+                .clone()
+                .unwrap_or_else(|| self.manager.default_shard.clone())
+        })
     }
 
     async fn exchange(&mut self, shard: &str, request: &[u8]) -> Result<Vec<u8>, String> {
+        let Some(cluster) = self.manager.cluster_topology() else {
+            return self.exchange_once(shard, request).await;
+        };
+        let mut target = shard.to_owned();
+        let mut asking = false;
+        for attempt in 0..=cluster.max_redirects() {
+            if asking {
+                let response = self
+                    .exchange_once(&target, &encode_command(&[b"ASKING"]))
+                    .await?;
+                if response_is_error(&response) {
+                    cluster.redirect_failed();
+                    return Err(format!(
+                        "Redis Cluster ASKING was rejected: {}",
+                        response_message(&response)
+                    ));
+                }
+            }
+            let response = self.exchange_once(&target, request).await?;
+            let Some((is_ask, slot, address)) = super::topology::parse_redirect(&response) else {
+                if response.starts_with(b"-MOVED") || response.starts_with(b"-ASK") {
+                    cluster.redirect_failed();
+                    return Err("Redis Cluster returned a malformed redirection".to_owned());
+                }
+                return Ok(response);
+            };
+            if attempt == cluster.max_redirects() {
+                cluster.redirect_failed();
+                return Err("Redis Cluster redirection retry limit reached".to_owned());
+            }
+            cluster.record_redirect(slot, address.clone(), is_ask);
+            self.topology_epoch = self.manager.topology_epoch();
+            target = super::topology::cluster_target(slot, &address);
+            asking = is_ask;
+        }
+        unreachable!("bounded Redis Cluster redirect loop always returns")
+    }
+
+    async fn exchange_once(&mut self, shard: &str, request: &[u8]) -> Result<Vec<u8>, String> {
         self.ensure_backend(shard).await?;
+        let backend_key = backend_key(shard);
         let backend = self
             .backends
-            .get_mut(shard)
+            .get_mut(&backend_key)
             .expect("ensured backend connection");
         if let Err(error) = backend_write(
             &mut backend.stream,
@@ -573,7 +627,7 @@ impl CommandSession {
         )
         .await
         {
-            self.backends.remove(shard);
+            self.backends.remove(&backend_key);
             return Err(format!("backend write for shard {shard:?} failed: {error}"));
         }
         self.stats.backend_request_bytes = self
@@ -590,7 +644,7 @@ impl CommandSession {
         {
             Ok(response) => response,
             Err(error) => {
-                self.backends.remove(shard);
+                self.backends.remove(&backend_key);
                 return Err(format!(
                     "backend response for shard {shard:?} failed: {error}"
                 ));
@@ -613,13 +667,21 @@ impl CommandSession {
             states.push((shard, request, ready));
         }
 
+        let mut failed_backends = HashSet::new();
         for (shard, request, state) in &mut states {
             if state.is_err() {
                 continue;
             }
+            let backend_key = backend_key(shard);
+            if failed_backends.contains(&backend_key) {
+                *state = Err(format!(
+                    "backend connection for shard {shard:?} failed earlier in this fanout"
+                ));
+                continue;
+            }
             let backend = self
                 .backends
-                .get_mut(shard)
+                .get_mut(&backend_key)
                 .expect("ensured backend connection");
             if let Err(error) = backend_write(
                 &mut backend.stream,
@@ -629,6 +691,7 @@ impl CommandSession {
             .await
             {
                 *state = Err(format!("backend write for shard {shard:?} failed: {error}"));
+                failed_backends.insert(backend_key);
             } else {
                 self.stats.backend_request_bytes = self
                     .stats
@@ -636,61 +699,81 @@ impl CommandSession {
                     .saturating_add(request.len() as u64);
             }
         }
+        for backend in &failed_backends {
+            self.backends.remove(backend);
+        }
 
-        let mut replies = Vec::with_capacity(states.len());
+        let mut initial_replies = Vec::with_capacity(states.len());
         let mut aggregate_response_bytes = 0_usize;
-        for (shard, _, state) in states {
+        for (shard, request, state) in states {
+            let backend_key = backend_key(&shard);
             let response = match state {
                 Err(error) => Err(error),
-                Ok(()) => {
-                    let backend = self
-                        .backends
-                        .get_mut(&shard)
-                        .expect("ensured backend connection");
-                    let remaining = self
-                        .config
-                        .max_response_bytes
-                        .saturating_sub(aggregate_response_bytes);
-                    if remaining == 0 {
-                        Err(
-                            "aggregate Redis fanout response exceeds configured byte limit"
-                                .to_owned(),
-                        )
-                    } else {
-                        match backend_read(
-                            &mut backend.stream,
-                            &mut backend.read_buffer,
-                            remaining,
-                            self.config.backend_response_timeout_seconds,
-                        )
-                        .await
-                        {
-                            Ok(response) => {
-                                aggregate_response_bytes =
-                                    aggregate_response_bytes.saturating_add(response.len());
-                                self.stats.backend_response_bytes = self
-                                    .stats
-                                    .backend_response_bytes
-                                    .saturating_add(response.len() as u64);
-                                Ok(response)
+                Ok(()) => match self.backends.get_mut(&backend_key) {
+                    None => Err(format!(
+                        "backend connection for shard {shard:?} is unavailable"
+                    )),
+                    Some(backend) => {
+                        let remaining = self
+                            .config
+                            .max_response_bytes
+                            .saturating_sub(aggregate_response_bytes);
+                        if remaining == 0 {
+                            Err(
+                                "aggregate Redis fanout response exceeds configured byte limit"
+                                    .to_owned(),
+                            )
+                        } else {
+                            match backend_read(
+                                &mut backend.stream,
+                                &mut backend.read_buffer,
+                                remaining,
+                                self.config.backend_response_timeout_seconds,
+                            )
+                            .await
+                            {
+                                Ok(response) => {
+                                    aggregate_response_bytes =
+                                        aggregate_response_bytes.saturating_add(response.len());
+                                    self.stats.backend_response_bytes = self
+                                        .stats
+                                        .backend_response_bytes
+                                        .saturating_add(response.len() as u64);
+                                    Ok(response)
+                                }
+                                Err(error) => Err(format!(
+                                    "backend response for shard {shard:?} failed: {error}"
+                                )),
                             }
-                            Err(error) => Err(format!(
-                                "backend response for shard {shard:?} failed: {error}"
-                            )),
                         }
                     }
-                }
+                },
             };
             if response.is_err() {
-                self.backends.remove(&shard);
+                self.backends.remove(&backend_key);
             }
+            initial_replies.push((shard, request, response));
+        }
+
+        let mut replies = Vec::with_capacity(initial_replies.len());
+        for (shard, request, response) in initial_replies {
+            let response = match response {
+                Ok(response)
+                    if self.manager.cluster_topology().is_some()
+                        && super::topology::parse_redirect(&response).is_some() =>
+                {
+                    self.exchange(&shard, &request).await
+                }
+                response => response,
+            };
             replies.push((shard, response));
         }
         replies
     }
 
     async fn ensure_backend(&mut self, shard: &str) -> Result<(), String> {
-        if self.backends.contains_key(shard) {
+        let backend_key = backend_key(shard);
+        if self.backends.contains_key(&backend_key) {
             return Ok(());
         }
         if self.backends.len() >= self.config.max_shard_connections_per_client {
@@ -699,52 +782,114 @@ impl CommandSession {
                 self.config.max_shard_connections_per_client
             ));
         }
-        let (stream, backend) = self
-            .manager
-            .connect(self.endpoint, Some(shard), &self.config, &self.metrics)
-            .await
-            .map_err(|error| format!("backend connection for shard {shard:?} failed: {error}"))?;
+        let (stream, active) =
+            if let Some((_, address)) = super::topology::parse_cluster_target(shard) {
+                let stream = time::timeout(
+                    Duration::from_secs(self.config.connect_timeout_seconds),
+                    TcpStream::connect(address),
+                )
+                .await
+                .map_err(|_| format!("Redis Cluster node {address:?} connection timed out"))?
+                .map_err(|error| {
+                    format!("Redis Cluster node {address:?} connection failed: {error}")
+                })?;
+                stream
+                    .set_nodelay(true)
+                    .map_err(|error| format!("Redis Cluster TCP_NODELAY failed: {error}"))?;
+                (stream, None)
+            } else {
+                let (stream, backend) = self
+                    .manager
+                    .connect(self.endpoint, Some(shard), &self.config, &self.metrics)
+                    .await
+                    .map_err(|error| {
+                        format!("backend connection for shard {shard:?} failed: {error}")
+                    })?;
+                (stream, Some(ActiveRedisBackend::new(backend)))
+            };
         let mut connection = CommandBackend {
             stream,
             read_buffer: BytesMut::with_capacity(READ_CHUNK_BYTES),
-            _active: ActiveRedisBackend::new(backend),
+            _active: active,
         };
-        for state in &self.state {
-            backend_write(
-                &mut connection.stream,
-                &state.raw,
-                self.config.backend_response_timeout_seconds,
-            )
-            .await
-            .map_err(|error| format!("backend state replay for shard {shard:?} failed: {error}"))?;
-            self.stats.backend_request_bytes = self
-                .stats
-                .backend_request_bytes
-                .saturating_add(state.raw.len() as u64);
-            let response = backend_read(
-                &mut connection.stream,
-                &mut connection.read_buffer,
-                self.config.max_response_bytes,
-                self.config.backend_response_timeout_seconds,
-            )
-            .await
-            .map_err(|error| {
-                format!("backend state replay response for shard {shard:?} failed: {error}")
-            })?;
-            self.stats.backend_response_bytes = self
-                .stats
-                .backend_response_bytes
-                .saturating_add(response.len() as u64);
-            if response_is_error(&response) {
-                return Err(format!(
-                    "backend state replay for shard {shard:?} was rejected: {}",
-                    response_message(&response)
-                ));
+        if let Some(cluster) = self.manager.cluster_topology() {
+            let (username, password) = cluster.credentials();
+            if !password.is_empty() {
+                let auth = if username.is_empty() {
+                    encode_command(&[b"AUTH", password.as_bytes()])
+                } else {
+                    encode_command(&[b"AUTH", username.as_bytes(), password.as_bytes()])
+                };
+                replay_connection_command(
+                    &mut connection,
+                    &auth,
+                    "internal cluster authentication",
+                    shard,
+                    &self.config,
+                    &mut self.stats,
+                )
+                .await?;
             }
         }
-        self.backends.insert(shard.to_owned(), connection);
+        for state in &self.state {
+            replay_connection_command(
+                &mut connection,
+                &state.raw,
+                "backend state replay",
+                shard,
+                &self.config,
+                &mut self.stats,
+            )
+            .await?;
+        }
+        self.backends.insert(backend_key, connection);
         Ok(())
     }
+}
+
+fn backend_key(target: &str) -> String {
+    super::topology::parse_cluster_target(target).map_or_else(
+        || target.to_owned(),
+        |(_, address)| super::topology::cluster_target(0, address),
+    )
+}
+
+async fn replay_connection_command(
+    connection: &mut CommandBackend,
+    request: &[u8],
+    label: &str,
+    target: &str,
+    config: &RedisConfig,
+    stats: &mut CommandStats,
+) -> Result<(), String> {
+    backend_write(
+        &mut connection.stream,
+        request,
+        config.backend_response_timeout_seconds,
+    )
+    .await
+    .map_err(|error| format!("{label} for {target:?} failed: {error}"))?;
+    stats.backend_request_bytes = stats
+        .backend_request_bytes
+        .saturating_add(request.len() as u64);
+    let response = backend_read(
+        &mut connection.stream,
+        &mut connection.read_buffer,
+        config.max_response_bytes,
+        config.backend_response_timeout_seconds,
+    )
+    .await
+    .map_err(|error| format!("{label} response for {target:?} failed: {error}"))?;
+    stats.backend_response_bytes = stats
+        .backend_response_bytes
+        .saturating_add(response.len() as u64);
+    if response_is_error(&response) {
+        return Err(format!(
+            "{label} for {target:?} was rejected: {}",
+            response_message(&response)
+        ));
+    }
+    Ok(())
 }
 
 fn action(response: Vec<u8>) -> CommandAction {
@@ -1009,7 +1154,7 @@ fn parse_usize(value: &[u8], label: &str) -> Result<usize, String> {
     })
 }
 
-fn encode_command(args: &[&[u8]]) -> Vec<u8> {
+pub(super) fn encode_command(args: &[&[u8]]) -> Vec<u8> {
     let mut output = Vec::new();
     output.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
     for argument in args {
@@ -1041,11 +1186,11 @@ fn resp_error(message: &str) -> Vec<u8> {
     format!("-ERR dbproxy {sanitized}\r\n").into_bytes()
 }
 
-fn response_is_error(response: &[u8]) -> bool {
+pub(super) fn response_is_error(response: &[u8]) -> bool {
     response.starts_with(b"-") || response.starts_with(b"!")
 }
 
-fn response_message(response: &[u8]) -> String {
+pub(super) fn response_message(response: &[u8]) -> String {
     String::from_utf8_lossy(response)
         .trim()
         .trim_start_matches(['-', '!'])
@@ -1065,7 +1210,7 @@ fn reply_for<'a>(
         .map_err(Clone::clone)
 }
 
-fn integer_response(response: &[u8]) -> Result<i64, String> {
+pub(super) fn integer_response(response: &[u8]) -> Result<i64, String> {
     if response.first() != Some(&b':') || !response.ends_with(b"\r\n") {
         return Err("backend returned a non-integer response".to_owned());
     }
@@ -1075,7 +1220,7 @@ fn integer_response(response: &[u8]) -> Result<i64, String> {
         .map_err(|_| "backend returned an invalid integer".to_owned())
 }
 
-fn array_elements(response: &[u8]) -> Result<Vec<&[u8]>, String> {
+pub(super) fn array_elements(response: &[u8]) -> Result<Vec<&[u8]>, String> {
     if response.first() != Some(&b'*') {
         return Err("backend returned a non-array response".to_owned());
     }
@@ -1233,7 +1378,7 @@ async fn read_response(
     }
 }
 
-async fn backend_write(
+pub(super) async fn backend_write(
     stream: &mut TcpStream,
     request: &[u8],
     timeout_seconds: u64,
@@ -1246,7 +1391,7 @@ async fn backend_write(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Redis backend write timed out"))?
 }
 
-async fn backend_read(
+pub(super) async fn backend_read(
     stream: &mut TcpStream,
     buffer: &mut BytesMut,
     max_bytes: usize,
@@ -1429,6 +1574,11 @@ fn parse_line(input: &[u8], start: usize, max_bytes: usize) -> io::Result<Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        BackendRole, RedisBackendConfig, RedisClusterConfig, RedisHashAlgorithm, RedisRoutingMode,
+    };
+    use std::sync::atomic::Ordering;
+    use tokio::net::TcpListener;
 
     #[test]
     fn parses_pipelined_commands_without_consuming_the_second() {
@@ -1510,5 +1660,179 @@ mod tests {
         ] {
             assert!(!is_read_only_safe(&RespCommand { args, raw: vec![] }).unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn follows_moved_redirect_and_updates_cluster_slot() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target_listener.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let mut request = [0_u8; 256];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(request[..read].windows(3).any(|value| value == b"SET"));
+            stream.write_all(b"+OK\r\n").await.unwrap();
+        });
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_address = seed_listener.local_addr().unwrap();
+        let key = b"customer:{42}";
+        let slot = crate::redis::redis_crc16(crate::redis::redis_hash_tag(key)) % 16_384;
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            let mut request = [0_u8; 256];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(request[..read].windows(3).any(|value| value == b"SET"));
+            stream
+                .write_all(format!("-MOVED {slot} {target_address}\r\n").as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let config = RedisConfig {
+            routing_mode: RedisRoutingMode::Command,
+            hash_algorithm: RedisHashAlgorithm::RedisCrc16,
+            cluster: RedisClusterConfig {
+                enabled: true,
+                seeds: vec![seed_address.to_string()],
+                ..RedisClusterConfig::default()
+            },
+            ..RedisConfig::default()
+        };
+        let manager = RedisBackendManager::from_config(
+            &[RedisBackendConfig {
+                name: "seed".to_owned(),
+                address: seed_address.to_string(),
+                role: BackendRole::Primary,
+                weight: 1,
+                shard: "default".to_owned(),
+            }],
+            &config,
+        )
+        .unwrap()
+        .unwrap();
+        let mut session = CommandSession {
+            endpoint: RedisEndpoint::ReadWrite,
+            manager: manager.clone(),
+            metrics: Arc::new(Metrics::default()),
+            router: Arc::new(ProtocolShardRouter::new(&config.sharding)),
+            config,
+            client_buffer: BytesMut::new(),
+            backends: HashMap::new(),
+            state: Vec::new(),
+            stats: CommandStats {
+                backend_request_bytes: 0,
+                backend_response_bytes: 0,
+            },
+            topology_epoch: manager.topology_epoch(),
+        };
+        let request = encode_command(&[b"SET", key, b"value"]);
+        let route = session.manager.cluster_target_for_key(key).unwrap();
+        assert_eq!(
+            session.exchange(&route, &request).await.unwrap(),
+            b"+OK\r\n"
+        );
+        assert_eq!(
+            manager
+                .topology_stats
+                .moved_redirects
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            manager
+                .cluster_target_for_key(key)
+                .unwrap()
+                .contains(&target_address.to_string())
+        );
+        seed_task.await.unwrap();
+        target_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn follows_ask_redirect_with_asking_on_the_target_connection() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target_listener.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let mut request = [0_u8; 256];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(request[..read].windows(6).any(|value| value == b"ASKING"));
+            stream.write_all(b"+OK\r\n").await.unwrap();
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(request[..read].windows(3).any(|value| value == b"SET"));
+            stream.write_all(b"+OK\r\n").await.unwrap();
+        });
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_address = seed_listener.local_addr().unwrap();
+        let key = b"order:{7}";
+        let slot = crate::redis::redis_crc16(crate::redis::redis_hash_tag(key)) % 16_384;
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            let mut request = [0_u8; 256];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(request[..read].windows(3).any(|value| value == b"SET"));
+            stream
+                .write_all(format!("-ASK {slot} {target_address}\r\n").as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let config = RedisConfig {
+            routing_mode: RedisRoutingMode::Command,
+            hash_algorithm: RedisHashAlgorithm::RedisCrc16,
+            cluster: RedisClusterConfig {
+                enabled: true,
+                seeds: vec![seed_address.to_string()],
+                ..RedisClusterConfig::default()
+            },
+            ..RedisConfig::default()
+        };
+        let manager = RedisBackendManager::from_config(
+            &[RedisBackendConfig {
+                name: "seed".to_owned(),
+                address: seed_address.to_string(),
+                role: BackendRole::Primary,
+                weight: 1,
+                shard: "default".to_owned(),
+            }],
+            &config,
+        )
+        .unwrap()
+        .unwrap();
+        let mut session = CommandSession {
+            endpoint: RedisEndpoint::ReadWrite,
+            manager: manager.clone(),
+            metrics: Arc::new(Metrics::default()),
+            router: Arc::new(ProtocolShardRouter::new(&config.sharding)),
+            config,
+            client_buffer: BytesMut::new(),
+            backends: HashMap::new(),
+            state: Vec::new(),
+            stats: CommandStats {
+                backend_request_bytes: 0,
+                backend_response_bytes: 0,
+            },
+            topology_epoch: manager.topology_epoch(),
+        };
+        let request = encode_command(&[b"SET", key, b"value"]);
+        let route = session.manager.cluster_target_for_key(key).unwrap();
+        assert_eq!(
+            session.exchange(&route, &request).await.unwrap(),
+            b"+OK\r\n"
+        );
+        assert_eq!(
+            manager.topology_stats.ask_redirects.load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            manager
+                .cluster_target_for_key(key)
+                .unwrap()
+                .contains(&seed_address.to_string())
+        );
+        seed_task.await.unwrap();
+        target_task.await.unwrap();
     }
 }

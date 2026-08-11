@@ -77,13 +77,13 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "redis_sentinel_discovery",
-        status: CapabilityStatus::Planned,
-        contract: "requires monitored-primary discovery and failover epoch handling",
+        status: CapabilityStatus::Constrained,
+        contract: "configured Sentinel address quorum atomically replaces shard-primary endpoints; replicas remain statically configured",
     },
     Capability {
         name: "redis_cluster_topology",
-        status: CapabilityStatus::Planned,
-        contract: "requires slot-map refresh plus bounded MOVED and ASK retries",
+        status: CapabilityStatus::Constrained,
+        contract: "command mode requires a complete native slot map and follows validated MOVED/ASK redirects with bounded retries",
     },
     Capability {
         name: "cross_shard_schema_validation",

@@ -85,8 +85,10 @@
 - Redis/Valkey connection mode preserves Pub/Sub, transactions, scripts, RESP3
   pushes, AUTH/ACL, TLS, and large values. Command mode intentionally rejects
   those stateful/streaming shapes when safe multi-shard semantics are not
-  available. Sentinel discovery and Redis Cluster redirection/topology
-  rewriting remain unimplemented.
+  available. Sentinel mode discovers quorum-approved primaries but keeps
+  replicas static. Cluster command mode owns a bounded slot map and rewrites
+  MOVED/ASK, but uses primaries for reads and needs directly reachable announced
+  addresses plus plaintext or externally terminated TLS.
 
 These boundaries are fail-closed where routing correctness is involved and are
 called out in the main README so operators can choose the correct deployment

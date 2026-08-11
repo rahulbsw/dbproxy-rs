@@ -57,9 +57,10 @@ selection requires an independent maturity and compatibility review,
 especially for TimescaleDB extensions.
 
 Redis Cluster should own dynamic Redis/Valkey slot topology. Sentinel should
-own primary discovery for non-clustered replication. A proxy that does not
-implement those protocols must not pretend its static mapping has equivalent
-failure or resharding semantics.
+own primary election for non-clustered replication. DBProxy can now consume
+Sentinel address quorum or a native Cluster slot map when a mandatory unified
+edge policy justifies the extra hop; it does not replace either system's
+provisioning, consensus, replication, or resharding control plane.
 
 ## Do not double proxy by default
 
@@ -108,7 +109,7 @@ queries. It must not silently convert topology or switch production traffic.
 | One operating model across SQL and key-value protocols | DBProxy |
 | Automated large-scale MySQL resharding and fleet management | Vitess |
 | Full PostgreSQL distributed control plane | Multigres when its maturity and compatibility meet the workload |
-| Native dynamic Redis/Valkey topology | Redis Cluster or Sentinel-aware clients |
+| Native dynamic Redis/Valkey topology with no mandatory edge policy | Redis Cluster or Sentinel-aware clients |
 | PostgreSQL transaction pooling only | PgBouncer |
 | MySQL-only mature query routing without DBProxy sharding needs | ProxySQL |
 

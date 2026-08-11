@@ -17,8 +17,8 @@ The live status is also available from `GET /capabilities` and
 | Authenticated readiness over TLS | Implemented | Per-backend certificate/hostname-verified TLS and optional mTLS for `SELECT 1` probes |
 | Redis selector before AUTH/HELLO | Command-engine work | Add an authenticated command-routing frontend; transparent connection mode cannot choose a key shard before it sees a key |
 | Redis transactions, Pub/Sub, blocking commands, modules, and streaming RESP | Command-engine work | Add separately bounded execution modes per semantic family; unknown commands remain rejected |
-| Sentinel discovery | Topology manager | Poll Sentinels, validate quorum/epochs, atomically replace primary snapshots, and drain stale connections |
-| Redis Cluster MOVED/ASK | Topology manager | Maintain slot maps, validate cluster identity, bound redirection retries, and preserve ASKING semantics |
+| Sentinel discovery | Implemented, constrained | Address quorum atomically replaces shard-primary endpoints and withdraws readiness when refresh fails; replica discovery, epoch comparison, and Sentinel TLS remain open |
+| Redis Cluster MOVED/ASK | Implemented, constrained | Complete slot maps, native CRC16 grouping, validated bounded redirects, and ASKING semantics; replica reads and TLS termination remain open |
 | Cross-shard prepared metadata | Compatibility preflight | Fingerprint parameters and result columns at prepare time and reject mismatches before execution |
 | Resume partially streamed results | Protocol invariant | Generic SQL cannot resume safely; require buffered mode or an explicit application/query checkpoint such as a unique keyset cursor |
 | Scatter/gather | Distributed execution engine | Start with explicit `UNION ALL` concatenation and bounded fanout; add each merge semantic independently |
@@ -41,8 +41,10 @@ The live status is also available from `GET /capabilities` and
 ### Phase 2: topology and compatibility
 
 - PostgreSQL cross-shard schema and prepared-metadata fingerprints
-- Redis Sentinel topology snapshots with epoch metrics
-- Redis Cluster slot maps with bounded `MOVED` and `ASK` handling
+- Redis Sentinel topology snapshots with epoch metrics (address-quorum
+  milestone complete; epochs and replicas remain)
+- Redis Cluster slot maps with bounded `MOVED` and `ASK` handling (primary-slot
+  milestone complete; replica reads and TLS remain)
 - versioned runtime configuration snapshots and controlled draining
 
 Acceptance requires fault tests for topology changes during connection

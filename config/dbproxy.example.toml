@@ -146,6 +146,29 @@ enabled = false
 # The Redis adapter also supports Valkey because both use RESP.
 strategy = "hash"
 
+# Optional Sentinel discovery. Every configured shard needs one service mapping
+# and at least `quorum` endpoints must return the same primary addresses.
+# [redis.sentinel]
+# enabled = true
+# endpoints = ["sentinel-1.internal:26379", "sentinel-2.internal:26379", "sentinel-3.internal:26379"]
+# quorum = 2
+# refresh_interval_seconds = 5
+# request_timeout_seconds = 2
+# password = "replace-with-sentinel-secret"
+# [[redis.sentinel.masters]]
+# shard = "default"
+# name = "app-primary"
+
+# Native Redis Cluster requires routing_mode="command" and
+# hash_algorithm="redis_crc16". It does not require redis.sharding.enabled.
+# [redis.cluster]
+# enabled = true
+# seeds = ["redis-cluster-1.internal:6379", "redis-cluster-2.internal:6379"]
+# refresh_interval_seconds = 15
+# request_timeout_seconds = 2
+# max_redirects = 3
+# password = "replace-with-cluster-secret"
+
 [cache]
 # Optional MySQL read-through result cache. This is separate from the Redis
 # proxy listener above and connects directly to an existing Redis/Valkey cache.

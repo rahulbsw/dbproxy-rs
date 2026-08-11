@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fmt::Write,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -32,6 +32,7 @@ use crate::{
 };
 
 mod command;
+mod topology;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RedisEndpoint {
@@ -42,7 +43,7 @@ pub enum RedisEndpoint {
 #[derive(Debug)]
 struct RedisBackend {
     name: String,
-    address: String,
+    address: RwLock<String>,
     role: BackendRole,
     weight: u32,
     shard: String,
@@ -62,7 +63,7 @@ impl RedisBackend {
         parse_backend_address(&config.address)?;
         Ok(Self {
             name: config.name.clone(),
-            address: config.address.clone(),
+            address: RwLock::new(config.address.clone()),
             role: config.role,
             weight: config.weight,
             shard: config.shard.clone(),
@@ -80,7 +81,8 @@ impl RedisBackend {
 
     async fn connect(&self, timeout: Duration) -> io::Result<TcpStream> {
         self.connection_attempts.fetch_add(1, Ordering::Relaxed);
-        let result = time::timeout(timeout, TcpStream::connect(self.address.as_str())).await;
+        let address = self.address();
+        let result = time::timeout(timeout, TcpStream::connect(address.as_str())).await;
         match result {
             Ok(Ok(stream)) => {
                 stream.set_nodelay(true)?;
@@ -104,7 +106,8 @@ impl RedisBackend {
         // This is intentionally a transport check. Redis AUTH/ACL and TLS stay
         // end-to-end between the client and backend and are never terminated here.
         let timeout = Duration::from_secs(config.timeout_seconds);
-        let success = time::timeout(timeout, TcpStream::connect(self.address.as_str()))
+        let address = self.address();
+        let success = time::timeout(timeout, TcpStream::connect(address.as_str()))
             .await
             .is_ok_and(|result| result.is_ok());
         let now = unix_seconds();
@@ -136,6 +139,26 @@ impl RedisBackend {
             BackendRole::Replica => "replica",
         }
     }
+
+    fn address(&self) -> String {
+        self.address
+            .read()
+            .expect("Redis backend address lock poisoned")
+            .clone()
+    }
+
+    fn set_address(&self, address: String) -> bool {
+        let mut current = self
+            .address
+            .write()
+            .expect("Redis backend address lock poisoned");
+        if *current == address {
+            return false;
+        }
+        *current = address;
+        self.healthy.store(false, Ordering::Release);
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -143,6 +166,9 @@ pub struct RedisBackendManager {
     shards: HashMap<String, RedisShard>,
     default_shard: String,
     all: Vec<Arc<RedisBackend>>,
+    sentinel: Option<Arc<topology::SentinelTopology>>,
+    cluster: Option<Arc<topology::ClusterTopology>>,
+    topology_stats: Arc<topology::RedisTopologyStats>,
     health_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -154,7 +180,10 @@ struct RedisShard {
 }
 
 impl RedisBackendManager {
-    pub fn from_config(backends: &[RedisBackendConfig]) -> Result<Option<Arc<Self>>, ProxyError> {
+    pub fn from_config(
+        backends: &[RedisBackendConfig],
+        config: &RedisConfig,
+    ) -> Result<Option<Arc<Self>>, ProxyError> {
         if backends.is_empty() {
             return Ok(None);
         }
@@ -192,18 +221,46 @@ impl RedisBackendManager {
                 },
             );
         }
+        let topology_stats = Arc::new(topology::RedisTopologyStats::default());
+        let sentinel = config.sentinel.enabled.then(|| {
+            let primaries = shards
+                .iter()
+                .map(|(name, shard)| (name.clone(), shard.primary.clone()))
+                .collect();
+            Arc::new(topology::SentinelTopology::new(
+                config.sentinel.clone(),
+                primaries,
+                topology_stats.clone(),
+            ))
+        });
+        let cluster = config.cluster.enabled.then(|| {
+            Arc::new(topology::ClusterTopology::new(
+                config.cluster.clone(),
+                topology_stats.clone(),
+            ))
+        });
         Ok(Some(Arc::new(Self {
             shards,
             default_shard,
             all,
+            sentinel,
+            cluster,
+            topology_stats,
             health_tasks: Mutex::new(Vec::new()),
         })))
     }
 
     pub fn ready(&self) -> bool {
-        self.shards
-            .values()
-            .all(|shard| shard.primary.healthy.load(Ordering::Acquire))
+        let static_primaries_ready = self.cluster.is_some()
+            || self
+                .shards
+                .values()
+                .all(|shard| shard.primary.healthy.load(Ordering::Acquire));
+        self.sentinel
+            .as_ref()
+            .is_none_or(|sentinel| sentinel.ready())
+            && self.cluster.as_ref().is_none_or(|cluster| cluster.ready())
+            && static_primaries_ready
     }
 
     fn select(
@@ -239,6 +296,24 @@ impl RedisBackendManager {
             }
         }
         None
+    }
+
+    fn cluster_target_for_key(&self, key: &[u8]) -> Option<String> {
+        let cluster = self.cluster.as_ref()?;
+        let slot = redis_crc16(redis_hash_tag(key)) % 16_384;
+        Some(cluster.target(slot))
+    }
+
+    fn cluster_seed_target(&self) -> Option<String> {
+        self.cluster.as_ref().map(|cluster| cluster.seed_target())
+    }
+
+    fn cluster_topology(&self) -> Option<Arc<topology::ClusterTopology>> {
+        self.cluster.clone()
+    }
+
+    fn topology_epoch(&self) -> u64 {
+        self.topology_stats.epoch.load(Ordering::Acquire)
     }
 
     async fn connect(
@@ -320,6 +395,38 @@ impl RedisBackendManager {
                 }
             }));
         }
+        if let Some(sentinel) = self.sentinel.clone() {
+            let mut shutdown = shutdown.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    if let Err(error) = sentinel.refresh().await {
+                        warn!(%error, "Redis Sentinel topology refresh failed");
+                    }
+                    tokio::select! {
+                        _ = time::sleep(sentinel.refresh_interval()) => {}
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() { break; }
+                        }
+                    }
+                }
+            }));
+        }
+        if let Some(cluster) = self.cluster.clone() {
+            let mut shutdown = shutdown.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    if let Err(error) = cluster.refresh().await {
+                        warn!(%error, "Redis Cluster topology refresh failed");
+                    }
+                    tokio::select! {
+                        _ = time::sleep(cluster.refresh_interval()) => {}
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() { break; }
+                        }
+                    }
+                }
+            }));
+        }
         drop(shutdown);
     }
 
@@ -341,7 +448,7 @@ impl RedisBackendManager {
             .iter()
             .map(|backend| RedisBackendStatus {
                 name: backend.name.clone(),
-                address: backend.address.clone(),
+                address: backend.address(),
                 role: backend.role_name().to_owned(),
                 shard: backend.shard.clone(),
                 healthy: backend.healthy.load(Ordering::Acquire),
@@ -403,6 +510,76 @@ impl RedisBackendManager {
         for (name, metric_type, help) in definitions {
             let _ = writeln!(output, "# HELP {name} {help}");
             let _ = writeln!(output, "# TYPE {name} {metric_type}");
+        }
+        for (name, metric_type, help, value) in [
+            (
+                "dbproxy_redis_topology_epoch",
+                "gauge",
+                "Monotonic Redis Sentinel/Cluster topology generation.",
+                self.topology_stats.epoch.load(Ordering::Relaxed),
+            ),
+            (
+                "dbproxy_redis_sentinel_refreshes_total",
+                "counter",
+                "Successful coherent Redis Sentinel topology refreshes.",
+                self.topology_stats
+                    .sentinel_refreshes
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "dbproxy_redis_sentinel_refresh_failures_total",
+                "counter",
+                "Redis Sentinel refresh cycles where every endpoint failed.",
+                self.topology_stats
+                    .sentinel_failures
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "dbproxy_redis_sentinel_failovers_total",
+                "counter",
+                "Redis shard-primary address changes accepted from Sentinel.",
+                self.topology_stats
+                    .sentinel_failovers
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "dbproxy_redis_cluster_refreshes_total",
+                "counter",
+                "Successful complete Redis Cluster slot-map refreshes.",
+                self.topology_stats
+                    .cluster_refreshes
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "dbproxy_redis_cluster_refresh_failures_total",
+                "counter",
+                "Redis Cluster refresh cycles where every candidate failed.",
+                self.topology_stats.cluster_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "dbproxy_redis_cluster_moved_redirects_total",
+                "counter",
+                "Redis Cluster MOVED redirects followed by DBProxy.",
+                self.topology_stats.moved_redirects.load(Ordering::Relaxed),
+            ),
+            (
+                "dbproxy_redis_cluster_ask_redirects_total",
+                "counter",
+                "Redis Cluster ASK redirects followed with ASKING by DBProxy.",
+                self.topology_stats.ask_redirects.load(Ordering::Relaxed),
+            ),
+            (
+                "dbproxy_redis_cluster_redirect_failures_total",
+                "counter",
+                "Redis Cluster redirects rejected after validation or retry limits.",
+                self.topology_stats
+                    .redirect_failures
+                    .load(Ordering::Relaxed),
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} {metric_type}");
+            let _ = writeln!(output, "{name} {value}");
         }
         for backend in &self.all {
             let labels = format!(
@@ -1022,10 +1199,13 @@ mod tests {
 
     #[test]
     fn read_write_endpoint_always_selects_primary() {
-        let manager = RedisBackendManager::from_config(&[
-            backend("primary", BackendRole::Primary, 1),
-            backend("replica", BackendRole::Replica, 1),
-        ])
+        let manager = RedisBackendManager::from_config(
+            &[
+                backend("primary", BackendRole::Primary, 1),
+                backend("replica", BackendRole::Replica, 1),
+            ],
+            &RedisConfig::default(),
+        )
         .unwrap()
         .unwrap();
         assert_eq!(
@@ -1039,10 +1219,13 @@ mod tests {
 
     #[test]
     fn read_only_endpoint_requires_a_healthy_replica() {
-        let manager = RedisBackendManager::from_config(&[
-            backend("primary", BackendRole::Primary, 1),
-            backend("replica", BackendRole::Replica, 1),
-        ])
+        let manager = RedisBackendManager::from_config(
+            &[
+                backend("primary", BackendRole::Primary, 1),
+                backend("replica", BackendRole::Replica, 1),
+            ],
+            &RedisConfig::default(),
+        )
         .unwrap()
         .unwrap();
         assert!(manager.select(RedisEndpoint::ReadOnly, None).is_none());
@@ -1060,11 +1243,14 @@ mod tests {
 
     #[test]
     fn weighted_selection_honors_replica_weights() {
-        let manager = RedisBackendManager::from_config(&[
-            backend("primary", BackendRole::Primary, 1),
-            backend("replica-a", BackendRole::Replica, 1),
-            backend("replica-b", BackendRole::Replica, 2),
-        ])
+        let manager = RedisBackendManager::from_config(
+            &[
+                backend("primary", BackendRole::Primary, 1),
+                backend("replica-a", BackendRole::Replica, 1),
+                backend("replica-b", BackendRole::Replica, 2),
+            ],
+            &RedisConfig::default(),
+        )
         .unwrap()
         .unwrap();
         for replica in &manager.shards["default"].replicas {
@@ -1157,7 +1343,7 @@ mod tests {
         first.shard = "s0".to_owned();
         let mut second = backend("s1-primary", BackendRole::Primary, 1);
         second.shard = "s1".to_owned();
-        let manager = RedisBackendManager::from_config(&[first, second])
+        let manager = RedisBackendManager::from_config(&[first, second], &RedisConfig::default())
             .unwrap()
             .unwrap();
         assert_eq!(

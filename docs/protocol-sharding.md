@@ -6,6 +6,11 @@ semantics. PostgreSQL transaction mode routes simple-query statements within a
 startup-selected shard, while Redis/Valkey additionally offers command routing
 for proxy-side key hashing and explicitly supported multi-key operations.
 
+Native Redis Cluster mode is separate from DBProxy's logical shard map. It uses
+Redis CRC16 slots directly, publishes only complete `CLUSTER SLOTS` snapshots,
+and groups supported multi-key commands by slot. See
+[Redis/Valkey topology](redis-topology.md).
+
 Every configured shard must have exactly one primary and may have weighted
 replicas. Read-write listener connections use that shard's primary. Read-only
 listener connections use a healthy replica in the same shard and may fall back
