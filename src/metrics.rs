@@ -74,6 +74,7 @@ pub struct Metrics {
     postgres_shard_routes: AtomicU64,
     postgres_shard_routing_failures: AtomicU64,
     postgres_terminated_queries: AtomicU64,
+    postgres_extended_queries: AtomicU64,
     postgres_queries_primary: AtomicU64,
     postgres_queries_replica: AtomicU64,
     postgres_transaction_pins: AtomicU64,
@@ -376,6 +377,11 @@ impl Metrics {
 
     pub fn postgres_terminated_query(&self) {
         self.postgres_terminated_queries
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn postgres_extended_query(&self) {
+        self.postgres_extended_queries
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1063,6 +1069,13 @@ impl Metrics {
             "counter",
             "Queries handled by PostgreSQL terminating transaction-pool mode.",
             self.postgres_terminated_queries.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_postgres_extended_queries_total",
+            "counter",
+            "Extended-protocol executions handled by PostgreSQL terminating transaction-pool mode.",
+            self.postgres_extended_queries.load(Ordering::Relaxed),
         );
         metric(
             &mut output,

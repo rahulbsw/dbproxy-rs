@@ -2,8 +2,9 @@
 
 DBProxy offers two deliberately separate PostgreSQL modes. `transparent`
 preserves the complete backend wire protocol and assigns one backend connection
-to each frontend connection. `transaction` terminates the simple-query protocol
-and reuses a bounded pool of authenticated backend connections.
+to each frontend connection. `transaction` terminates simple queries and a
+common-scalar subset of the extended protocol, then reuses a bounded pool of
+authenticated backend connections.
 
 ## Configuration
 
@@ -19,6 +20,8 @@ query_timeout_seconds = 30
 pool_acquire_timeout_seconds = 5
 pool_max_per_backend = 32
 read_after_write_seconds = 2
+max_result_rows = 100000
+max_result_bytes = 67108864
 fallback_to_primary = true
 
 [[postgres_backends]]
@@ -58,7 +61,7 @@ Database roles remain the final read-only permission boundary.
 
 ## Routing and pinning
 
-DBProxy parses exactly one PostgreSQL statement per simple-query message.
+DBProxy parses exactly one PostgreSQL statement per simple or extended query.
 Ordinary reads use a healthy replica, selected from the lowest pool-pressure
 band while preserving configured weights. Writes, `SELECT ... FOR UPDATE`,
 transaction control, and the read-after-write window use the primary.
@@ -75,19 +78,32 @@ session pin can never move to another shard.
 
 ## Compatibility contract
 
-Transaction mode currently supports the simple-query protocol and emits text
-result columns. It intentionally fails closed on multiple statements or SQL it
-cannot classify safely. Use transparent mode for:
+Simple-query results use PostgreSQL text columns. Extended queries preserve
+text/binary formats for booleans, signed integers, floating point, text,
+`bytea`, OID/char, JSON/JSONB, numeric, date, time, timestamp, and timestamp with
+time zone. Named prepared statements are owned by the frontend session and
+re-prepared on the selected pooled connection; backend prepared state is never
+leaked between clients. It intentionally fails closed on multiple statements,
+SQL it cannot classify safely, or types it cannot encode without loss.
 
-- extended queries and prepared portals;
-- binary or extension-specific type fidelity;
+Use transparent mode for:
+
+- custom, array, UUID, interval, network, geometric, or extension-specific
+  parameter/result types;
 - `COPY` and very large streaming results;
 - notices, asynchronous notifications, and workloads that rely on arbitrary
   session state.
 
+Terminated results are incrementally read from PostgreSQL but buffered only up
+to `max_result_rows` and `max_result_bytes` before they are exposed to the
+frontend. Exceeding either bound fails closed and the connection must pass reset
+before reuse. Use transparent mode for genuinely large streaming results.
+
 Cancellation closes an in-flight pooled backend connection, preventing a
 possibly still-running operation from being reused. Backend timeouts behave the
-same way.
+same way. If a pinned transaction or session loses its backend, the frontend is
+poisoned and must reconnect; DBProxy never pretends that lost session state was
+replayed.
 
 ## Operations
 

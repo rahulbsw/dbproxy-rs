@@ -19,7 +19,7 @@ Completed:
   weighted backend selection, COPY/extended-protocol preservation, cancellation
   broadcast, unsharded end-to-end TLS, optional authenticated SQL readiness
   with verified TLS or mTLS, transport health, and metrics
-- opt-in PostgreSQL/TimescaleDB simple-query termination with frontend
+- opt-in PostgreSQL/TimescaleDB simple/common-extended termination with frontend
   authentication/TLS, independently verified backend TLS, bounded transaction
   pools, SQL read/write routing, transaction/session pinning, post-write
   consistency, cancellation, and per-pool pressure metrics

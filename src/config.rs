@@ -164,6 +164,8 @@ pub struct PostgresConfig {
     pub pool_acquire_timeout_seconds: u64,
     pub pool_max_per_backend: usize,
     pub read_after_write_seconds: u64,
+    pub max_result_rows: usize,
+    pub max_result_bytes: usize,
     pub shutdown_grace_seconds: u64,
     pub fallback_to_primary: bool,
     pub relay_buffer_bytes: usize,
@@ -190,6 +192,8 @@ impl Default for PostgresConfig {
             pool_acquire_timeout_seconds: 5,
             pool_max_per_backend: 32,
             read_after_write_seconds: 2,
+            max_result_rows: 100_000,
+            max_result_bytes: 64 * 1024 * 1024,
             shutdown_grace_seconds: 10,
             fallback_to_primary: true,
             relay_buffer_bytes: default_relay_buffer_bytes(),
@@ -1344,6 +1348,8 @@ impl Config {
             || self.postgres.query_timeout_seconds == 0
             || self.postgres.pool_acquire_timeout_seconds == 0
             || self.postgres.pool_max_per_backend == 0
+            || self.postgres.max_result_rows == 0
+            || self.postgres.max_result_bytes == 0
             || self.postgres.shutdown_grace_seconds == 0
         {
             return Err(ProxyError::Config(
@@ -2593,6 +2599,8 @@ mod tests {
             PostgresRoutingMode::Transparent
         );
         assert_eq!(PostgresConfig::default().relay_buffer_bytes, 32 * 1024);
+        assert_eq!(PostgresConfig::default().max_result_rows, 100_000);
+        assert_eq!(PostgresConfig::default().max_result_bytes, 64 * 1024 * 1024);
         assert_eq!(RedisConfig::default().relay_buffer_bytes, 32 * 1024);
         assert_eq!(WriteFanoutConfig::default().max_concurrency, 8);
     }

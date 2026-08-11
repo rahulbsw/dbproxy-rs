@@ -8,7 +8,8 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures_util::{Sink, stream};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
+use futures_util::{Sink, StreamExt, stream};
 use pgwire::{
     api::{
         ClientInfo, ConnectionManager, PgWireServerHandlers, Type,
@@ -17,13 +18,19 @@ use pgwire::{
             md5pass::{Md5PasswordAuthStartupHandler, hash_md5_password},
         },
         cancel::CancelHandler,
-        query::SimpleQueryHandler,
-        results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag},
+        portal::Portal,
+        query::{ExtendedQueryHandler, SimpleQueryHandler},
+        results::{
+            DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
+            FieldInfo, QueryResponse, Response, Tag,
+        },
+        stmt::{NoopQueryParser, StoredStatement},
     },
     error::{ErrorInfo, PgWireError, PgWireResult},
     messages::{PgWireBackendMessage, PgWireFrontendMessage, cancel::CancelRequest},
     tokio::process_socket,
 };
+use rust_decimal::Decimal;
 use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
 use tokio::{
     net::TcpListener,
@@ -31,7 +38,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
     time,
 };
-use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
+use tokio_postgres::{Client, NoTls, Row, SimpleQueryMessage, types::ToSql};
 use tracing::{debug, warn};
 
 use super::{PostgresBackend, PostgresBackendManager, PostgresEndpoint, PostgresServeOptions};
@@ -257,6 +264,7 @@ struct TerminatedSession {
     session_pinned: bool,
     transaction_active: bool,
     last_write: Option<Instant>,
+    poisoned: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -274,6 +282,7 @@ struct TerminatingQueryHandler {
     metrics: Arc<Metrics>,
     config: PostgresConfig,
     shard_router: ProtocolShardRouter,
+    parser: Arc<NoopQueryParser>,
 }
 
 #[derive(Debug)]
@@ -356,6 +365,10 @@ impl PgWireServerHandlers for TerminatingHandlers {
         self.auth.clone()
     }
 
+    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
+        self.query.clone()
+    }
+
     fn cancel_handler(&self) -> Arc<impl CancelHandler> {
         self.cancel.clone()
     }
@@ -414,6 +427,7 @@ pub(super) async fn serve(
         manager,
         metrics: metrics.clone(),
         shard_router: ProtocolShardRouter::new(&config.sharding),
+        parser: Arc::new(NoopQueryParser),
         config: config.clone(),
     });
     let users = Arc::new(options.users.clone());
@@ -477,6 +491,36 @@ pub(super) async fn serve(
     }
 }
 
+impl TerminatingQueryHandler {
+    fn validated_shard<C>(&self, client: &C) -> PgWireResult<String>
+    where
+        C: ClientInfo,
+    {
+        let shard = terminated_shard(
+            client,
+            &self.config,
+            &self.shard_router,
+            &self.manager.default_shard,
+        )?;
+        if let Some(requested_database) = client.metadata().get("database") {
+            let configured_database = &self
+                .manager
+                .shards
+                .get(&shard)
+                .ok_or_else(|| user_error("22023", "unknown PostgreSQL shard"))?
+                .primary
+                .database;
+            if requested_database != configured_database {
+                return Err(user_error(
+                    "3D000",
+                    "requested database is not configured for this DBProxy shard",
+                ));
+            }
+        }
+        Ok(shard)
+    }
+}
+
 #[async_trait]
 impl SimpleQueryHandler for TerminatingQueryHandler {
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
@@ -500,16 +544,17 @@ impl SimpleQueryHandler for TerminatingQueryHandler {
                 "write or session-state statement rejected on the read-only listener",
             ));
         }
-        let shard = terminated_shard(
-            client,
-            &self.config,
-            &self.shard_router,
-            &self.manager.default_shard,
-        )?;
+        let shard = self.validated_shard(client)?;
         let state = client
             .session_extensions()
             .get_or_insert_with(|| Mutex::new(TerminatedSession::default()));
         let mut state = state.lock().await;
+        if state.poisoned {
+            return Err(user_error(
+                "08007",
+                "PostgreSQL pinned session lost its backend connection; reconnect the client",
+            ));
+        }
         if state
             .pinned_shard
             .as_deref()
@@ -520,22 +565,6 @@ impl SimpleQueryHandler for TerminatingQueryHandler {
                 "PostgreSQL session is pinned to a different shard",
             ));
         }
-        if let Some(requested_database) = client.metadata().get("database") {
-            let configured_database = &self
-                .manager
-                .shards
-                .get(&shard)
-                .ok_or_else(|| user_error("22023", "unknown PostgreSQL shard"))?
-                .primary
-                .database;
-            if requested_database != configured_database {
-                return Err(user_error(
-                    "3D000",
-                    "requested database is not configured for this DBProxy shard",
-                ));
-            }
-        }
-
         let consistency_window_active = state.last_write.is_some_and(|last_write| {
             last_write.elapsed() < Duration::from_secs(self.config.read_after_write_seconds)
         });
@@ -578,16 +607,29 @@ impl SimpleQueryHandler for TerminatingQueryHandler {
                 if was_pinned && error.as_db_error().is_some() {
                     state.pinned = Some((backend, connection));
                     state.pinned_shard = Some(shard);
+                } else if was_pinned {
+                    state.poisoned = true;
+                    state.pinned = None;
+                    state.pinned_shard = None;
                 }
                 return Err(postgres_error(error));
             }
             Err(_) => {
+                if was_pinned || state.session_pinned || state.transaction_active {
+                    state.poisoned = true;
+                }
                 state.pinned = None;
                 state.pinned_shard = None;
                 return Err(user_error("57014", "PostgreSQL backend query timed out"));
             }
         };
-        let response = encode_simple_response(messages, kind, query)?;
+        let response = encode_simple_response(
+            messages,
+            kind,
+            query,
+            self.config.max_result_rows,
+            self.config.max_result_bytes,
+        )?;
         if kind == StatementKind::Write {
             state.last_write = Some(Instant::now());
         }
@@ -626,6 +668,534 @@ impl SimpleQueryHandler for TerminatingQueryHandler {
         }
         Ok(vec![response])
     }
+}
+
+#[async_trait]
+impl ExtendedQueryHandler for TerminatingQueryHandler {
+    type Statement = String;
+    type QueryParser = NoopQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        self.parser.clone()
+    }
+
+    async fn do_describe_statement<C>(
+        &self,
+        client: &mut C,
+        target: &StoredStatement<Self::Statement>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo
+            + pgwire::api::ClientPortalStore
+            + Sink<PgWireBackendMessage>
+            + Unpin
+            + Send
+            + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let (parameters, fields) = self
+            .describe_extended(client, &target.statement, None)
+            .await?;
+        Ok(DescribeStatementResponse::new(parameters, fields))
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        client: &mut C,
+        target: &Portal<Self::Statement>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo
+            + pgwire::api::ClientPortalStore
+            + Sink<PgWireBackendMessage>
+            + Unpin
+            + Send
+            + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let (_, fields) = self
+            .describe_extended(
+                client,
+                &target.statement.statement,
+                Some(&target.result_column_format),
+            )
+            .await?;
+        Ok(DescribePortalResponse::new(fields))
+    }
+
+    async fn do_query<C>(
+        &self,
+        client: &mut C,
+        portal: &Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo
+            + pgwire::api::ClientPortalStore
+            + Sink<PgWireBackendMessage>
+            + Unpin
+            + Send
+            + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        self.execute_extended(client, portal).await
+    }
+}
+
+impl TerminatingQueryHandler {
+    async fn describe_extended<C>(
+        &self,
+        client: &C,
+        query: &str,
+        format: Option<&pgwire::api::portal::Format>,
+    ) -> PgWireResult<(Vec<Type>, Vec<FieldInfo>)>
+    where
+        C: ClientInfo,
+    {
+        classify_statement(query).inspect_err(|_| {
+            self.metrics.postgres_statement_routing_failed();
+        })?;
+        let shard = self.validated_shard(client)?;
+        let (connection, backend) = self
+            .manager
+            .checkout_sql(
+                PostgresEndpoint::ReadWrite,
+                Some(&shard),
+                &self.config,
+                &self.metrics,
+            )
+            .await
+            .map_err(proxy_error)?;
+        let prepared = time::timeout(
+            Duration::from_secs(self.config.query_timeout_seconds),
+            connection.client.prepare(query),
+        )
+        .await;
+        let metadata = match prepared {
+            Ok(Ok(statement)) => Ok((
+                statement.params().to_vec(),
+                statement
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| {
+                        FieldInfo::new(
+                            column.name().to_owned(),
+                            None,
+                            None,
+                            column.type_().clone(),
+                            format.map_or(FieldFormat::Text, |format| format.format_for(index)),
+                        )
+                    })
+                    .collect(),
+            )),
+            Ok(Err(error)) => Err(postgres_error(error)),
+            Err(_) => Err(user_error("57014", "PostgreSQL backend describe timed out")),
+        };
+        backend.release_sql(connection).await;
+        metadata
+    }
+
+    async fn execute_extended<C>(
+        &self,
+        client: &C,
+        portal: &Portal<String>,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo,
+    {
+        self.metrics.postgres_terminated_query();
+        self.metrics.postgres_extended_query();
+        let query = &portal.statement.statement;
+        let kind = classify_statement(query).inspect_err(|_| {
+            self.metrics.postgres_statement_routing_failed();
+        })?;
+        if self.endpoint == PostgresEndpoint::ReadOnly
+            && matches!(kind, StatementKind::Write | StatementKind::Session)
+        {
+            self.metrics.postgres_read_only_rejected();
+            return Err(user_error(
+                "25006",
+                "write or session-state statement rejected on the read-only listener",
+            ));
+        }
+        let shard = self.validated_shard(client)?;
+        let state = client
+            .session_extensions()
+            .get_or_insert_with(|| Mutex::new(TerminatedSession::default()));
+        let mut state = state.lock().await;
+        if state.poisoned {
+            return Err(user_error(
+                "08007",
+                "PostgreSQL pinned session lost its backend connection; reconnect the client",
+            ));
+        }
+        if state
+            .pinned_shard
+            .as_deref()
+            .is_some_and(|pinned| pinned != shard)
+        {
+            return Err(user_error(
+                "25000",
+                "PostgreSQL session is pinned to a different shard",
+            ));
+        }
+        let consistency_window_active = state.last_write.is_some_and(|last_write| {
+            last_write.elapsed() < Duration::from_secs(self.config.read_after_write_seconds)
+        });
+        let route = if matches!(kind, StatementKind::Read)
+            && state.pinned.is_none()
+            && !consistency_window_active
+        {
+            PostgresEndpoint::ReadOnly
+        } else {
+            PostgresEndpoint::ReadWrite
+        };
+        let was_pinned = state.pinned.is_some();
+        let acquired = if was_pinned {
+            None
+        } else {
+            Some(
+                self.manager
+                    .checkout_sql(route, Some(&shard), &self.config, &self.metrics)
+                    .await
+                    .map_err(proxy_error)?,
+            )
+        };
+        let (backend, connection) = match acquired {
+            Some((connection, backend)) => (backend, connection),
+            None => state.pinned.take().expect("pinned connection exists"),
+        };
+        match backend.role {
+            crate::config::BackendRole::Primary => self.metrics.postgres_query_primary(),
+            crate::config::BackendRole::Replica => self.metrics.postgres_query_replica(),
+        }
+
+        let execution = time::timeout(
+            Duration::from_secs(self.config.query_timeout_seconds),
+            execute_portal(
+                &connection.client,
+                portal,
+                kind,
+                query,
+                self.config.max_result_rows,
+                self.config.max_result_bytes,
+            ),
+        )
+        .await;
+        let response = match execution {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                if was_pinned && !connection.client.is_closed() {
+                    state.pinned = Some((backend, connection));
+                    state.pinned_shard = Some(shard);
+                } else if was_pinned {
+                    state.poisoned = true;
+                    state.pinned = None;
+                    state.pinned_shard = None;
+                } else {
+                    backend.release_sql(connection).await;
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                if was_pinned || state.session_pinned || state.transaction_active {
+                    state.poisoned = true;
+                }
+                state.pinned = None;
+                state.pinned_shard = None;
+                return Err(user_error("57014", "PostgreSQL backend query timed out"));
+            }
+        };
+        if kind == StatementKind::Write {
+            state.last_write = Some(Instant::now());
+        }
+        match kind {
+            StatementKind::TransactionStart => {
+                self.metrics.postgres_transaction_pin();
+                state.pinned = Some((backend, connection));
+                state.pinned_shard = Some(shard);
+                state.transaction_active = true;
+            }
+            StatementKind::TransactionEnd => {
+                state.transaction_active = false;
+                if state.session_pinned {
+                    state.pinned = Some((backend, connection));
+                    state.pinned_shard = Some(shard);
+                } else {
+                    state.pinned = None;
+                    state.pinned_shard = None;
+                    backend.release_sql(connection).await;
+                }
+            }
+            StatementKind::Session => {
+                self.metrics.postgres_session_pin();
+                state.pinned = Some((backend, connection));
+                state.pinned_shard = Some(shard);
+                state.session_pinned = true;
+            }
+            StatementKind::Read | StatementKind::Write
+                if was_pinned || state.session_pinned || state.transaction_active =>
+            {
+                state.pinned = Some((backend, connection));
+                state.pinned_shard = Some(shard);
+            }
+            StatementKind::Read | StatementKind::Write => backend.release_sql(connection).await,
+        }
+        Ok(response)
+    }
+}
+
+async fn execute_portal(
+    client: &Client,
+    portal: &Portal<String>,
+    kind: StatementKind,
+    query: &str,
+    max_result_rows: usize,
+    max_result_bytes: usize,
+) -> PgWireResult<Response> {
+    let statement = client.prepare(query).await.map_err(postgres_error)?;
+    let parameters = decode_portal_parameters(portal, statement.params())?;
+    let parameter_refs = parameters
+        .iter()
+        .map(|parameter| parameter.as_ref() as &(dyn ToSql + Sync))
+        .collect::<Vec<_>>();
+    if statement.columns().is_empty() {
+        let affected = client
+            .execute(&statement, &parameter_refs)
+            .await
+            .map_err(postgres_error)?;
+        let command = command_name_from_sql(query);
+        let tag = if command == "INSERT" {
+            Tag::new(&command).with_oid(0).with_rows(affected as usize)
+        } else {
+            Tag::new(&command).with_rows(affected as usize)
+        };
+        return Ok(match kind {
+            StatementKind::TransactionStart => Response::TransactionStart(tag),
+            StatementKind::TransactionEnd => Response::TransactionEnd(tag),
+            _ => Response::Execution(tag),
+        });
+    }
+    let rows = client
+        .query_raw(&statement, parameter_refs)
+        .await
+        .map_err(postgres_error)?;
+    encode_extended_response(
+        rows,
+        statement.columns(),
+        portal,
+        query,
+        max_result_rows,
+        max_result_bytes,
+    )
+    .await
+}
+
+type ExtendedParameter = Box<dyn ToSql + Sync + Send>;
+
+fn decode_portal_parameters(
+    portal: &Portal<String>,
+    types: &[Type],
+) -> PgWireResult<Vec<ExtendedParameter>> {
+    if portal.parameter_len() != types.len() {
+        return Err(user_error(
+            "08P01",
+            "extended-query parameter count does not match backend metadata",
+        ));
+    }
+    types
+        .iter()
+        .enumerate()
+        .map(|(index, data_type)| {
+            macro_rules! parameter {
+                ($rust_type:ty) => {{
+                    let value = portal.parameter::<$rust_type>(index, data_type)?;
+                    Ok(Box::new(value) as ExtendedParameter)
+                }};
+            }
+            if data_type == &Type::BOOL {
+                parameter!(bool)
+            } else if data_type == &Type::INT2 {
+                parameter!(i16)
+            } else if data_type == &Type::INT4 {
+                parameter!(i32)
+            } else if data_type == &Type::INT8 {
+                parameter!(i64)
+            } else if data_type == &Type::FLOAT4 {
+                parameter!(f32)
+            } else if data_type == &Type::FLOAT8 {
+                parameter!(f64)
+            } else if matches!(
+                *data_type,
+                Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN
+            ) {
+                parameter!(String)
+            } else if data_type == &Type::BYTEA {
+                parameter!(Vec<u8>)
+            } else if data_type == &Type::OID {
+                parameter!(u32)
+            } else if data_type == &Type::CHAR {
+                parameter!(i8)
+            } else if matches!(*data_type, Type::JSON | Type::JSONB) {
+                parameter!(serde_json::Value)
+            } else if data_type == &Type::NUMERIC {
+                parameter!(Decimal)
+            } else if data_type == &Type::DATE {
+                parameter!(NaiveDate)
+            } else if data_type == &Type::TIME {
+                parameter!(NaiveTime)
+            } else if data_type == &Type::TIMESTAMP {
+                parameter!(NaiveDateTime)
+            } else if data_type == &Type::TIMESTAMPTZ {
+                parameter!(DateTime<FixedOffset>)
+            } else {
+                Err(user_error(
+                    "0A000",
+                    &format!(
+                        "extended-query parameter type {} is not supported in transaction mode",
+                        data_type.name()
+                    ),
+                ))
+            }
+        })
+        .collect()
+}
+
+async fn encode_extended_response<S>(
+    rows: S,
+    columns: &[tokio_postgres::Column],
+    portal: &Portal<String>,
+    query: &str,
+    max_result_rows: usize,
+    max_result_bytes: usize,
+) -> PgWireResult<Response>
+where
+    S: futures_util::Stream<Item = Result<Row, tokio_postgres::Error>>,
+{
+    let schema = Arc::new(
+        columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                FieldInfo::new(
+                    column.name().to_owned(),
+                    None,
+                    None,
+                    column.type_().clone(),
+                    portal.result_column_format.format_for(index),
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut encoded = Vec::new();
+    let mut encoded_bytes = 0_usize;
+    let mut rows = Box::pin(rows);
+    while let Some(row) = rows.next().await {
+        let row = row.map_err(postgres_error)?;
+        if encoded.len() >= max_result_rows {
+            return Err(user_error(
+                "54000",
+                "PostgreSQL result exceeds postgres.max_result_rows",
+            ));
+        }
+        let mut encoder = DataRowEncoder::new(schema.clone());
+        for (index, column) in row.columns().iter().enumerate() {
+            encode_extended_field(&mut encoder, &row, index, column.type_())?;
+        }
+        let encoded_row = encoder.take_row();
+        encoded_bytes = encoded_bytes.saturating_add(encoded_row.data.len());
+        if encoded_bytes > max_result_bytes {
+            return Err(user_error(
+                "54000",
+                "PostgreSQL result exceeds postgres.max_result_bytes",
+            ));
+        }
+        encoded.push(Ok(encoded_row));
+    }
+    let mut response = QueryResponse::new(schema, stream::iter(encoded));
+    let command = command_name_from_sql(query);
+    response.set_command_tag(if command == "INSERT" {
+        "INSERT 0"
+    } else {
+        &command
+    });
+    Ok(Response::Query(response))
+}
+
+fn encode_extended_field(
+    encoder: &mut DataRowEncoder,
+    row: &Row,
+    index: usize,
+    data_type: &Type,
+) -> PgWireResult<()> {
+    macro_rules! field {
+        ($rust_type:ty) => {{
+            let value = row
+                .try_get::<_, Option<$rust_type>>(index)
+                .map_err(postgres_error)?;
+            encoder.encode_field(&value)
+        }};
+    }
+    if data_type == &Type::BOOL {
+        field!(bool)
+    } else if data_type == &Type::INT2 {
+        field!(i16)
+    } else if data_type == &Type::INT4 {
+        field!(i32)
+    } else if data_type == &Type::INT8 {
+        field!(i64)
+    } else if data_type == &Type::FLOAT4 {
+        field!(f32)
+    } else if data_type == &Type::FLOAT8 {
+        field!(f64)
+    } else if matches!(
+        *data_type,
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN
+    ) {
+        field!(String)
+    } else if data_type == &Type::BYTEA {
+        field!(Vec<u8>)
+    } else if data_type == &Type::OID {
+        field!(u32)
+    } else if data_type == &Type::CHAR {
+        field!(i8)
+    } else if matches!(*data_type, Type::JSON | Type::JSONB) {
+        field!(serde_json::Value)
+    } else if data_type == &Type::NUMERIC {
+        field!(Decimal)
+    } else if data_type == &Type::DATE {
+        field!(NaiveDate)
+    } else if data_type == &Type::TIME {
+        field!(NaiveTime)
+    } else if data_type == &Type::TIMESTAMP {
+        field!(NaiveDateTime)
+    } else if data_type == &Type::TIMESTAMPTZ {
+        field!(DateTime<FixedOffset>)
+    } else {
+        Err(user_error(
+            "0A000",
+            &format!(
+                "extended-query result type {} is not supported in transaction mode",
+                data_type.name()
+            ),
+        ))
+    }
+}
+
+fn command_name_from_sql(query: &str) -> String {
+    query
+        .split_whitespace()
+        .next()
+        .unwrap_or("OK")
+        .trim_end_matches(';')
+        .to_ascii_uppercase()
 }
 
 impl PostgresBackendManager {
@@ -688,7 +1258,36 @@ fn classify_statement(query: &str) -> PgWireResult<StatementKind> {
         ));
     };
     let normalized = query.to_ascii_uppercase();
+    if matches!(statement, Statement::Copy { .. }) {
+        return Err(user_error(
+            "0A000",
+            "COPY requires postgres.routing_mode = \"transparent\"",
+        ));
+    }
+    if matches!(
+        statement,
+        Statement::LISTEN { .. } | Statement::UNLISTEN { .. } | Statement::NOTIFY { .. }
+    ) {
+        return Err(user_error(
+            "0A000",
+            "LISTEN/NOTIFY requires postgres.routing_mode = \"transparent\"",
+        ));
+    }
     Ok(match statement {
+        Statement::Query(_)
+            if normalized.contains("NEXTVAL(") || normalized.contains("SETVAL(") =>
+        {
+            StatementKind::Write
+        }
+        Statement::Query(_)
+            if normalized.contains("PG_ADVISORY_")
+                || normalized.contains("CURRVAL(")
+                || normalized.contains("LASTVAL(")
+                || normalized.contains("PG_BACKEND_PID(")
+                || normalized.contains(" INTO TEMP") =>
+        {
+            StatementKind::Session
+        }
         Statement::Query(_)
             if !normalized.contains(" FOR UPDATE") && !normalized.contains(" FOR SHARE") =>
         {
@@ -700,12 +1299,14 @@ fn classify_statement(query: &str) -> PgWireResult<StatementKind> {
             savepoint: None, ..
         } => StatementKind::TransactionEnd,
         Statement::Set(_)
-        | Statement::LISTEN { .. }
-        | Statement::UNLISTEN { .. }
-        | Statement::NOTIFY { .. }
+        | Statement::Reset(_)
+        | Statement::Discard { .. }
+        | Statement::Prepare { .. }
+        | Statement::Deallocate { .. }
         | Statement::Declare { .. }
         | Statement::Fetch { .. }
         | Statement::Close { .. } => StatementKind::Session,
+        Statement::CreateTable(table) if table.temporary => StatementKind::Session,
         _ => StatementKind::Write,
     })
 }
@@ -744,6 +1345,8 @@ fn encode_simple_response(
     messages: Vec<SimpleQueryMessage>,
     kind: StatementKind,
     query: &str,
+    max_result_rows: usize,
+    max_result_bytes: usize,
 ) -> PgWireResult<Response> {
     let command = query
         .split_whitespace()
@@ -753,6 +1356,7 @@ fn encode_simple_response(
         .to_ascii_uppercase();
     let mut schema = None::<Arc<Vec<FieldInfo>>>;
     let mut rows = Vec::new();
+    let mut result_bytes = 0_usize;
     let mut affected = 0_u64;
     for message in messages {
         match message {
@@ -773,12 +1377,27 @@ fn encode_simple_response(
                 ));
             }
             SimpleQueryMessage::Row(row) => {
+                if rows.len() >= max_result_rows {
+                    return Err(user_error(
+                        "54000",
+                        "PostgreSQL result exceeds postgres.max_result_rows",
+                    ));
+                }
                 let row_schema = schema.clone().ok_or_else(|| {
                     user_error("XX000", "backend row arrived without a row description")
                 })?;
                 let mut encoder = DataRowEncoder::new(row_schema);
                 for index in 0..row.len() {
-                    encoder.encode_field(&row.get(index))?;
+                    let value = row.get(index);
+                    result_bytes =
+                        result_bytes.saturating_add(value.map_or(0, |value| value.len()));
+                    if result_bytes > max_result_bytes {
+                        return Err(user_error(
+                            "54000",
+                            "PostgreSQL result exceeds postgres.max_result_bytes",
+                        ));
+                    }
+                    encoder.encode_field(&value)?;
                 }
                 rows.push(Ok(encoder.take_row()));
             }
@@ -835,7 +1454,12 @@ mod tests {
     use futures_util::stream;
     use pgwire::api::{
         auth::noop::NoopStartupHandler,
-        results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse},
+        query::ExtendedQueryHandler,
+        results::{
+            DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
+            FieldInfo, QueryResponse,
+        },
+        stmt::{NoopQueryParser, StoredStatement},
     };
     use tokio::net::TcpListener;
 
@@ -854,6 +1478,20 @@ mod tests {
             classify_statement("SET search_path = app").unwrap(),
             StatementKind::Session
         );
+        assert_eq!(
+            classify_statement("CREATE TEMP TABLE work (id int)").unwrap(),
+            StatementKind::Session
+        );
+        assert_eq!(
+            classify_statement("SELECT pg_advisory_lock(42)").unwrap(),
+            StatementKind::Session
+        );
+        assert_eq!(
+            classify_statement("SELECT nextval('orders_id_seq')").unwrap(),
+            StatementKind::Write
+        );
+        assert!(classify_statement("LISTEN events").is_err());
+        assert!(classify_statement("COPY events TO STDOUT").is_err());
         assert!(classify_statement("SELECT 1; SELECT 2").is_err());
     }
 
@@ -899,6 +1537,132 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ExtendedQueryHandler for TestBackend {
+        type Statement = String;
+        type QueryParser = NoopQueryParser;
+
+        fn query_parser(&self) -> Arc<Self::QueryParser> {
+            Arc::new(NoopQueryParser)
+        }
+
+        async fn do_describe_statement<C>(
+            &self,
+            _client: &mut C,
+            _target: &StoredStatement<Self::Statement>,
+        ) -> PgWireResult<DescribeStatementResponse>
+        where
+            C: ClientInfo
+                + pgwire::api::ClientPortalStore
+                + Sink<PgWireBackendMessage>
+                + Unpin
+                + Send
+                + Sync,
+            C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+            C::Error: std::fmt::Debug,
+            PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+        {
+            Ok(DescribeStatementResponse::new(
+                vec![Type::INT4],
+                vec![
+                    FieldInfo::new(
+                        "marker".to_owned(),
+                        None,
+                        None,
+                        Type::TEXT,
+                        FieldFormat::Text,
+                    ),
+                    FieldInfo::new(
+                        "value".to_owned(),
+                        None,
+                        None,
+                        Type::INT4,
+                        FieldFormat::Text,
+                    ),
+                ],
+            ))
+        }
+
+        async fn do_describe_portal<C>(
+            &self,
+            _client: &mut C,
+            target: &Portal<Self::Statement>,
+        ) -> PgWireResult<DescribePortalResponse>
+        where
+            C: ClientInfo
+                + pgwire::api::ClientPortalStore
+                + Sink<PgWireBackendMessage>
+                + Unpin
+                + Send
+                + Sync,
+            C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+            C::Error: std::fmt::Debug,
+            PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+        {
+            Ok(DescribePortalResponse::new(vec![
+                FieldInfo::new(
+                    "marker".to_owned(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    target.result_column_format.format_for(0),
+                ),
+                FieldInfo::new(
+                    "value".to_owned(),
+                    None,
+                    None,
+                    Type::INT4,
+                    target.result_column_format.format_for(1),
+                ),
+            ]))
+        }
+
+        async fn do_query<C>(
+            &self,
+            _client: &mut C,
+            portal: &Portal<Self::Statement>,
+            _max_rows: usize,
+        ) -> PgWireResult<Response>
+        where
+            C: ClientInfo
+                + pgwire::api::ClientPortalStore
+                + Sink<PgWireBackendMessage>
+                + Unpin
+                + Send
+                + Sync,
+            C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+            C::Error: std::fmt::Debug,
+            PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+        {
+            let value = portal
+                .parameter::<i32>(0, &Type::INT4)?
+                .ok_or_else(|| user_error("22004", "test parameter cannot be null"))?;
+            let schema = Arc::new(vec![
+                FieldInfo::new(
+                    "marker".to_owned(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    portal.result_column_format.format_for(0),
+                ),
+                FieldInfo::new(
+                    "value".to_owned(),
+                    None,
+                    None,
+                    Type::INT4,
+                    portal.result_column_format.format_for(1),
+                ),
+            ]);
+            let mut encoder = DataRowEncoder::new(schema.clone());
+            encoder.encode_field(&self.marker)?;
+            encoder.encode_field(&value)?;
+            Ok(Response::Query(QueryResponse::new(
+                schema,
+                stream::iter(vec![Ok(encoder.take_row())]),
+            )))
+        }
+    }
+
     struct TestBackendHandlers {
         handler: Arc<TestBackend>,
     }
@@ -909,6 +1673,10 @@ mod tests {
         }
 
         fn startup_handler(&self) -> Arc<impl StartupHandler> {
+            self.handler.clone()
+        }
+
+        fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
             self.handler.clone()
         }
     }
@@ -1028,6 +1796,12 @@ mod tests {
             }),
             Some("replica")
         ));
+        let extended = client
+            .query_one("SELECT $1::int4", &[&7_i32])
+            .await
+            .unwrap();
+        assert_eq!(extended.get::<_, String>(0), "replica");
+        assert_eq!(extended.get::<_, i32>(1), 7);
         client.simple_query("BEGIN").await.unwrap();
         let pinned = client.simple_query("SELECT marker").await.unwrap();
         assert!(matches!(
@@ -1040,8 +1814,9 @@ mod tests {
         client.simple_query("COMMIT").await.unwrap();
 
         let metrics_text = metrics.encode_prometheus();
-        assert!(metrics_text.contains("dbproxy_postgres_queries_replica_total 1"));
+        assert!(metrics_text.contains("dbproxy_postgres_queries_replica_total 2"));
         assert!(metrics_text.contains("dbproxy_postgres_transaction_pins_total 1"));
+        assert!(metrics_text.contains("dbproxy_postgres_extended_queries_total 1"));
         let mut backend_metrics = String::new();
         manager.encode_prometheus(&mut backend_metrics);
         assert!(backend_metrics.contains("dbproxy_postgres_pool_checkouts_total"));

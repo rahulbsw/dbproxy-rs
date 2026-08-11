@@ -38,7 +38,7 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         name: "postgres_protocol_termination",
         status: CapabilityStatus::Constrained,
-        contract: "opt-in simple-query protocol termination with MD5 frontend authentication and independently verified backend TLS; use transparent mode for extended protocol and COPY",
+        contract: "opt-in simple and common-scalar extended-query termination with MD5 frontend authentication and independently verified backend TLS; use transparent mode for COPY and custom types",
     },
     Capability {
         name: "postgres_transaction_pooling",
@@ -48,7 +48,7 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         name: "postgres_statement_read_write_split",
         status: CapabilityStatus::Constrained,
-        contract: "single parsed simple-query statements route reads to replicas and writes to primaries with read-after-write consistency",
+        contract: "single parsed simple or extended statements route reads to replicas and writes to primaries with read-after-write consistency",
     },
     Capability {
         name: "postgres_connection_sharding",

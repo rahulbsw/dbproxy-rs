@@ -10,7 +10,7 @@ start. The focused guides below describe design and operating contracts.
 | [Architecture](architecture.md) | Listener, routing, pooling, consistency, failure, and security design |
 | [Operations and metrics](operations.md) | Health endpoints, Prometheus metrics, alerts, and capacity tuning |
 | [Protocol sharding](protocol-sharding.md) | PostgreSQL/TimescaleDB and Redis/Valkey hash, range, value, and command routing |
-| [PostgreSQL transaction pooling](postgres-pooling.md) | Terminated simple-query routing, pool reset, TLS, pinning, and compatibility contract |
+| [PostgreSQL transaction pooling](postgres-pooling.md) | Terminated simple/extended routing, pool reset, TLS, pinning, and compatibility contract |
 | [Redis/Valkey topology](redis-topology.md) | Sentinel quorum discovery and native Cluster slot/redirection routing |
 | [MySQL read-through cache](cache.md) | Redis/Valkey cache rules, consistency, invalidation, and failure behavior |
 | [MySQL XA fanout](mysql-xa.md) | Atomic fanout configuration, recovery, storage, and retry contract |

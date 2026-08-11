@@ -28,7 +28,7 @@ graduation criteria.
 | Protocol | Proxy behavior | Read/write routing | Sharding | Backend connection model |
 | --- | --- | --- | --- | --- |
 | MySQL | Protocol termination, authentication, TLS upgrade, SQL parsing, prepared statements | Statement-level with transaction and session affinity | Statement key or explicit shard hint; hash, range, and exact value | Independent bounded pool per configured backend |
-| PostgreSQL / TimescaleDB | Transparent wire relay, or opt-in simple-query termination with transaction pooling | Connection-level or statement-level read/write routing | Startup-key pinning; hash, range, and exact value | Transparent sessions or bounded per-backend pools |
+| PostgreSQL / TimescaleDB | Transparent wire relay, or opt-in simple/common-extended termination with transaction pooling | Connection-level or statement-level read/write routing | Startup-key pinning; hash, range, and exact value | Transparent sessions or bounded per-backend pools |
 | Redis / Valkey connection mode | Transparent RESP2/RESP3 relay | Separate read-write and read-only listeners | `DBPROXY.SHARD` connection pinning; hash, range, and exact value | One selected backend connection per client connection |
 | Redis / Valkey command mode | Bounded command parsing and proxy-side key placement | Command key and listener role | CRC16 hash tags or stable hash, range, and exact value; guarded multi-key fanout | One connection per used shard for each client session |
 
@@ -265,9 +265,9 @@ remains a backward-compatible alias. To override auto-detection, set
 PostgreSQL compatibility has two explicit modes. The default `transparent` mode
 does not decode or re-encode traffic, so drivers retain extended queries,
 binary and extension types, `COPY`, cancellation, notices, notifications, and
-TimescaleDB-specific messages. The opt-in `transaction` mode terminates the
-simple-query protocol to pool backend connections and route each safely parsed
-statement.
+TimescaleDB-specific messages. The opt-in `transaction` mode terminates simple
+queries and common-scalar extended queries to pool backend connections and
+route each safely parsed statement.
 
 ```toml
 [postgres]
@@ -281,6 +281,8 @@ query_timeout_seconds = 30
 pool_acquire_timeout_seconds = 5
 pool_max_per_backend = 32
 read_after_write_seconds = 2
+max_result_rows = 100000
+max_result_bytes = 67108864
 shutdown_grace_seconds = 10
 fallback_to_primary = true
 relay_buffer_bytes = 32768
@@ -341,10 +343,13 @@ connections, and routes read-only statements to the least-pressured healthy
 replica. Writes, transactions, unsafe session state, and the post-write
 consistency window use the shard primary. Transactions and session state pin a
 backend connection; released connections are reset with `ROLLBACK; DISCARD
-ALL`. This mode accepts exactly one parseable statement per simple-query
-message and rejects writes on the read-only listener. Extended queries, `COPY`,
-Pub/Sub-like `LISTEN` workflows, and extension/binary type fidelity should use
-transparent mode. See [PostgreSQL transaction pooling](docs/postgres-pooling.md).
+ALL`. This mode accepts exactly one parseable statement per simple or extended
+query and rejects writes on the read-only listener. Extended parameters and
+binary results support common scalar, JSON, numeric, and time types; prepared
+statements are re-prepared on the selected pooled backend. `COPY`, custom or
+array types, Pub/Sub-like `LISTEN` workflows, and unrestricted extension type
+fidelity should use transparent mode. See
+[PostgreSQL transaction pooling](docs/postgres-pooling.md).
 
 ## Redis and Valkey
 
@@ -595,9 +600,9 @@ recommendations.
 
 ## Current boundaries
 
-- PostgreSQL transaction mode currently supports the simple-query protocol;
-  extended query, prepared portals, `COPY`, and binary/extension result types
-  remain on transparent mode
+- PostgreSQL transaction mode supports simple queries and a bounded set of
+  extended-query scalar types. `COPY`, custom/array types, and very large
+  result streaming remain on transparent mode
 - PostgreSQL/TimescaleDB sharding is startup-selected. Transparent end-to-end TLS
   hides the selector; transaction mode can terminate frontend TLS and use a
   separately verified TLS or mTLS backend hop
