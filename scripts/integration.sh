@@ -49,4 +49,6 @@ if ! grep -Eq 'dbproxy_postgres_backend_sql_health_checks_total\{backend="timesc
 fi
 
 "${script_dir}/smoke.sh"
-cargo test --test docker_integration -- --ignored --nocapture
+# These tests intentionally share the live proxy, backing databases, and Redis
+# cache-version keys, so running them concurrently can corrupt version assertions.
+cargo test --test docker_integration -- --ignored --nocapture --test-threads=1
