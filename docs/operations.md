@@ -76,7 +76,8 @@ or measure replica lag.
 | TLS | `dbproxy_frontend_tls_upgrade_attempts_total`, `dbproxy_frontend_plaintext_rejections_total`, `dbproxy_backend_info{tls_mode}` |
 | Queries | `dbproxy_queries_total{kind}`, `dbproxy_queries_primary_total`, `dbproxy_queries_replica_total`, `dbproxy_query_successes_total`, `dbproxy_query_errors_total`, `dbproxy_query_timeouts_total`, `dbproxy_query_duration_seconds_*`, `dbproxy_sql_analysis_duration_seconds_*`, `dbproxy_sql_parse_fallbacks_total` |
 | Results | `dbproxy_rows_returned_total`, `dbproxy_rows_affected_total`, `dbproxy_result_bytes_total`, `dbproxy_streaming_result_sets_total` |
-| Cache | `dbproxy_cache_hits_total`, `dbproxy_cache_misses_total`, `dbproxy_cache_bypasses_total`, `dbproxy_cache_errors_total`, fill/rejection/invalidation/singleflight totals, and `dbproxy_cache_bytes_served_total` |
+| Cache | `dbproxy_cache_hits_total`, `dbproxy_cache_misses_total`, `dbproxy_cache_bypasses_total`, `dbproxy_cache_errors_total`, fill/rejection/invalidation/local and distributed singleflight/refresh totals, and `dbproxy_cache_bytes_served_total` |
+| Query registry | `dbproxy_query_registry_entries`, `dbproxy_query_registry_evictions_total`, and retained `dbproxy_query_registry_calls{cache_status=...}`; query IDs are never metric labels |
 | Runtime config | `dbproxy_config_epoch`, `dbproxy_config_reload_successes_total`, `dbproxy_config_reload_failures_total`, `dbproxy_config_poll_failures_total` |
 | Routing | `dbproxy_replica_fallbacks_total`, `dbproxy_shard_routing_failures_total` |
 | Fanout | `dbproxy_write_fanout_attempts_total`, `dbproxy_write_fanout_successes_total`, `dbproxy_write_fanout_failures_total`, `dbproxy_write_fanout_timeouts_total` |

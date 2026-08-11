@@ -74,6 +74,8 @@ curl --fail http://127.0.0.1:6071/readyz
 curl --fail http://127.0.0.1:6071/backends
 curl --fail http://127.0.0.1:6071/postgres/backends
 curl --fail http://127.0.0.1:6071/redis/backends
+curl --fail http://127.0.0.1:6071/queries
+curl --fail http://127.0.0.1:6071/cache/candidates
 curl --fail http://127.0.0.1:6071/metrics
 ```
 

@@ -189,6 +189,12 @@ max_value_bytes = 1048576
 # Cache failures bypass Redis and read from MySQL. Set false only when the cache
 # is a required service dependency.
 fail_open = true
+# Optional cluster-wide miss coalescing. The lease is stored in the same
+# Redis/Valkey service and is always expiry-bounded.
+distributed_singleflight = false
+fill_lease_milliseconds = 2000
+fill_wait_milliseconds = 250
+fill_poll_milliseconds = 10
 
 # Rules are explicit: arbitrary SELECT statements are never cached globally.
 # [[cache.rules]]
@@ -196,6 +202,9 @@ fail_open = true
 # ttl_seconds = 30
 # negative_ttl_seconds = 5
 # ttl_jitter_percent = 10
+# Set above zero to synchronously refresh near-expiry entries. Other DBProxy
+# instances serve the still-valid value while the lease owner refreshes it.
+# refresh_ahead_seconds = 5
 # max_rows = 1000
 # max_bytes = 1048576
 

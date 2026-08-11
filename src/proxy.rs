@@ -42,7 +42,7 @@ use crate::{
     admin,
     auth::{verify_caching_sha2_password, verify_native_password},
     backend::{Backend, BackendManager, BackendQueryOutcome},
-    cache::{CacheManager, CacheScope, CachedResult},
+    cache::{CacheManager, CacheRead, CacheScope, CachedResult},
     classifier::{
         MysqlTransactionEvaluation, MysqlTransactionSemantics, QueryKind, SqlAnalysis,
         SqlClassifier,
@@ -53,6 +53,7 @@ use crate::{
     metrics::Metrics,
     operation_id,
     postgres::{self, PostgresBackendManager, PostgresEndpoint},
+    query_registry::{CacheOutcome, CacheStatus, QueryIdentity},
     redis::{self, RedisBackendManager, RedisEndpoint},
     routing::{RouteTarget, SessionState},
     sharding::{
@@ -929,6 +930,7 @@ struct PreparedStatement {
     atomic_dml: bool,
     mysql_transaction_semantics: MysqlTransactionSemantics,
     columns: Vec<Column>,
+    query_identity: QueryIdentity,
     routing_statements: Option<Vec<sqlparser::ast::Statement>>,
 }
 
@@ -1680,30 +1682,50 @@ impl ProxySession {
     async fn cache_lookup(
         &self,
         query: &str,
+        query_id: &str,
         decision: &ShardDecision,
         route: RouteTarget,
         kind: QueryKind,
     ) -> Result<Option<CacheLookup>, ProxyError> {
-        let Some(manager) = &self.cache else {
-            return Ok(None);
+        let status = if kind != QueryKind::Read {
+            CacheStatus::NotRead
+        } else if decision.table.is_none() {
+            CacheStatus::MissingTable
+        } else if route != RouteTarget::Replica {
+            CacheStatus::PrimaryOrPinnedRoute
+        } else if self.config.proxy.result_mode != ResultMode::Buffered {
+            CacheStatus::StreamingResultMode
+        } else if decision.table_count != 1 {
+            CacheStatus::MultipleTables
+        } else if !cache_safe_sql(query) {
+            CacheStatus::VolatileOrSessionDependent
+        } else if self.cache.is_none() {
+            CacheStatus::CacheDisabled
+        } else if self.cache.as_ref().is_some_and(|manager| {
+            decision
+                .table
+                .as_deref()
+                .is_some_and(|table| manager.rule(table).is_none())
+        }) {
+            CacheStatus::TableNotConfigured
+        } else {
+            CacheStatus::Eligible
         };
-        let Some(table) = decision.table.as_deref() else {
+        if status != CacheStatus::Eligible {
             self.metrics.cache_bypass();
-            return Ok(None);
-        };
-        let Some(rule) = manager.rule(table).cloned() else {
-            self.metrics.cache_bypass();
-            return Ok(None);
-        };
-        if kind != QueryKind::Read
-            || route != RouteTarget::Replica
-            || self.config.proxy.result_mode != ResultMode::Buffered
-            || decision.table_count != 1
-            || !cache_safe_sql(query)
-        {
-            self.metrics.cache_bypass();
+            self.metrics
+                .record_query_cache(query_id, status, CacheOutcome::Bypass);
             return Ok(None);
         }
+        let manager = self.cache.as_ref().expect("eligible cache has a manager");
+        let table = decision
+            .table
+            .as_deref()
+            .expect("eligible query has a table");
+        let rule = manager
+            .rule(table)
+            .cloned()
+            .expect("eligible cache has a table rule");
 
         let scope = CacheScope::new(self.schema.as_deref(), table, &decision.shard);
         let mut cache_identity = String::with_capacity(query.len() + 64);
@@ -1713,19 +1735,64 @@ impl ProxySession {
             cache_identity.push_str(command);
         }
         let key = manager.query_key(&scope, &cache_identity).await?;
-        if let Some(result) = manager.get(&key).await? {
-            return Ok(Some(CacheLookup::Hit(result)));
-        }
+        let mut stale = match manager.get(&key, rule.refresh_ahead_seconds).await? {
+            CacheRead::Hit(result) => {
+                self.metrics
+                    .record_query_cache(query_id, status, CacheOutcome::Hit);
+                return Ok(Some(CacheLookup::Hit(result)));
+            }
+            CacheRead::RefreshDue {
+                result,
+                payload_bytes,
+            } => Some((result, payload_bytes)),
+            CacheRead::Miss => None,
+        };
 
         let flight = manager.flight(&key).await;
         let guard = flight.lock_owned().await;
-        if let Some(result) = manager.get(&key).await? {
-            return Ok(Some(CacheLookup::Hit(result)));
+        match manager.get(&key, rule.refresh_ahead_seconds).await? {
+            CacheRead::Hit(result) => {
+                self.metrics
+                    .record_query_cache(query_id, status, CacheOutcome::Hit);
+                return Ok(Some(CacheLookup::Hit(result)));
+            }
+            CacheRead::RefreshDue {
+                result,
+                payload_bytes,
+            } => stale = Some((result, payload_bytes)),
+            CacheRead::Miss => {}
         }
+        let lease_token = if manager.distributed_singleflight() {
+            match manager.acquire_fill_lease(&key).await? {
+                Some(token) => Some(token),
+                None => {
+                    if let Some((result, payload_bytes)) = stale {
+                        manager.stale_served(payload_bytes);
+                        self.metrics
+                            .record_query_cache(query_id, status, CacheOutcome::Hit);
+                        return Ok(Some(CacheLookup::Hit(result)));
+                    }
+                    if let Some(result) = manager.wait_for_fill(&key).await? {
+                        self.metrics
+                            .record_query_cache(query_id, status, CacheOutcome::Hit);
+                        return Ok(Some(CacheLookup::Hit(result)));
+                    }
+                    self.metrics.cache_bypass();
+                    self.metrics
+                        .record_query_cache(query_id, status, CacheOutcome::Bypass);
+                    return Ok(None);
+                }
+            }
+        } else {
+            None
+        };
+        self.metrics
+            .record_query_cache(query_id, status, CacheOutcome::Miss);
         Ok(Some(CacheLookup::Fill(CacheFill {
             manager: manager.clone(),
             rule,
             key,
+            lease_token,
             _guard: guard,
         })))
     }
@@ -2082,6 +2149,11 @@ impl ProxySession {
             analysis_started.elapsed(),
             Some(analysis.classification.parsed),
         );
+        let query_id = self.metrics.begin_query_shape(
+            "mysql",
+            analysis.classification.kind.as_str(),
+            analysis.statements(),
+        );
         let atomic_dml = analysis.is_atomic_dml();
         let mysql_transaction = analysis.mysql_transaction_semantics().evaluate(
             self.state.autocommit_enabled(),
@@ -2104,6 +2176,12 @@ impl ProxySession {
         let decision = match plan {
             ShardQueryPlan::Single(decision) => decision,
             plan @ (ShardQueryPlan::UnionAll(_) | ShardQueryPlan::Aggregate(_)) => {
+                self.metrics.cache_bypass();
+                self.metrics.record_query_cache(
+                    &query_id,
+                    CacheStatus::MultipleTables,
+                    CacheOutcome::Bypass,
+                );
                 if classification.kind != QueryKind::Read || !scatter_safe_sql(query) {
                     self.metrics.query_failed();
                     writer
@@ -2182,7 +2260,7 @@ impl ProxySession {
             .route(classification.kind, self.config.routing.read_write_split);
         let mut cache_fill = None;
         match self
-            .cache_lookup(query, &decision, route, classification.kind)
+            .cache_lookup(query, &query_id, &decision, route, classification.kind)
             .await
         {
             Ok(Some(CacheLookup::Hit(cached))) => {
@@ -2269,7 +2347,7 @@ impl ProxySession {
             Ok(Ok(QueryExecution::Success(materialized))) => {
                 if let (Some(fill), Some(cached)) = (cache_fill.take(), materialized.cached) {
                     tokio::spawn(async move {
-                        if let Err(error) = fill.manager.put(&fill.key, &cached, &fill.rule).await {
+                        if let Err(error) = fill.store(cached).await {
                             warn!(%error, "result cache fill failed");
                         }
                     });
@@ -2404,7 +2482,18 @@ struct CacheFill {
     manager: Arc<CacheManager>,
     rule: crate::config::CacheRuleConfig,
     key: String,
+    lease_token: Option<String>,
     _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl CacheFill {
+    async fn store(self, cached: CachedResult) -> Result<(), ProxyError> {
+        let result = self.manager.put(&self.key, &cached, &self.rule).await;
+        if let Some(token) = &self.lease_token {
+            self.manager.release_fill_lease(&self.key, token).await;
+        }
+        result
+    }
 }
 
 #[async_trait]
@@ -2564,6 +2653,11 @@ where
                 atomic_dml,
                 mysql_transaction_semantics,
                 columns: columns.clone(),
+                query_identity: self.metrics.query_identity(
+                    "mysql",
+                    classification.kind.as_str(),
+                    routing_statements.as_deref(),
+                ),
                 routing_statements,
             },
         );
@@ -2596,6 +2690,9 @@ where
         );
         let prepared_columns = prepared.columns.clone();
         let routing_statements = prepared.routing_statements.clone();
+        let query_identity = prepared.query_identity.clone();
+        self.metrics.begin_query_identity(&query_identity);
+        let query_id = query_identity.query_id();
         self.metrics.prepared_executed();
         self.metrics.query_started(kind);
         let started = Instant::now();
@@ -2658,6 +2755,12 @@ where
         let decision = match plan {
             ShardQueryPlan::Single(decision) => decision,
             ref mut plan @ (ShardQueryPlan::UnionAll(_) | ShardQueryPlan::Aggregate(_)) => {
+                self.metrics.cache_bypass();
+                self.metrics.record_query_cache(
+                    query_id,
+                    CacheStatus::MultipleTables,
+                    CacheOutcome::Bypass,
+                );
                 if kind != QueryKind::Read || !scatter_safe_sql(&routing_sql) {
                     self.metrics.query_failed();
                     results
@@ -2791,7 +2894,7 @@ where
         let route = self.state.route(kind, self.config.routing.read_write_split);
         let mut cache_fill = None;
         match self
-            .cache_lookup(&routing_sql, &decision, route, kind)
+            .cache_lookup(&routing_sql, query_id, &decision, route, kind)
             .await
         {
             Ok(Some(CacheLookup::Hit(cached))) => {
@@ -2869,7 +2972,7 @@ where
             Ok(Ok(QueryExecution::Success(materialized))) => {
                 if let (Some(fill), Some(cached)) = (cache_fill.take(), materialized.cached) {
                     tokio::spawn(async move {
-                        if let Err(error) = fill.manager.put(&fill.key, &cached, &fill.rule).await {
+                        if let Err(error) = fill.store(cached).await {
                             warn!(%error, "prepared result cache fill failed");
                         }
                     });

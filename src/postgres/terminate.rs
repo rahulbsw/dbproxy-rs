@@ -59,6 +59,7 @@ use crate::{
     error::ProxyError,
     metrics::Metrics,
     operation_id,
+    query_registry::{CacheOutcome, CacheStatus, QueryIdentity},
     sharding::{
         AggregateKind, AggregatePlan, PlannedShardQuery, ShardDecision, ShardQueryPlan,
         ShardRouter, ShardRoutingError, parameterize_postgres_scatter_plan,
@@ -290,6 +291,18 @@ enum StatementKind {
     Session,
 }
 
+impl StatementKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::TransactionStart => "transaction_start",
+            Self::TransactionEnd => "transaction_end",
+            Self::Session => "session",
+        }
+    }
+}
+
 struct TerminatingQueryHandler {
     endpoint: PostgresEndpoint,
     manager: Arc<PostgresBackendManager>,
@@ -308,6 +321,7 @@ struct PostgresPreparedStatement {
     parameter_count: usize,
     declared_parameter_types: Vec<Option<Type>>,
     parameter_types: Arc<OnceLock<Vec<Type>>>,
+    query_identity: Arc<OnceLock<QueryIdentity>>,
 }
 
 impl fmt::Debug for PostgresPreparedStatement {
@@ -324,6 +338,10 @@ impl fmt::Debug for PostgresPreparedStatement {
             .field(
                 "parameter_types_cached",
                 &self.parameter_types.get().is_some(),
+            )
+            .field(
+                "query_identity_cached",
+                &self.query_identity.get().is_some(),
             )
             .finish()
     }
@@ -612,15 +630,6 @@ impl TerminatingQueryHandler {
             }
         }
         Ok(shard)
-    }
-
-    fn validated_query_plan<C>(&self, client: &C, query: &str) -> PgWireResult<ShardQueryPlan>
-    where
-        C: ClientInfo,
-    {
-        let statements = Parser::parse_sql(&PostgreSqlDialect {}, query)
-            .map_err(|error| user_error("42601", &format!("cannot safely parse query: {error}")))?;
-        self.validated_query_plan_parsed(client, query, &statements)
     }
 
     fn validated_query_plan_parsed<C>(
@@ -1080,9 +1089,16 @@ impl SimpleQueryHandler for TerminatingQueryHandler {
         PgWireError: From<<C as futures_util::Sink<pgwire::messages::PgWireBackendMessage>>::Error>,
     {
         self.metrics.postgres_terminated_query();
-        let kind = classify_statement(query).inspect_err(|_| {
+        let (statements, kind) = parse_postgres_statement(query).inspect_err(|_| {
             self.metrics.postgres_statement_routing_failed();
         })?;
+        self.metrics.observe_query_shape(
+            "postgresql",
+            kind.as_str(),
+            Some(&statements),
+            CacheStatus::ProtocolResultCacheUnsupported,
+            CacheOutcome::Bypass,
+        );
         if self.endpoint == PostgresEndpoint::ReadOnly
             && matches!(kind, StatementKind::Write | StatementKind::Session)
         {
@@ -1092,9 +1108,11 @@ impl SimpleQueryHandler for TerminatingQueryHandler {
                 "write or session-state statement rejected on the read-only listener",
             ));
         }
-        let plan = self.validated_query_plan(client, query).inspect_err(|_| {
-            self.metrics.postgres_statement_routing_failed();
-        })?;
+        let plan = self
+            .validated_query_plan_parsed(client, query, &statements)
+            .inspect_err(|_| {
+                self.metrics.postgres_statement_routing_failed();
+            })?;
         let state = client
             .session_extensions()
             .get_or_insert_with(|| Mutex::new(TerminatedSession::default()));
@@ -1309,6 +1327,7 @@ fn parse_postgres_prepared_statement(
         parameter_count,
         declared_parameter_types: types.to_vec(),
         parameter_types,
+        query_identity: Arc::new(OnceLock::new()),
     })
 }
 
@@ -1504,6 +1523,19 @@ impl TerminatingQueryHandler {
         let prepared_statement = &portal.statement.statement;
         let query = prepared_statement.query.as_str();
         let kind = prepared_statement.kind;
+        let query_identity = prepared_statement.query_identity.get_or_init(|| {
+            self.metrics.query_identity(
+                "postgresql",
+                kind.as_str(),
+                Some(&prepared_statement.routing_statements),
+            )
+        });
+        self.metrics.begin_query_identity(query_identity);
+        self.metrics.record_query_cache(
+            query_identity.query_id(),
+            CacheStatus::ProtocolResultCacheUnsupported,
+            CacheOutcome::Bypass,
+        );
         if self.endpoint == PostgresEndpoint::ReadOnly
             && matches!(kind, StatementKind::Write | StatementKind::Session)
         {
@@ -2072,6 +2104,7 @@ fn parse_postgres_statement(query: &str) -> PgWireResult<(Vec<Statement>, Statem
     Ok((statements, kind))
 }
 
+#[cfg(test)]
 fn classify_statement(query: &str) -> PgWireResult<StatementKind> {
     parse_postgres_statement(query).map(|(_, kind)| kind)
 }
@@ -3057,6 +3090,7 @@ mod tests {
             parameter_count: 1,
             declared_parameter_types: vec![Some(Type::TEXT)],
             parameter_types,
+            query_identity: Arc::new(OnceLock::new()),
         };
         let statement = Arc::new(StoredStatement::new(
             "cached".to_owned(),

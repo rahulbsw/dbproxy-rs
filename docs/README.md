@@ -15,6 +15,8 @@ start. The focused guides below describe design and operating contracts.
 | [PostgreSQL transaction pooling](postgres-pooling.md) | Terminated simple/extended routing, pool reset, TLS, pinning, and compatibility contract |
 | [Redis/Valkey topology](redis-topology.md) | Sentinel quorum discovery and native Cluster slot/redirection routing |
 | [MySQL read-through cache](cache.md) | Redis/Valkey cache rules, consistency, invalidation, and failure behavior |
+| [Query observatory](query-observatory.md) | Privacy-safe query shapes, cache candidates, and explain endpoints |
+| [CDC cache invalidation contract](cdc-cache-invalidation.md) | Durable offsets, lag fail-closed behavior, and acceptance gates for direct writes |
 | [MySQL XA fanout](mysql-xa.md) | Atomic fanout configuration, recovery, storage, and retry contract |
 | [Shared etcd control plane](control-plane.md) | Immutable runtime generations, last-known-good behavior, and transaction draining |
 | [Database and networking review](review.md) | Closed correctness issues and intentional production boundaries |

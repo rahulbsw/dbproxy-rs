@@ -35,8 +35,8 @@ if ! grep -Eq '"name":"postgres_readiness_tls","status":"available"' <<<"${capab
   echo "capability endpoint did not report PostgreSQL readiness TLS as available" >&2
   exit 1
 fi
-if ! grep -Eq 'dbproxy_capability_info\{capability="distributed_atomic_fanout",status="planned"\} 1' <<<"${metrics}"; then
-  echo "capability metrics did not report distributed atomic fanout as planned" >&2
+if ! grep -Eq 'dbproxy_capability_info\{capability="distributed_atomic_fanout",status="constrained"\} 1' <<<"${metrics}"; then
+  echo "capability metrics did not report constrained distributed atomic fanout" >&2
   exit 1
 fi
 if ! grep -Eq 'dbproxy_postgres_backend_sql_healthy\{backend="timescale-primary",role="primary",shard="default"\} 1' <<<"${metrics}"; then

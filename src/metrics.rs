@@ -4,7 +4,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use sqlparser::ast::Statement;
+
 use crate::classifier::QueryKind;
+use crate::query_registry::{
+    CacheOutcome, CacheStatus, QueryIdentity, QueryRegistry, QuerySnapshot,
+};
 
 const QUERY_BUCKETS_MICROS: [u64; 10] = [
     1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000,
@@ -12,6 +17,7 @@ const QUERY_BUCKETS_MICROS: [u64; 10] = [
 
 #[derive(Debug, Default)]
 pub struct Metrics {
+    query_registry: QueryRegistry,
     active_clients: AtomicI64,
     accepted_clients: AtomicU64,
     rejected_clients: AtomicU64,
@@ -113,6 +119,12 @@ pub struct Metrics {
     cache_invalidations: AtomicU64,
     cache_invalidation_failures: AtomicU64,
     cache_singleflight_waiters: AtomicU64,
+    cache_refreshes_due: AtomicU64,
+    cache_stale_while_refresh: AtomicU64,
+    cache_distributed_leases: AtomicU64,
+    cache_distributed_waiters: AtomicU64,
+    cache_distributed_wait_timeouts: AtomicU64,
+    cache_distributed_release_failures: AtomicU64,
     cache_bytes_served: AtomicU64,
     config_epoch: AtomicU64,
     config_reload_successes: AtomicU64,
@@ -121,6 +133,56 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    pub fn begin_query_shape(
+        &self,
+        protocol: &str,
+        kind: &str,
+        statements: Option<&[Statement]>,
+    ) -> String {
+        self.query_registry.begin(protocol, kind, statements)
+    }
+
+    pub fn query_identity(
+        &self,
+        protocol: &str,
+        kind: &str,
+        statements: Option<&[Statement]>,
+    ) -> QueryIdentity {
+        self.query_registry.identity(protocol, kind, statements)
+    }
+
+    pub fn begin_query_identity(&self, identity: &QueryIdentity) {
+        self.query_registry.begin_identity(identity);
+    }
+
+    pub fn record_query_cache(&self, query_id: &str, status: CacheStatus, outcome: CacheOutcome) {
+        self.query_registry.record_cache(query_id, status, outcome);
+    }
+
+    pub fn observe_query_shape(
+        &self,
+        protocol: &str,
+        kind: &str,
+        statements: Option<&[Statement]>,
+        status: CacheStatus,
+        outcome: CacheOutcome,
+    ) -> String {
+        self.query_registry
+            .observe(protocol, kind, statements, status, outcome)
+    }
+
+    pub fn query_registry_snapshot(&self) -> Vec<QuerySnapshot> {
+        self.query_registry.snapshot()
+    }
+
+    pub fn cache_candidates(&self) -> Vec<QuerySnapshot> {
+        self.query_registry.candidates()
+    }
+
+    pub fn explain_query(&self, query_id: &str) -> Option<QuerySnapshot> {
+        self.query_registry.explain(query_id)
+    }
+
     pub fn client_accepted(&self) {
         self.accepted_clients.fetch_add(1, Ordering::Relaxed);
         self.active_clients.fetch_add(1, Ordering::Relaxed);
@@ -553,6 +615,35 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn cache_refresh_due(&self) {
+        self.cache_refreshes_due.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_stale_while_refresh(&self) {
+        self.cache_stale_while_refresh
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_distributed_lease_acquired(&self) {
+        self.cache_distributed_leases
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_distributed_waiter(&self) {
+        self.cache_distributed_waiters
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_distributed_wait_timed_out(&self) {
+        self.cache_distributed_wait_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_distributed_release_failed(&self) {
+        self.cache_distributed_release_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn config_epoch(&self, epoch: u64) {
         self.config_epoch.store(epoch, Ordering::Release);
     }
@@ -812,6 +903,76 @@ impl Metrics {
             "Serialized result-cache bytes served on hits.",
             self.cache_bytes_served.load(Ordering::Relaxed),
         );
+        metric(
+            &mut output,
+            "dbproxy_cache_refreshes_due_total",
+            "counter",
+            "Cache entries selected for refresh-ahead before Redis expiry.",
+            self.cache_refreshes_due.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_stale_while_refresh_total",
+            "counter",
+            "Near-expiry cache entries served while another DBProxy instance owns the fill lease.",
+            self.cache_stale_while_refresh.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_distributed_fill_leases_total",
+            "counter",
+            "Redis-backed cache fill leases acquired by this DBProxy instance.",
+            self.cache_distributed_leases.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_distributed_waiters_total",
+            "counter",
+            "Cold misses waiting for a cache fill lease owner in another DBProxy instance.",
+            self.cache_distributed_waiters.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_distributed_wait_timeouts_total",
+            "counter",
+            "Cold misses that stopped waiting before another instance published a fill.",
+            self.cache_distributed_wait_timeouts.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_cache_distributed_release_failures_total",
+            "counter",
+            "Compare-and-delete cache fill lease releases that failed; leases remain expiry-bounded.",
+            self.cache_distributed_release_failures
+                .load(Ordering::Relaxed),
+        );
+        metric(
+            &mut output,
+            "dbproxy_query_registry_entries",
+            "gauge",
+            "Privacy-safe normalized query shapes currently retained in the bounded registry.",
+            self.query_registry.len(),
+        );
+        metric(
+            &mut output,
+            "dbproxy_query_registry_evictions_total",
+            "counter",
+            "Normalized query shapes evicted from the bounded registry.",
+            self.query_registry.evictions(),
+        );
+        let _ = writeln!(
+            output,
+            "# HELP dbproxy_query_registry_calls Retained query calls by bounded cacheability status; query identifiers are intentionally not metric labels."
+        );
+        let _ = writeln!(output, "# TYPE dbproxy_query_registry_calls gauge");
+        for status in CacheStatus::ALL {
+            let _ = writeln!(
+                output,
+                "dbproxy_query_registry_calls{{cache_status=\"{}\"}} {}",
+                status.as_str(),
+                self.query_registry.status_calls(status)
+            );
+        }
         metric(
             &mut output,
             "dbproxy_config_epoch",
@@ -1441,5 +1602,20 @@ mod tests {
         assert!(output.contains("dbproxy_query_duration_seconds_bucket{le=\"0.010\"} 1"));
         assert!(output.contains("dbproxy_query_duration_seconds_bucket{le=\"0.025\"} 2"));
         assert!(output.contains("dbproxy_query_duration_seconds_count 2"));
+    }
+
+    #[test]
+    fn query_registry_metrics_use_only_bounded_status_labels() {
+        let metrics = Metrics::default();
+        let query_id = metrics.observe_query_shape(
+            "mysql",
+            "read",
+            None,
+            CacheStatus::CacheDisabled,
+            CacheOutcome::Bypass,
+        );
+        let output = metrics.encode_prometheus();
+        assert!(output.contains("dbproxy_query_registry_calls{cache_status=\"cache_disabled\"} 1"));
+        assert!(!output.contains(&query_id));
     }
 }

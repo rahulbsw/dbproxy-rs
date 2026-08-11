@@ -25,7 +25,7 @@ The live status is also available from `GET /capabilities` and
 | Cross-shard joins | Distributed query planner | Require bounded join strategies, cardinality limits, spill policy, and type/collation compatibility |
 | Automatic table rewriting | AST and catalog layer | Apply dialect-aware rewrites only against a versioned schema snapshot and verify generated SQL before routing |
 | Runtime reload | Implemented, constrained | Optional etcd revisions atomically update scoped MySQL users, routing, sharding, fanout, and cache policy for new sessions; listeners, backends, protocol topology, and XA durability remain restart-only |
-| Query cache | Implemented, constrained | Explicit MySQL table rules use bounded Redis/Valkey values, per-process singleflight, replica-eligible text/prepared reads, and commit-aware table/shard generations; streaming reads and bypass writes remain uncached |
+| Query cache | Implemented, constrained | Explicit MySQL table rules use bounded Redis/Valkey values, local and opt-in cluster-wide singleflight, refresh-ahead, replica-eligible text/prepared reads, and commit-aware table/shard generations; streaming reads and bypass writes remain uncached |
 | Admin SQL | Authenticated control plane | Keep separate from data credentials; add authorization, audit records, deadlines, and read-only defaults |
 | Atomic write fanout | Implemented, constrained | MySQL XA decision journal and restart recovery for allowlisted autocommit DML; online reconciliation and client-transaction fanout remain open |
 

@@ -12,6 +12,7 @@ pub mod metrics;
 pub mod operation_id;
 pub mod postgres;
 pub mod proxy;
+pub mod query_registry;
 pub mod redis;
 pub mod routing;
 pub mod sharding;

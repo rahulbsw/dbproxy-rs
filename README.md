@@ -84,6 +84,8 @@ flowchart LR
 | [Operations and metrics](docs/operations.md) | Readiness, Prometheus metrics, alerts, and capacity tuning |
 | [Protocol sharding](docs/protocol-sharding.md) | PostgreSQL, TimescaleDB, Redis, and Valkey routing contracts |
 | [MySQL cache](docs/cache.md) | Read-through rules, consistency, failure, and invalidation contracts |
+| [Query observatory](docs/query-observatory.md) | Privacy-safe query shapes, cache candidates, and explainability |
+| [CDC invalidation contract](docs/cdc-cache-invalidation.md) | Durable direct-write invalidation and lag safety acceptance gates |
 | [Shared etcd config](docs/control-plane.md) | Runtime generation scope, security, last-known-good, and draining behavior |
 | [Database/network review](docs/review.md) | Correctness review and intentional production boundaries |
 | [Advanced roadmap](docs/advanced-features.md) | XA, scatter/gather, online resharding, and acceptance gates |
@@ -573,6 +575,9 @@ GET /readyz    primary-backend readiness
 GET /backends  backend role and health state
 GET /postgres/backends  PostgreSQL transport and configured SQL readiness
 GET /redis/backends  Redis backend transport health
+GET /queries   bounded privacy-safe normalized query-shape activity
+GET /cache/candidates   ranked MySQL result-cache candidates
+GET /cache/explain/<query_id>   cacheability reason and counters for one shape
 GET /capabilities  machine-readable feature status and safety contracts
 GET /metrics   Prometheus text exposition
 ```

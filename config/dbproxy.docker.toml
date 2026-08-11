@@ -94,12 +94,17 @@ key_prefix = "dbproxy-test"
 request_timeout_milliseconds = 500
 max_value_bytes = 1048576
 fail_open = false
+distributed_singleflight = true
+fill_lease_milliseconds = 2000
+fill_wait_milliseconds = 500
+fill_poll_milliseconds = 20
 
 [[cache.rules]]
 table = "backend_identity"
 ttl_seconds = 30
 negative_ttl_seconds = 5
 ttl_jitter_percent = 0
+refresh_ahead_seconds = 5
 max_rows = 10
 max_bytes = 65536
 
@@ -108,6 +113,7 @@ table = "proxy_write_test"
 ttl_seconds = 30
 negative_ttl_seconds = 5
 ttl_jitter_percent = 0
+refresh_ahead_seconds = 5
 max_rows = 100
 max_bytes = 65536
 

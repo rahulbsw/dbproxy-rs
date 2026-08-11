@@ -110,6 +110,10 @@ pub struct CacheConfig {
     pub request_timeout_milliseconds: u64,
     pub max_value_bytes: usize,
     pub fail_open: bool,
+    pub distributed_singleflight: bool,
+    pub fill_lease_milliseconds: u64,
+    pub fill_wait_milliseconds: u64,
+    pub fill_poll_milliseconds: u64,
     pub rules: Vec<CacheRuleConfig>,
 }
 
@@ -122,6 +126,10 @@ impl Default for CacheConfig {
             request_timeout_milliseconds: 100,
             max_value_bytes: 1_048_576,
             fail_open: true,
+            distributed_singleflight: false,
+            fill_lease_milliseconds: 2_000,
+            fill_wait_milliseconds: 250,
+            fill_poll_milliseconds: 10,
             rules: Vec::new(),
         }
     }
@@ -134,6 +142,7 @@ pub struct CacheRuleConfig {
     pub ttl_seconds: u64,
     pub negative_ttl_seconds: u64,
     pub ttl_jitter_percent: u8,
+    pub refresh_ahead_seconds: u64,
     pub max_rows: usize,
     pub max_bytes: usize,
 }
@@ -145,6 +154,7 @@ impl Default for CacheRuleConfig {
             ttl_seconds: 30,
             negative_ttl_seconds: 5,
             ttl_jitter_percent: 10,
+            refresh_ahead_seconds: 0,
             max_rows: 1_000,
             max_bytes: 1_048_576,
         }
@@ -1230,6 +1240,18 @@ impl Config {
                 "cache timeout and value-size limits must be greater than zero".to_owned(),
             ));
         }
+        if self.cache.distributed_singleflight
+            && (self.cache.fill_lease_milliseconds == 0
+                || self.cache.fill_wait_milliseconds == 0
+                || self.cache.fill_poll_milliseconds == 0
+                || self.cache.fill_wait_milliseconds > self.cache.fill_lease_milliseconds
+                || self.cache.fill_poll_milliseconds > self.cache.fill_wait_milliseconds)
+        {
+            return Err(ProxyError::Config(
+                "cache distributed singleflight requires positive poll/wait/lease durations with poll <= wait <= lease"
+                    .to_owned(),
+            ));
+        }
         if self.cache.rules.is_empty() {
             return Err(ProxyError::Config(
                 "cache.rules must contain at least one explicit table rule".to_owned(),
@@ -1264,6 +1286,12 @@ impl Config {
             if rule.ttl_jitter_percent > 50 {
                 return Err(ProxyError::Config(format!(
                     "cache rule for {:?} has ttl_jitter_percent above 50",
+                    rule.table
+                )));
+            }
+            if rule.refresh_ahead_seconds >= rule.ttl_seconds && rule.refresh_ahead_seconds != 0 {
+                return Err(ProxyError::Config(format!(
+                    "cache rule for {:?} must have refresh_ahead_seconds below ttl_seconds",
                     rule.table
                 )));
             }
@@ -2239,6 +2267,27 @@ mod tests {
         "#;
         let config: Config = toml::from_str(raw).unwrap();
         config.validate().unwrap();
+
+        let mut invalid = config.clone();
+        invalid.cache.distributed_singleflight = true;
+        invalid.cache.fill_wait_milliseconds = invalid.cache.fill_lease_milliseconds + 1;
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("distributed singleflight")
+        );
+
+        let mut invalid = config.clone();
+        invalid.cache.rules[0].refresh_ahead_seconds = invalid.cache.rules[0].ttl_seconds;
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("refresh_ahead_seconds")
+        );
 
         let mut invalid = config;
         invalid.cache.rules.push(invalid.cache.rules[0].clone());

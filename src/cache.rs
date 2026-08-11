@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mysql_async::Value;
@@ -18,6 +18,15 @@ use crate::{
 };
 
 const CACHE_FORMAT_VERSION: u8 = 1;
+
+pub enum CacheRead {
+    Hit(CachedResult),
+    RefreshDue {
+        result: CachedResult,
+        payload_bytes: u64,
+    },
+    Miss,
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CacheScope {
@@ -102,18 +111,48 @@ impl CacheManager {
         Ok(format!("{}:query:{encoded}", self.config.key_prefix))
     }
 
-    pub async fn get(&self, key: &str) -> Result<Option<CachedResult>, ProxyError> {
+    pub async fn get(
+        &self,
+        key: &str,
+        refresh_ahead_seconds: u64,
+    ) -> Result<CacheRead, ProxyError> {
+        self.read(key, refresh_ahead_seconds, true).await
+    }
+
+    async fn read(
+        &self,
+        key: &str,
+        refresh_ahead_seconds: u64,
+        record_miss: bool,
+    ) -> Result<CacheRead, ProxyError> {
         let mut connection = self.connection.clone();
-        let payload: Option<Vec<u8>> = self
-            .request(
-                redis_client::cmd("GET")
-                    .arg(key)
-                    .query_async(&mut connection),
-            )
-            .await?;
+        let (payload, remaining_milliseconds) = if refresh_ahead_seconds == 0 {
+            let payload: Option<Vec<u8>> = self
+                .request(
+                    redis_client::cmd("GET")
+                        .arg(key)
+                        .query_async(&mut connection),
+                )
+                .await?;
+            (payload, None)
+        } else {
+            const GET_WITH_TTL: &str = "local value = redis.call('get', KEYS[1]); if not value then return {false, -2} end; return {value, redis.call('pttl', KEYS[1])}";
+            let (payload, remaining): (Option<Vec<u8>>, i64) = self
+                .request(
+                    redis_client::cmd("EVAL")
+                        .arg(GET_WITH_TTL)
+                        .arg(1)
+                        .arg(key)
+                        .query_async(&mut connection),
+                )
+                .await?;
+            (payload, Some(remaining))
+        };
         let Some(payload) = payload else {
-            self.metrics.cache_miss();
-            return Ok(None);
+            if record_miss {
+                self.metrics.cache_miss();
+            }
+            return Ok(CacheRead::Miss);
         };
         if payload.len() > self.config.max_value_bytes {
             self.metrics.cache_error();
@@ -133,8 +172,89 @@ impl CacheManager {
                 result.format_version
             )));
         }
+        if let Some(remaining_milliseconds) = remaining_milliseconds {
+            let refresh_window_milliseconds =
+                i64::try_from(refresh_ahead_seconds.saturating_mul(1_000)).unwrap_or(i64::MAX);
+            if remaining_milliseconds >= 0 && remaining_milliseconds <= refresh_window_milliseconds
+            {
+                self.metrics.cache_refresh_due();
+                return Ok(CacheRead::RefreshDue {
+                    result,
+                    payload_bytes: payload.len() as u64,
+                });
+            }
+        }
         self.metrics.cache_hit(payload.len() as u64);
-        Ok(Some(result))
+        Ok(CacheRead::Hit(result))
+    }
+
+    pub fn stale_served(&self, payload_bytes: u64) {
+        self.metrics.cache_hit(payload_bytes);
+        self.metrics.cache_stale_while_refresh();
+    }
+
+    pub async fn acquire_fill_lease(&self, key: &str) -> Result<Option<String>, ProxyError> {
+        if !self.config.distributed_singleflight {
+            return Ok(None);
+        }
+        let token = nanoid::nanoid!();
+        let mut connection = self.connection.clone();
+        let acquired: Option<String> = self
+            .request(
+                redis_client::cmd("SET")
+                    .arg(self.lease_key(key))
+                    .arg(&token)
+                    .arg("NX")
+                    .arg("PX")
+                    .arg(self.config.fill_lease_milliseconds)
+                    .query_async(&mut connection),
+            )
+            .await?;
+        if acquired.is_some() {
+            self.metrics.cache_distributed_lease_acquired();
+            Ok(Some(token))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn distributed_singleflight(&self) -> bool {
+        self.config.distributed_singleflight
+    }
+
+    pub async fn wait_for_fill(&self, key: &str) -> Result<Option<CachedResult>, ProxyError> {
+        self.metrics.cache_distributed_waiter();
+        let deadline = Instant::now() + Duration::from_millis(self.config.fill_wait_milliseconds);
+        loop {
+            time::sleep(Duration::from_millis(self.config.fill_poll_milliseconds)).await;
+            match self.read(key, 0, false).await? {
+                CacheRead::Hit(result) => return Ok(Some(result)),
+                CacheRead::RefreshDue { result, .. } => return Ok(Some(result)),
+                CacheRead::Miss if Instant::now() < deadline => {}
+                CacheRead::Miss => {
+                    self.metrics.cache_distributed_wait_timed_out();
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    pub async fn release_fill_lease(&self, key: &str, token: &str) {
+        const COMPARE_AND_DELETE: &str = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+        let mut connection = self.connection.clone();
+        let result = self
+            .request::<u64, _>(
+                redis_client::cmd("EVAL")
+                    .arg(COMPARE_AND_DELETE)
+                    .arg(1)
+                    .arg(self.lease_key(key))
+                    .arg(token)
+                    .query_async(&mut connection),
+            )
+            .await;
+        if result.is_err() {
+            self.metrics.cache_distributed_release_failed();
+        }
     }
 
     pub async fn put(
@@ -205,6 +325,10 @@ impl CacheManager {
             "{}:version:{}:{}:{}",
             self.config.key_prefix, scope.schema, scope.table, scope.shard
         )
+    }
+
+    fn lease_key(&self, key: &str) -> String {
+        format!("{key}:fill-lease")
     }
 
     async fn version(&self, scope: &CacheScope) -> Result<u64, ProxyError> {
@@ -462,5 +586,61 @@ mod tests {
         assert!((90..=110).contains(&ttl));
         assert_eq!(ttl, jittered_ttl("query-key", 100, 10));
         assert_eq!(jittered_ttl("query-key", 3, 10), 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBPROXY_CACHE_TEST_REDIS_URL"]
+    async fn redis_fill_lease_and_refresh_ahead_are_expiry_bounded() {
+        let redis_url = std::env::var("DBPROXY_CACHE_TEST_REDIS_URL")
+            .expect("DBPROXY_CACHE_TEST_REDIS_URL must select a disposable Redis database");
+        let rule = CacheRuleConfig {
+            table: "products".to_owned(),
+            ttl_seconds: 2,
+            negative_ttl_seconds: 1,
+            ttl_jitter_percent: 0,
+            refresh_ahead_seconds: 1,
+            max_rows: 10,
+            max_bytes: 65_536,
+        };
+        let config = CacheConfig {
+            enabled: true,
+            redis_url,
+            key_prefix: format!("dbproxy-test-{}", nanoid::nanoid!()),
+            request_timeout_milliseconds: 500,
+            max_value_bytes: 65_536,
+            fail_open: false,
+            distributed_singleflight: true,
+            fill_lease_milliseconds: 2_000,
+            fill_wait_milliseconds: 250,
+            fill_poll_milliseconds: 10,
+            rules: vec![rule.clone()],
+        };
+        let manager = CacheManager::connect(config, Arc::new(Metrics::default()))
+            .await
+            .unwrap();
+        let key = format!("lease-refresh-{}", nanoid::nanoid!());
+
+        let first_token = manager.acquire_fill_lease(&key).await.unwrap().unwrap();
+        assert!(manager.acquire_fill_lease(&key).await.unwrap().is_none());
+        manager.release_fill_lease(&key, &first_token).await;
+        let second_token = manager.acquire_fill_lease(&key).await.unwrap().unwrap();
+        manager.release_fill_lease(&key, &second_token).await;
+
+        let cached = CachedResult {
+            format_version: CACHE_FORMAT_VERSION,
+            columns: Vec::new(),
+            rows: vec![Vec::new()],
+            bytes_returned: 0,
+        };
+        manager.put(&key, &cached, &rule).await.unwrap();
+        assert!(matches!(
+            manager.get(&key, 1).await.unwrap(),
+            CacheRead::Hit(_)
+        ));
+        time::sleep(Duration::from_millis(1_100)).await;
+        assert!(matches!(
+            manager.get(&key, 1).await.unwrap(),
+            CacheRead::RefreshDue { .. }
+        ));
     }
 }
