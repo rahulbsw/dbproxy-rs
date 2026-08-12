@@ -960,6 +960,38 @@ kbd {
   border: 0;
 }
 
+.mermaid-diagram {
+  padding: clamp(1rem, 3vw, 2rem);
+  margin: 1.8rem 0;
+  overflow-x: auto;
+  background:
+    linear-gradient(rgb(25 120 139 / 4%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(25 120 139 / 4%) 1px, transparent 1px),
+    var(--paper);
+  background-size: 1.5rem 1.5rem;
+  border: 1px solid var(--line-strong);
+  box-shadow: 0 12px 34px rgb(16 40 50 / 8%);
+}
+
+.mermaid-diagram svg {
+  display: block;
+  width: 100% !important;
+  min-width: 34rem;
+  height: auto !important;
+  max-height: 42rem;
+  margin: 0 auto;
+}
+
+.mermaid-fallback {
+  color: #d9e7e9;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  line-height: 1.7;
+  white-space: pre;
+  background: #102832;
+  border-left: 3px solid var(--danger);
+}
+
 .copy-code {
   position: absolute;
   top: 0.55rem;
@@ -1454,6 +1486,10 @@ body > .site-footer {
 
   .prose h2 {
     font-size: 2rem;
+  }
+
+  .mermaid-diagram {
+    padding: 0.8rem;
   }
 
   .doc-kicker a {

@@ -67,6 +67,23 @@ for (const entry of searchIndex) {
   }
 }
 
+const mermaidBundle = path.join(outputDir, "assets", "vendor", "mermaid.min.js");
+if (!fs.existsSync(mermaidBundle)) {
+  failures.push("Mermaid browser bundle is missing");
+}
+const architectureHtml = fs.readFileSync(path.join(outputDir, "docs", "architecture.html"), "utf8");
+if (!architectureHtml.includes('src="../assets/vendor/mermaid.min.js"')) {
+  failures.push("architecture page does not load the local Mermaid bundle");
+}
+const mermaidSources = architectureHtml.match(/class="language-mermaid"/g) ?? [];
+if (mermaidSources.length !== 5) {
+  failures.push(`architecture page contains ${mermaidSources.length} Mermaid sources; expected 5`);
+}
+const homeHtml = fs.readFileSync(path.join(outputDir, "index.html"), "utf8");
+if (homeHtml.includes("assets/vendor/mermaid.min.js")) {
+  failures.push("homepage loads Mermaid without any diagrams");
+}
+
 if (failures.length) {
   console.error(failures.join("\n"));
   process.exit(1);
