@@ -99,7 +99,8 @@ Use transparent mode for:
 Terminated results are incrementally read from PostgreSQL but buffered only up
 to `max_result_rows` and `max_result_bytes` before they are exposed to the
 frontend. Exceeding either bound fails closed and the connection must pass reset
-before reuse. Use transparent mode for genuinely large streaming results.
+before reuse. Use transparent mode when a result may exceed either configured
+limit.
 
 Cancellation closes an in-flight pooled backend connection, preventing a
 possibly still-running operation from being reused. Backend timeouts behave the

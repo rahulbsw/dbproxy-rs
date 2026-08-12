@@ -1,119 +1,63 @@
-# Database and networking review
+# Database and networking assurance review
 
-## Closed in this review
+This review summarizes the safety properties enforced by the current code. It
+is an operating reference, not a release history. `GET /capabilities` and the
+`dbproxy_capability_info` metric provide the machine-readable feature status.
 
-- Backend execution errors no longer advance transaction state, release pins, or
-  start read-after-write windows as if the statement succeeded.
-- Readiness no longer reports healthy before the first successful primary probe.
-- Pool acquisition, backend queries, fanout writes, schema changes, client I/O,
-  and admin requests now have explicit deadlines.
-- Timed-out or result-limit-violating backend connections are disconnected
-  rather than reused with uncertain protocol state.
-- Client, admin, query, result, and prepared-statement resource usage is bounded.
-- SIGTERM is handled alongside Ctrl-C, with bounded graceful session draining.
-- The admin listener has its own connection limit, request-line bound, deadline,
-  method validation, and no-cache responses.
-- Common deterministic session state is replayed across shard connections;
-  unsafe state such as user variables still causes explicit pinning.
-- Prepared routing ignores placeholders inside quoted strings and SQL comments.
-- Shard-key mutations are rejected, including conflict-update clauses.
-- Tuple-form shard-key assignments are rejected, source tables in DML are
-  inspected, unsupported statements touching a sharded table fail closed, and
-  signed numeric literals participate in range routing.
-- Fanout targets for sharded tables must be dedicated shards, ensuring the
-  routed shard cannot silently collapse a configured multi-write into one copy.
-- IPv6 backend addresses in `[address]:port` form are accepted.
-- Secret-bearing configuration structures no longer derive debug formatting.
-- Prometheus coverage now includes query latency buckets and per-backend health,
-  execution, and native pool telemetry with bounded cardinality.
-- Frontend TLS can be preferred or required, and backend TLS supports encrypted,
-  CA-verified, hostname-verified, and optional client-certificate connections.
-- Result forwarding can remain fail-clean and buffered or stream row-by-row with
-  bounded memory for large result sets.
-- PostgreSQL and TimescaleDB use transparent wire forwarding, preserving
-  extended queries, binary types, COPY, cancellation, and unsharded end-to-end
-  TLS.
-- PostgreSQL and TimescaleDB can select a connection-pinned shard from a
-  stripped startup parameter using hash, numeric range, or exact-value maps.
-- PostgreSQL transaction mode can route configured table keys from parsed SQL
-  and perform bounded root `UNION ALL` and decomposable aggregate merges.
-- PostgreSQL scatter branches reserve the shared row/byte budget while backend
-  rows are consumed, prepared routing binds only shard-key parameters, partial
-  Parse type lists follow PostgreSQL inference semantics, and merge metrics
-  describe emitted output rather than hidden branch rows.
-- PostgreSQL scatter rejects volatile, clock-, backend-, and session-dependent
-  expressions before fanout. Parameterized Describe selects a backend whose
-  configured database matches the frontend startup database.
-- Distributed MySQL and PostgreSQL numeric aggregates use arbitrary-precision
-  decimals; PostgreSQL text and binary NUMERIC encoding no longer imposes the
-  narrower client-decimal width.
-- MySQL implicit-commit tracking models autocommit and table-lock state.
-  Transactional cache generations advance after the backend commit boundary,
-  including failed DDL whose leading implicit commit already occurred.
-- PostgreSQL SQL shard rules reject schema-qualified names instead of silently
-  collapsing distinct schemas onto one routing rule.
-- XA journal compaction replaces only the data file while a separate stable
-  lock file preserves process exclusivity across inode replacement.
-- Redis uses transparent RESP2/RESP3 forwarding with separate read-write and
-  read-only listeners, weighted healthy replicas, optional primary fallback,
-  graceful draining, directional byte counters, and backend transport metrics.
-- Redis and Valkey can select a connection-pinned shard through an intercepted
-  pre-authentication `DBPROXY.SHARD` command using the same three strategies.
-- NanoID-backed operation identifiers correlate protocol sessions without
-  creating unbounded Prometheus labels.
-- MySQL classification and sharding share one parsed AST, fanout is
-  bounded-concurrent, result rows are sized once, and weighted replica
-  selection no longer allocates on each route.
-- Redis shard selection uses bounded buffered RESP parsing with SIMD-dispatched
-  delimiter search and safely preserves pipelined read-ahead bytes.
-- PostgreSQL and Redis relay buffer sizes are configurable, query histograms
-  require one bucket update per observation, and SQL-analysis cost is exported
-  explicitly.
-- Redis/Valkey command mode computes key placement inside DBProxy, supports
-  CRC16 hash tags and bounded multi-key merge/sum operations, replays safe
-  connection state, and rejects unknown or stateful command shapes.
-- PostgreSQL backends can opt into authenticated `SELECT 1` readiness with
-  separately scoped credentials and certificate/hostname-verified TLS or mTLS,
-  while retaining TCP-only probes by default.
-- Redis/Valkey command-mode read-only listeners fail closed for writes, unsafe
-  scripts, and unknown commands and expose a dedicated rejection counter.
-- A production-oriented Helm chart provides two or more independent replicas,
-  safe rolling updates, disruption protection, hardened pods, health probes,
-  separate data/admin services, secret/config integration, and optional
-  monitoring and network policy.
+## Current guarantees
+
+| Area | Enforced behavior |
+| --- | --- |
+| Execution state | Backend errors do not advance transaction state, release pinned connections, or start read-after-write windows. Timed-out or protocol-uncertain backend connections are discarded. |
+| Admission and limits | Client, admin, query, prepared-statement, result, and fanout resources have configured bounds. Client I/O, pool acquisition, backend queries, fanout, health checks, and shutdown have deadlines. |
+| Readiness | A required primary must pass a health probe before readiness succeeds. XA in-doubt state and required topology failures withdraw readiness. |
+| Pool hygiene | Transactions and unsafe session state pin the exact backend. MySQL and PostgreSQL pooled connections are reset and validated before reuse. |
+| MySQL routing | SQL classification and shard selection share one parsed AST. Parse uncertainty, locking reads, shard-key mutation, unsafe DML sources, unsupported sharded statements, and multi-shard ordinary statements route conservatively or fail closed. |
+| Prepared statements | Routing ignores placeholders in comments and quoted strings. Bound shard parameters select the route, while prepared metadata and result limits remain enforced. |
+| Distributed reads | MySQL and PostgreSQL/TimescaleDB support bounded root-level `UNION ALL` and decomposable aggregate plans. Shared concurrency, row, byte, deadline, expression-safety, and metadata checks apply before results are returned. |
+| Numeric merges | Distributed `SUM` and `AVG` use arbitrary-precision decimal arithmetic. PostgreSQL text and binary NUMERIC output does not narrow values to the client-decimal width. |
+| Write fanout | Fanout is bounded-concurrent. Dedicated fanout shards prevent a configured copy from collapsing onto the routed shard. Partial non-atomic completion is reported explicitly. |
+| MySQL XA | Allowlisted autocommit DML uses a checksummed, fsynced decision journal. A stable lock file preserves single-process ownership across compaction. Startup recovery acts only on XIDs in the originating journal. |
+| Cache consistency | MySQL cache generations advance at the backend commit boundary, including an implicit commit that precedes a later DDL failure. Transactional invalidation waits for commit. |
+| PostgreSQL | Transparent mode preserves the native wire protocol. Transaction mode adds frontend authentication/TLS, verified backend TLS, bounded pools, parsed read/write and shard routing, exact cancellation mapping, and reset-before-reuse. |
+| Redis / Valkey | Connection mode relays RESP2/RESP3 transparently. Command mode uses bounded parsing, key-based routing, safe state replay, explicit multi-key operations, and fail-closed handling for unknown or stateful command shapes. |
+| Redis topology | Sentinel changes a primary only after configured address quorum. Cluster routing accepts complete slot maps and validates bounded `MOVED` and `ASK` redirects, including `ASKING` order. |
+| TLS | MySQL supports optional or required frontend TLS and per-backend certificate/hostname verification with optional client certificates. PostgreSQL transaction pools and SQL readiness probes support certificate-verified TLS or mTLS. |
+| Sensitive data | Secret-bearing configuration does not implement debug formatting. Logs and metrics exclude SQL text, Redis keys and values, credentials, shard-key values, and per-session identifiers. |
+| Observability | Bounded-cardinality metrics cover traffic, routing, failures, latency, health, pool pressure, fanout/XA, scatter/gather, caching, and topology state. NanoIDs correlate protocol sessions in logs only. |
+| Deployment | SIGTERM and Ctrl-C trigger bounded draining. The Helm chart adds probes, disruption protection, hardened pods, separate data/admin services, secret/config integration, and optional monitoring and network policy. |
 
 ## Intentional production boundaries
 
-- Default synchronous fanout is non-atomic. Optional MySQL XA provides durable
-  atomicity only for allowlisted autocommit DML; it does not span a client
-  transaction or remove schema/application idempotency requirements.
-- Bounded MySQL root-level `UNION ALL` concatenation and decomposable
-  `COUNT`/`SUM`/`AVG`/numeric-or-temporal-`MIN`/`MAX` merges are implemented.
-  Cross-shard joins, ordered/grouped distributed merges, general distributed
-  transactions, and online resharding are not implemented.
-- Streaming mode cannot replace a partially emitted result with a MySQL error;
-  mid-stream failures close the client connection and require application retry.
-- etcd can reload scoped MySQL policy. XA durability, listeners, and backend or
-  protocol topology remain restart-only.
-- MySQL result caching is opt-in per table and transaction-aware for writes
-  passing through DBProxy. Streaming reads and direct database writes bypass
-  its coherence contract; use bounded TTLs or an external CDC
-  invalidator for those topologies.
-- PostgreSQL transparent forwarding remains connection-pinned. The optional
-  terminating mode adds bounded transaction pools and simple/common-extended
-  read/write routing, but `COPY` and unrestricted custom/array/extension type
-  fidelity remain on transparent mode.
-- PostgreSQL startup sharding cannot be inspected through native end-to-end TLS.
-  Terminating mode supports frontend TLS termination followed by a separately
-  verified backend TLS or mTLS hop.
-- Redis/Valkey connection mode preserves Pub/Sub, transactions, scripts, RESP3
-  pushes, AUTH/ACL, TLS, and large values. Command mode intentionally rejects
-  those stateful/streaming shapes when safe multi-shard semantics are not
-  available. Sentinel mode discovers quorum-approved primaries but keeps
-  replicas static. Cluster command mode owns a bounded slot map and rewrites
-  MOVED/ASK, but uses primaries for reads and needs directly reachable announced
-  addresses plus plaintext or externally terminated TLS.
+- Default synchronous fanout is non-atomic. Optional MySQL XA covers only
+  allowlisted autocommit DML; it does not span a client transaction or remove
+  schema and application idempotency requirements. XA recovery also depends on
+  the originating journal, stable participant mapping, and connectivity.
+- Scatter/gather supports root-level `UNION ALL` and aggregate-only
+  `COUNT`/`SUM`/`AVG`/numeric-or-temporal-`MIN`/`MAX`. Cross-shard joins,
+  ordered or grouped distributed merges, general distributed transactions, and
+  online resharding are not implemented.
+- Streaming mode cannot replace a partially emitted result with a protocol
+  error. A mid-stream failure closes the client connection; the application
+  must decide whether the operation is safe to retry.
+- etcd reloads scoped MySQL policy. XA durability, listeners, backends, and
+  PostgreSQL or Redis topology remain restart-only.
+- MySQL caching is opt-in per table and transaction-aware for writes passing
+  through DBProxy. Streaming reads and direct database writes bypass the
+  coherence contract; use bounded TTLs or the external CDC invalidation
+  contract for those topologies.
+- PostgreSQL transparent forwarding remains connection-pinned. Transaction mode
+  pools and routes supported simple/common-extended traffic, but `COPY` and
+  unrestricted custom, array, and extension types stay in transparent mode.
+- Native end-to-end TLS hides PostgreSQL startup shard metadata. Inspecting that
+  metadata requires frontend TLS termination followed by a separately verified
+  backend TLS or mTLS connection, or a trusted plaintext hop.
+- Redis connection mode preserves transactions, Pub/Sub, scripts, RESP3 pushes,
+  AUTH/ACL, TLS, and large values. Command mode rejects stateful or streaming
+  shapes without defined multi-shard semantics. Sentinel does not discover
+  replicas or terminate TLS. Cluster command mode uses primaries for reads and
+  requires directly reachable announced addresses.
 
-These boundaries are fail-closed where routing correctness is involved and are
-called out in the main README so operators can choose the correct deployment
-controls.
+Routing correctness boundaries fail closed. See
+[boundary status](boundary-closure.md) for each disposition and
+[advanced execution](advanced-features.md) for unfinished acceptance gates.

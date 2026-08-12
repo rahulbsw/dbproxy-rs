@@ -3,6 +3,9 @@
 Start with the main [README](../README.md) for the feature summary and quick
 start. The focused guides below describe design and operating contracts.
 
+The same material is published as a categorized, searchable
+[documentation site](https://rahulbsw.github.io/dbproxy-rs/).
+
 | Document | Use it for |
 | --- | --- |
 | [Quick start](quick-start.md) | Start, verify, inspect, and stop the disposable multi-protocol demo |
@@ -19,9 +22,9 @@ start. The focused guides below describe design and operating contracts.
 | [CDC cache invalidation contract](cdc-cache-invalidation.md) | Durable offsets, lag fail-closed behavior, and acceptance gates for direct writes |
 | [MySQL XA fanout](mysql-xa.md) | Atomic fanout configuration, recovery, storage, and retry contract |
 | [Shared etcd control plane](control-plane.md) | Immutable runtime generations, last-known-good behavior, and transaction draining |
-| [Database and networking review](review.md) | Closed correctness issues and intentional production boundaries |
+| [Database and networking assurance review](review.md) | Current safety guarantees and intentional production boundaries |
 | [Advanced execution roadmap](advanced-features.md) | Safety contracts for XA, scatter/gather, online resharding, and streaming |
-| [Boundary closure plan](boundary-closure.md) | Delivery phases and acceptance gates for every known boundary |
+| [Boundary status](boundary-closure.md) | Disposition, open engineering work, and invariants for every known boundary |
 | [Contributing](../CONTRIBUTING.md) | Development workflow, validation, and pull-request expectations |
 | [Security policy](../SECURITY.md) | Private reporting and deployment responsibilities |
 

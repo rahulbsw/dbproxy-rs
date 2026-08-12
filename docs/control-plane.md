@@ -33,11 +33,11 @@ and validated as a complete candidate configuration. Cache connectivity is also
 proved when fail-closed caching is selected. Only then is one `ArcSwap`
 operation used to publish the generation for new MySQL sessions.
 
-Existing sessions—including transactions, prepared statements, pinned session
-state, and in-flight cache fills—retain the `Arc` for their original generation
-and drain normally. A proxy crash still terminates its transactions; the
-database rolls them back and the client must retry. Transaction state is never
-stored in etcd.
+Existing sessions retain the `Arc` for their original generation and drain
+normally. This includes transactions, prepared statements, pinned session
+state, and in-flight cache fills. A proxy crash still terminates its
+transactions; the database rolls them back and the client must retry.
+Transaction state is never stored in etcd.
 
 Malformed values, missing keys after startup, endpoint outages, authentication
 failures, and TLS failures retain the last-known-good generation and increment

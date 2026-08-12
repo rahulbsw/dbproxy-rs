@@ -1,4 +1,4 @@
-# Boundary closure plan
+# Boundary status
 
 This document turns each known boundary into an explicit engineering contract.
 “Planned” does not mean silently approximated: DBProxy continues to fail closed
@@ -29,68 +29,20 @@ The live status is also available from `GET /capabilities` and
 | Admin SQL | Authenticated control plane | Keep separate from data credentials; add authorization, audit records, deadlines, and read-only defaults |
 | Atomic write fanout | Implemented, constrained | MySQL XA decision journal and restart recovery for allowlisted autocommit DML; online reconciliation and client-transaction fanout remain open |
 
-## Delivery sequence
+## Open engineering work
 
-### Phase 1: transport and capability safety (complete)
+| Area | Remaining work | Required safety gate |
+| --- | --- | --- |
+| PostgreSQL compatibility | Cross-shard schema and prepared-metadata fingerprints; terminated `COPY`; unrestricted custom, array, and extension types; larger streamed results | Reject incompatible metadata before execution; prove reset and bounded-memory behavior for every added protocol shape |
+| Redis Sentinel | Replica discovery, topology epoch comparison, and Sentinel TLS | Require coherent quorum-approved snapshots and fail readiness when no current topology can be proved |
+| Redis Cluster | Replica reads and protocol termination/TLS | Validate a complete slot epoch, bind redirects to configured nodes, and enforce read consistency explicitly |
+| Distributed reads | Global order/limit, grouping, distinctness, windows, collation-aware string extrema, and bounded joins | Define exact merge semantics and cap concurrency, rows, bytes, and data movement before fanout |
+| AST and catalog | Automatic table rewriting | Use a versioned schema snapshot and validate generated SQL before routing |
+| XA operations | Background reconciliation, an authenticated operator API, shared recovery ownership, and client-transaction fanout | Preserve durable decisions; use leases and fencing before a peer can recover another coordinator's XIDs |
+| Online resharding | Versioned epochs, dual-write/outbox integration, checkpointed backfill, verification, and cutover | Block cutover on unresolved transactions, incomplete checkpoints, mismatched checksums, or mixed routing epochs |
 
-- certificate-verified PostgreSQL readiness TLS and optional mTLS
-- machine-readable capability registry and static capability metrics
-- reject configuration that supplies TLS material while readiness TLS is
-  disabled or has no trust anchor
-
-### Phase 2: topology and compatibility (partially complete)
-
-- Remaining: PostgreSQL cross-shard schema and prepared-metadata fingerprints.
-- Redis Sentinel address-quorum snapshots, topology epochs, primary failover,
-  and metrics are implemented; replica discovery and Sentinel TLS remain.
-- Redis Cluster complete slot maps plus bounded `MOVED` and `ASK` handling are
-  implemented; replica reads and protocol termination/TLS remain.
-- Versioned etcd runtime snapshots and per-session generation draining are
-  implemented for the documented MySQL policy scope.
-
-Acceptance requires fault tests for topology changes during connection
-establishment and active requests. An instance must fail readiness if it cannot
-prove one coherent topology/configuration epoch.
-
-### Phase 3: PostgreSQL termination and pooling (common extended milestone complete)
-
-Implement a separate listener mode; do not alter transparent mode:
-
-Implemented: client TLS termination and MD5 authentication, independently
-verified backend TLS/mTLS, bounded transaction pools, parsed simple/extended
-routing, read-after-write consistency, exact transaction pinning, conservative
-session-state pinning, cancellation, reset-before-reuse, and pool metrics.
-
-Remaining in this phase: `COPY`, custom/array/extension result types, streaming
-large terminated results, and finer-grained handling for temporary objects and
-advisory locks. Those shapes continue to use transparent mode.
-
-Cancellation keys must map to the exact in-flight backend. Pool reuse requires
-an explicit reset that proves no transaction, portal, prepared statement,
-temporary object, role change, or session setting leaks to the next client.
-
-### Phase 4: distributed reads
-
-The first MySQL and PostgreSQL/TimescaleDB scatter modes accept one sharded
-table and only AST shapes with
-an explicit implemented merge: root-level `UNION ALL` concatenation, or an
-aggregate-only projection using `COUNT`, `SUM`, weighted `AVG`, and
-numeric/temporal `MIN`/`MAX`. Every plan has shared shard, concurrency, row, and
-byte limits plus dedicated metrics. Volatile and session-dependent expressions
-are rejected before PostgreSQL fanout. Global order/limit, distinctness, grouping,
-windows, string-collation extrema, and joins remain rejected.
-
-Cross-shard joins remain disabled until the planner can estimate and cap data
-movement. Automatic rewriting remains disabled until it is backed by the same
-versioned catalog used for metadata validation.
-
-### Phase 5: durable writes and online movement
-
-Constrained MySQL XA fanout now has a durable decision journal and restart
-recovery for allowlisted autocommit DML. General client-transaction fanout,
-online reconciliation APIs, and resharding orchestration remain future phases.
-The cache is rejected with XA until invalidation is tied to the same committed
-configuration and transaction epochs.
+The [advanced execution roadmap](advanced-features.md) defines the state
+machines and acceptance tests for distributed reads, XA, and resharding.
 
 ## Non-negotiable invariants
 

@@ -8,9 +8,10 @@ generations across the replicas while transactions remain local and pinned.
 MySQL XA atomic fanout is the exception to the default stateless deployment.
 Set `replicaCount: 1` and `persistence.enabled: true`, then configure
 `xa_journal_path = "/var/lib/dbproxy/xa-journal.jsonl"`. The chart uses a
-single PVC and `Recreate` updates in this mode. For active-active XA, deploy one
-release and PVC per replica; a shared journal is intentionally rejected by its
-single-writer lock. See [the XA guide](../../docs/mysql-xa.md).
+single PVC and `Recreate` updates in this mode. Separate releases and PVCs may
+run independent XA coordinators concurrently, but one replica cannot recover
+another replica's XIDs. A shared filesystem journal is intentionally rejected
+by its single-writer lock. See [the XA guide](../../docs/mysql-xa.md).
 
 The repository deployer creates or checks the credentials Secret and performs
 an atomic Helm upgrade in one command. Supply a private values file containing

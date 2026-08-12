@@ -120,9 +120,11 @@ The deployer reduces command count; it does not remove the need to:
 For MySQL XA atomic fanout, set `replicaCount: 1` and
 `persistence.enabled: true`; the chart mounts a single-writer PVC at
 `/var/lib/dbproxy` and switches updates to `Recreate` so the journal is never
-mounted by two Deployment pods. Run separate one-replica releases with separate
-PVCs for active-active XA. Never place the decision journal on `emptyDir`; see
-[the XA guide](mysql-xa.md).
+mounted by two Deployment pods. Separate one-replica releases with separate
+PVCs may process XA transactions concurrently, but each release owns and
+recovers only its local XIDs. This does not provide peer recovery after a
+replica loses access to its volume. Never place the decision journal on
+`emptyDir`; see [the XA guide](mysql-xa.md).
 
 See the [Helm chart guide](../charts/dbproxy/README.md) and
 [operations guide](operations.md) for these contracts.

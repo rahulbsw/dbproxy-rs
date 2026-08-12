@@ -105,6 +105,7 @@ require transparent connection mode and therefore are not Cluster-rewritten.
 The Redis backend metrics include topology epoch; Sentinel refresh, failure,
 and failover totals; Cluster refresh failures; and MOVED, ASK, and redirect
 failure totals. Alert on any failed refresh, sustained readiness loss, redirect
-failure, or rapidly increasing MOVED traffic. A MOVED spike usually indicates a
-stale map or active resharding; persistent refresh failure means DBProxy cannot
-prove one coherent topology.
+failure, or a sustained increase in MOVED responses. Correlate rising MOVED
+responses with slot-map refreshes, announced-node reachability, and planned
+resharding. Persistent refresh failure means DBProxy cannot prove one coherent
+topology.

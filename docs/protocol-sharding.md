@@ -6,8 +6,8 @@ covered there as well.
 
 PostgreSQL/TimescaleDB transparent mode and the default Redis/Valkey mode remain
 connection-pinned so backend authentication and protocol state retain native
-semantics. PostgreSQL transaction mode routes simple/common-extended statements within a
-SQL-selected or startup-selected shard, while Redis/Valkey additionally offers
+semantics. PostgreSQL transaction mode routes simple/common-extended statements
+within a SQL-selected or startup-selected shard. Redis/Valkey also offers
 command routing for proxy-side key hashing and explicitly supported multi-key
 operations.
 

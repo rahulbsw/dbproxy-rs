@@ -14,6 +14,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  website:
+    name: Documentation site
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Build and validate site
+        working-directory: website
+        run: |
+          npm ci
+          npm run build
+          npm run check
+
   rust:
     name: Rust checks
     runs-on: ubuntu-latest

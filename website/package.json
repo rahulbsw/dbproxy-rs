@@ -1,0 +1,13 @@
+{
+  "name": "dbproxy-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node test-site.mjs"
+  },
+  "devDependencies": {
+    "marked": "18.0.9",
+    "marked-gfm-heading-id": "4.1.4"
+  }
+}

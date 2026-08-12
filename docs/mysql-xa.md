@@ -1,8 +1,8 @@
 # MySQL XA atomic fanout
 
-DBProxy's default write fanout is fast and explicitly non-atomic. Set
-`atomic = true` only when one allowlisted `INSERT`, `UPDATE`, or `DELETE` must
-commit on the routed primary and all configured fanout primaries together.
+DBProxy's default write fanout is explicitly non-atomic. Set `atomic = true`
+only when one allowlisted `INSERT`, `UPDATE`, or `DELETE` must commit on the
+routed primary and all configured fanout primaries together.
 
 ```toml
 [write_fanout]
@@ -31,8 +31,10 @@ journal file.
 - After `commit_decided`, DBProxy never changes the decision to rollback. If a
   participant cannot confirm commit, the client receives an explicit
   "commit decided but incomplete" error and `/readyz` returns 503. Do not
-  blindly retry the application operation; restart recovery will finish the
-  original XID, and a retry could create a duplicate logical write.
+  blindly retry the application operation; a retry could create a duplicate
+  logical write. Restart recovery retries the original XID only when the
+  originating durable journal is available, participant mappings still resolve
+  to the same resource managers, and those participants are reachable.
 - On startup, undecided or merely prepared records are durably changed to abort;
   commit decisions continue commit. Recovery treats MySQL `XAER_NOTA` as the
   idempotent result of an earlier successful resolution attempt.
@@ -68,9 +70,13 @@ process-level lease. Keep the journal and its lock file on the same persistent
 volume and do not remove either while DBProxy is running.
 
 The supplied Helm chart's `persistence.enabled` mode is deliberately limited to
-one Deployment replica and one PVC. For active-active XA, run separate releases
-with one PVC each, or introduce a StatefulSet with per-pod volume claims before
-scaling a single release.
+one Deployment replica and one PVC. Separate releases with one PVC each, or a
+StatefulSet with per-pod claims, can run independent XA coordinators
+concurrently. Each coordinator can recover only the XIDs in its own journal.
+This is not active-active XA recovery: a surviving peer cannot recover an XID
+owned by a failed replica. Active-active recovery requires a shared durable
+decision store plus ownership leases and fencing, which DBProxy does not yet
+provide.
 
 Back up the journal with the database recovery plan. Never delete or replace it
 while `dbproxy_xa_in_doubt_transactions` is non-zero.
