@@ -53,5 +53,5 @@ The adapter is production-ready only after tests prove:
 6. DDL, truncate, reshard mapping changes, and unknown tables fail closed;
 7. bounded memory, payload, retry, and shutdown behavior.
 
-This contract is documented now so a later CDC implementation cannot weaken
-cache correctness merely to claim feature coverage.
+Future CDC adapters must pass these gates before DBProxy enables cache hits for
+direct database writes.

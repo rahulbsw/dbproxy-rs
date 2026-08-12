@@ -11,3 +11,5 @@
 *.pem
 *.key
 *.crt
+/website/node_modules/
+/website/dist/

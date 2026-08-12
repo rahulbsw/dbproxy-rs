@@ -61,9 +61,9 @@ verify both the trust chain and hostname and can use an explicit CA and client
 identity.
 
 When Redis is enabled, readiness also requires TCP transport health to every
-configured shard primary. Sentinel mode additionally requires the most recent
-refresh to reach its configured address quorum. Cluster mode instead requires a
-complete current 16,384-slot snapshot. `/redis/backends` reports dynamic
+configured shard primary. Sentinel mode also requires the most recent refresh
+to reach its configured address quorum. Cluster mode instead requires a complete
+current 16,384-slot snapshot. `/redis/backends` reports dynamic
 Sentinel primary addresses plus transport and connection counters. Static
 transport probes do not authenticate, issue `PING`, validate replication role,
 or measure replica lag.
@@ -141,8 +141,9 @@ database values are never used as labels.
   endpoints did not agree at quorum; readiness is withdrawn.
 - Any `dbproxy_redis_cluster_refresh_failures_total` or
   `dbproxy_redis_cluster_redirect_failures_total` increase: the native slot map
-  or a redirection could not be proven safe. A MOVED spike without refresh
-  recovery usually indicates active resharding or unreachable announced nodes.
+  or a redirection could not be proven safe. When MOVED responses rise without
+  a successful refresh, check for planned resharding and unreachable announced
+  nodes.
 - Any sustained increase in
   `dbproxy_postgres_shard_routing_failures_total` or
   `dbproxy_redis_shard_routing_failures_total`: missing client initialization,

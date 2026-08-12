@@ -36,7 +36,7 @@ All three protocol adapters support the following placement strategies:
 | `value` | Exact, case-sensitive UTF-8 value lookup. | Every accepted value must be declared once. |
 
 Hash, range, and value placement normally select one shard. MySQL and
-PostgreSQL/TimescaleDB transaction mode additionally support bounded top-level
+PostgreSQL/TimescaleDB transaction mode also support bounded top-level
 `UNION ALL` concatenation and decomposable aggregate merges. Cross-shard joins
 and globally ordered/grouped merges remain rejected.
 Redis command mode supports only its documented bounded multi-key command set.

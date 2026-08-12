@@ -5,59 +5,32 @@ shard boundaries. A configuration option must not be exposed as production
 ready until its acceptance gates are implemented and exercised against the
 matching real database protocol.
 
-## Current milestone
+## Status source
 
-Completed:
+`GET /capabilities` and `dbproxy_capability_info` report live feature status.
+The [assurance review](review.md) groups current guarantees, and
+[boundary status](boundary-closure.md) records each remaining constraint. This
+document defines the acceptance gates for distributed execution work, including
+background XA reconciliation, richer distributed reads, and online resharding.
 
-- frontend TLS with `disabled`, `preferred`, and `required` modes
-- per-backend TLS with encrypted-only, CA verification, hostname verification,
-  and optional client certificates
-- buffered or row-by-row streaming result forwarding
-- a Docker/Podman Compose integration workflow that validates replica reads,
-  primary writes, prepared statements, health, and metrics
-- transparent PostgreSQL/TimescaleDB read-write and read-only listeners with
-  weighted backend selection, COPY/extended-protocol preservation, cancellation
-  broadcast, unsharded end-to-end TLS, optional authenticated SQL readiness
-  with verified TLS or mTLS, transport health, and metrics
-- opt-in PostgreSQL/TimescaleDB simple/common-extended termination with frontend
-  authentication/TLS, independently verified backend TLS, bounded transaction
-  pools, SQL read/write routing, transaction/session pinning, post-write
-  consistency, cancellation, and per-pool pressure metrics
-- transparent Redis read-write and read-only listeners with RESP2/RESP3
-  preservation, weighted replica selection, end-to-end AUTH/ACL and unsharded TLS,
-  graceful draining, transport health, and metrics
-- connection-level PostgreSQL/TimescaleDB and Redis/Valkey sharding plus
-  PostgreSQL transaction-mode SQL rules, with shared hash, half-open numeric
-  range, and exact-value strategies
-- opt-in Redis/Valkey command sharding with CRC16 hash tags, bounded fanout,
-  ordered `MGET` merge, integer aggregation, guarded non-atomic writes, and
-  command-mode read-only enforcement
-- Redis Sentinel primary discovery with configurable address quorum, plus
-  native Redis Cluster full-slot snapshots and bounded MOVED/ASK handling
-- NanoID operation identifiers for bounded-cardinality log correlation
-- a hardened active-active Helm deployment with independent stateless replicas
-- constrained MySQL XA fanout for allowlisted autocommit DML, with a checksummed
-  fsynced journal, bounded participants, restart recovery, and in-doubt metrics
-
-Run the live protocol and routing suite with Docker Compose or Podman Compose;
-the script auto-detects a running runtime:
+Run the live protocol and routing suite with a running Docker Compose or Podman
+Compose implementation:
 
 ```bash
 ./scripts/integration.sh
 ```
 
-Set `DBPROXY_KEEP_CONTAINERS=1` to retain the containers after the test.
-`DBPROXY_KEEP_DOCKER=1` remains a backward-compatible alias. Set
-`DBPROXY_COMPOSE="podman-compose"` or `DBPROXY_COMPOSE="docker compose"` to
-override auto-detection.
+The script detects the runtime. Set `DBPROXY_KEEP_CONTAINERS=1` to retain the
+containers, or set `DBPROXY_COMPOSE="podman-compose"` or
+`DBPROXY_COMPOSE="docker compose"` to override detection.
 
 ## Distributed-atomic write fanout
 
-The first atomic mode targets MySQL XA transactions and uses the routed primary
-and every fanout primary as XA participants. The state machine below is now
-implemented; see [mysql-xa.md](mysql-xa.md) for its operating contract.
+The implemented atomic mode uses MySQL XA with the routed primary and every
+fanout primary as participants. See [mysql-xa.md](mysql-xa.md) for its operating
+contract.
 
-Required state machine:
+DBProxy executes this state machine:
 
 1. allocate a globally unique, length-bounded transaction ID;
 2. durably record the participant shard set and an undecided transaction;
@@ -69,16 +42,15 @@ Required state machine:
 8. durably mark the transaction complete and compact completed records.
 
 Any failure before the commit decision drives `XA ROLLBACK`. A failure after
-the durable commit decision is an in-doubt commit, not a rollback. The current
-release retries recovery during startup and withholds readiness until
-completion; online background reconciliation and an operator admin endpoint
-remain follow-up work.
+the durable commit decision is an in-doubt commit, not a rollback. DBProxy
+retries recovery during startup and withholds readiness until completion.
+Online background reconciliation and an operator admin endpoint remain open.
 
 Startup does not accept traffic until the coordinator scans its checksummed,
 versioned journal and reconciles known decisions. Unknown prepared XA
 transactions are not adopted or guessed; operators must inspect them directly.
 
-Initial constraints:
+Current constraints:
 
 - autocommit DML only; no nesting inside client transactions
 - deterministic statement values and application-supplied IDs
@@ -92,12 +64,11 @@ and oldest in-doubt age.
 
 ## Scatter/gather reads
 
-The implemented first release accepts only read-only queries over one
-configured MySQL or PostgreSQL/TimescaleDB sharded table when the AST provides
-an explicit safe merge:
-a root-level `UNION ALL`, or an aggregate-only projection using the supported
-decomposable functions. Locking reads, user variables, session-dependent
-functions, cross-shard joins, and writes remain rejected.
+Scatter/gather accepts read-only queries over one configured MySQL or
+PostgreSQL/TimescaleDB sharded table when the AST provides an explicit safe
+merge: a root-level `UNION ALL`, or an aggregate-only projection using the
+supported decomposable functions. Locking reads, user variables,
+session-dependent functions, cross-shard joins, and writes remain rejected.
 
 Execution must:
 
@@ -108,7 +79,7 @@ Execution must:
 5. merge results according to an explicit supported merge strategy;
 6. cancel and discard uncertain backend connections on failure.
 
-The initial merge strategies are root-level `UNION ALL` concatenation and
+The supported merge strategies are root-level `UNION ALL` concatenation and
 aggregate-only `COUNT`, `SUM`, numeric/temporal `MIN` and `MAX`, plus `AVG`
 rewritten as shard-local `SUM` and `COUNT`. All plans share configured shard,
 row, byte, and concurrency limits. Later strategies require separate
@@ -120,9 +91,9 @@ implementations:
 
 `DISTINCT`, arbitrary expressions, window functions, and non-decomposable
 aggregates remain unsupported until their exact global semantics are defined.
-The first implementation buffers every gather—even when ordinary query mode is
-configured for streaming—under one shared row/byte budget so a shard failure is
-reported before any partial client response.
+DBProxy buffers every gather under one shared row and byte budget, including
+when ordinary query mode uses streaming. This lets it report a shard failure
+before sending a partial client response.
 
 Metrics cover scatter plans, participating shards, failures, merged rows/bytes,
 and execution latency through the normal query-duration histogram.
