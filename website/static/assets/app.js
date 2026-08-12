@@ -80,6 +80,49 @@ document.querySelectorAll("[data-route-tab]").forEach((tab) => {
   });
 });
 
+const mermaidDiagrams = window.mermaid
+  ? [...document.querySelectorAll(".prose pre > code.language-mermaid")]
+    .map((code, index) => {
+      const diagram = document.createElement("figure");
+      diagram.className = "mermaid-diagram";
+      diagram.setAttribute("aria-label", `Architecture diagram ${index + 1}`);
+      diagram.textContent = code.textContent?.trim() || "";
+      code.parentElement.replaceWith(diagram);
+      return { diagram, source: diagram.textContent };
+    })
+  : [];
+
+if (mermaidDiagrams.length) {
+  window.mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: "strict",
+    suppressErrorRendering: true,
+    theme: "base",
+    fontFamily: "Source Sans 3, system-ui, sans-serif",
+    themeVariables: {
+      primaryColor: "#e4f2f3",
+      primaryTextColor: "#102832",
+      primaryBorderColor: "#19788b",
+      lineColor: "#19788b",
+      secondaryColor: "#fff3d6",
+      tertiaryColor: "#f4f8f7",
+      clusterBkg: "#edf5f5",
+      clusterBorder: "#a9c1c4",
+      edgeLabelBackground: "#f4f8f7",
+      fontSize: "16px",
+    },
+    flowchart: { htmlLabels: false, curve: "basis" },
+  });
+  window.mermaid.run({ nodes: mermaidDiagrams.map(({ diagram }) => diagram) }).catch((error) => {
+    for (const { diagram, source } of mermaidDiagrams) {
+      if (diagram.querySelector("svg")) continue;
+      diagram.classList.add("mermaid-fallback");
+      diagram.textContent = source;
+    }
+    console.error("Failed to render Mermaid diagram", error);
+  });
+}
+
 document.querySelectorAll(".prose pre").forEach((block) => {
   const code = block.querySelector("code");
   if (!code) return;

@@ -332,7 +332,7 @@ function siteHeader(currentOutput) {
   </header>`;
 }
 
-function pageHead({ title, description, output }) {
+function pageHead({ title, description, output, mermaid = false }) {
   const assetPrefix = rootPrefix(output);
   return `<!doctype html>
 <html lang="en">
@@ -345,6 +345,7 @@ function pageHead({ title, description, output }) {
   <title>${escapeHtml(title)} · dbproxy-rs</title>
   <link rel="icon" href="${assetPrefix}assets/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="${assetPrefix}assets/styles.css">
+  ${mermaid ? `<script src="${assetPrefix}assets/vendor/mermaid.min.js"></script>` : ""}
   <script type="module" src="${assetPrefix}assets/app.js"></script>
 </head>
 <body data-root="${assetPrefix}">`;
@@ -380,7 +381,7 @@ function renderDocument(page, markdown) {
     ${next ? `<a class="pager-next" href="${escapeHtml(relativeHref(page.output, next.output))}"><span>Next</span>${escapeHtml(next.title)}</a>` : "<span></span>"}
   </nav>`;
 
-  return `${pageHead({ ...page, title: page.title })}
+  return `${pageHead({ ...page, title: page.title, mermaid: article.includes('class="language-mermaid"') })}
     ${siteHeader(page.output)}
     <div class="mobile-nav-backdrop" data-menu-backdrop></div>
     <div class="docs-layout">
@@ -505,6 +506,12 @@ function copyTree(source, destination) {
 fs.rmSync(outputDir, { recursive: true, force: true });
 fs.mkdirSync(outputDir, { recursive: true });
 copyTree(staticDir, outputDir);
+const vendorDir = path.join(outputDir, "assets", "vendor");
+fs.mkdirSync(vendorDir, { recursive: true });
+fs.copyFileSync(
+  path.join(websiteDir, "node_modules", "mermaid", "dist", "mermaid.min.js"),
+  path.join(vendorDir, "mermaid.min.js"),
+);
 copyTree(path.join(repositoryDir, "config"), path.join(outputDir, "config"));
 copyTree(path.join(repositoryDir, "scripts"), path.join(outputDir, "scripts"));
 copyTree(path.join(repositoryDir, "charts", "dbproxy"), path.join(outputDir, "charts", "dbproxy"));

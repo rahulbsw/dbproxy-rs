@@ -23,6 +23,7 @@ The build produces:
 
 - a task-based landing page;
 - categorized navigation and per-page tables of contents;
+- locally bundled Mermaid rendering with a readable source fallback;
 - a section-level client-side search index;
 - responsive desktop and mobile layouts;
 - local copies of referenced configuration, script, chart, and license files.

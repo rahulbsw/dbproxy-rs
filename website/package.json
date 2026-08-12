@@ -8,6 +8,7 @@
   },
   "devDependencies": {
     "marked": "18.0.9",
-    "marked-gfm-heading-id": "4.1.4"
+    "marked-gfm-heading-id": "4.1.4",
+    "mermaid": "11.16.1"
   }
 }
