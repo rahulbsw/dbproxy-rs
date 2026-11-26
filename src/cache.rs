@@ -90,7 +90,11 @@ impl CacheManager {
         self.rules.get(&table.to_ascii_lowercase())
     }
 
-    pub async fn query_key(&self, scope: &CacheScope, query: &str) -> Result<String, ProxyError> {
+    pub async fn query_key(
+        &self,
+        scope: &CacheScope,
+        query: impl AsRef<[u8]>,
+    ) -> Result<String, ProxyError> {
         let version = self.version(scope).await?;
         let mut digest = Sha256::new();
         digest.update(scope.schema.as_bytes());
@@ -101,7 +105,7 @@ impl CacheManager {
         digest.update([0]);
         digest.update(version.to_be_bytes());
         digest.update([0]);
-        digest.update(query.as_bytes());
+        digest.update(query.as_ref());
         let digest = digest.finalize();
         let mut encoded = String::with_capacity(digest.len() * 2);
         for byte in digest {
@@ -387,6 +391,8 @@ pub struct CachedResult {
     pub columns: Vec<CachedColumn>,
     pub rows: Vec<Vec<CachedValue>>,
     pub bytes_returned: u64,
+    #[serde(default)]
+    wire_metadata: Option<Vec<(u16, u32, u8)>>,
 }
 
 impl CachedResult {
@@ -399,11 +405,34 @@ impl CachedResult {
                 .map(|row| row.iter().map(CachedValue::from).collect())
                 .collect(),
             bytes_returned,
+            wire_metadata: None,
         }
+    }
+
+    pub fn new_with_wire_metadata(
+        columns: &[Column],
+        rows: &[Vec<Value>],
+        bytes_returned: u64,
+        wire_metadata: Vec<(u16, u32, u8)>,
+    ) -> Self {
+        let mut result = Self::new(columns, rows, bytes_returned);
+        result.wire_metadata = Some(wire_metadata);
+        result
     }
 
     pub fn frontend_columns(&self) -> Vec<Column> {
         self.columns.iter().map(Column::from).collect()
+    }
+
+    pub fn backend_rows(&self) -> Vec<Vec<Value>> {
+        self.rows
+            .iter()
+            .map(|row| row.iter().map(Value::from).collect())
+            .collect()
+    }
+
+    pub fn wire_metadata(&self) -> Option<Vec<(u16, u32, u8)>> {
+        self.wire_metadata.clone()
     }
 }
 
@@ -595,6 +624,7 @@ mod tests {
             .expect("DBPROXY_CACHE_TEST_REDIS_URL must select a disposable Redis database");
         let rule = CacheRuleConfig {
             table: "products".to_owned(),
+            batch_decomposition: crate::config::CacheBatchDecomposition::PerShard,
             ttl_seconds: 2,
             negative_ttl_seconds: 1,
             ttl_jitter_percent: 0,
@@ -631,6 +661,7 @@ mod tests {
             columns: Vec::new(),
             rows: vec![Vec::new()],
             bytes_returned: 0,
+            wire_metadata: None,
         };
         manager.put(&key, &cached, &rule).await.unwrap();
         assert!(matches!(

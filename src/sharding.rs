@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     ops::ControlFlow,
 };
@@ -14,6 +14,7 @@ use sqlparser::{
     },
     dialect::{MySqlDialect, PostgreSqlDialect},
     parser::Parser,
+    tokenizer::Location,
 };
 
 use crate::{
@@ -38,6 +39,7 @@ pub struct PlannedShardQuery {
     pub shard: String,
     pub sql: String,
     pub parameter_indexes: Vec<usize>,
+    pub source_value_indexes: Vec<usize>,
 }
 
 impl fmt::Debug for PlannedShardQuery {
@@ -70,10 +72,95 @@ pub struct AggregatePlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiKeyScatterPlan {
+    pub queries: Vec<PlannedShardQuery>,
+    pub table: String,
+    pub column: String,
+    pub qualifier: String,
+    pub key_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShardQueryPlan {
     Single(ShardDecision),
     UnionAll(Vec<PlannedShardQuery>),
     Aggregate(AggregatePlan),
+    MultiKey(MultiKeyScatterPlan),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MultiKeyScatterRejectReason {
+    HasDistinct,
+    HasGroupBy,
+    HasHaving,
+    HasLimit,
+    HasOrderBy,
+    HasWindow,
+    LockingRead,
+    MultiTable,
+    SelectInto,
+    SpansTooManyShards,
+    UnresolvableKey,
+    UnsupportedFunction,
+    UnsupportedPredicate,
+}
+
+impl MultiKeyScatterRejectReason {
+    pub const COUNT: usize = 13;
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HasDistinct => "has_distinct",
+            Self::HasGroupBy => "has_group_by",
+            Self::HasHaving => "has_having",
+            Self::HasLimit => "has_limit",
+            Self::HasOrderBy => "has_order_by",
+            Self::HasWindow => "has_window",
+            Self::LockingRead => "locking_read",
+            Self::MultiTable => "multi_table",
+            Self::SelectInto => "select_into",
+            Self::SpansTooManyShards => "spans_too_many_shards",
+            Self::UnresolvableKey => "unresolvable_key",
+            Self::UnsupportedFunction => "unsupported_function",
+            Self::UnsupportedPredicate => "unsupported_predicate",
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::HasDistinct => 0,
+            Self::HasGroupBy => 1,
+            Self::HasHaving => 2,
+            Self::HasLimit => 3,
+            Self::HasOrderBy => 4,
+            Self::HasWindow => 5,
+            Self::LockingRead => 6,
+            Self::MultiTable => 7,
+            Self::SelectInto => 8,
+            Self::SpansTooManyShards => 9,
+            Self::UnresolvableKey => 10,
+            Self::UnsupportedFunction => 11,
+            Self::UnsupportedPredicate => 12,
+        }
+    }
+
+    pub const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::HasDistinct,
+            Self::HasGroupBy,
+            Self::HasHaving,
+            Self::HasLimit,
+            Self::HasOrderBy,
+            Self::HasWindow,
+            Self::LockingRead,
+            Self::MultiTable,
+            Self::SelectInto,
+            Self::SpansTooManyShards,
+            Self::UnresolvableKey,
+            Self::UnsupportedFunction,
+            Self::UnsupportedPredicate,
+        ]
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +173,8 @@ struct ShardRule {
 #[derive(Clone, Debug)]
 pub struct ShardRouter {
     enabled: bool,
+    allow_multikey_scatter: bool,
+    mysql: bool,
     default_shard: String,
     missing_key_policy: MissingShardKeyPolicy,
     valid_shards: HashSet<String>,
@@ -110,6 +199,11 @@ pub enum ShardRoutingError {
     CrossShardValues { table: String },
     #[error("cross-shard query shape is not safe for bounded scatter/gather: {0}")]
     UnsafeScatter(&'static str),
+    #[error("multi-key scatter rejected: {reason}")]
+    MultiKeyScatterRejected {
+        reason: &'static str,
+        code: MultiKeyScatterRejectReason,
+    },
     #[error("cross-shard query targets {actual} shards, exceeding the configured limit of {limit}")]
     ScatterLimit { actual: usize, limit: usize },
     #[error(
@@ -124,6 +218,22 @@ pub enum ShardRoutingError {
     UnsupportedShardedStatement { table: String },
     #[error("shard key could not be mapped: {0}")]
     InvalidKey(String),
+}
+
+impl ShardRoutingError {
+    pub fn multikey_reject_reason(&self) -> Option<MultiKeyScatterRejectReason> {
+        match self {
+            Self::MultiKeyScatterRejected { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+}
+
+fn multikey_rejected(reason: MultiKeyScatterRejectReason) -> ShardRoutingError {
+    ShardRoutingError::MultiKeyScatterRejected {
+        reason: reason.as_str(),
+        code: reason,
+    }
 }
 
 impl ShardRouter {
@@ -167,6 +277,8 @@ impl ShardRouter {
             .collect();
         Self {
             enabled: config.enabled,
+            allow_multikey_scatter: config.allow_multikey_scatter,
+            mysql: true,
             default_shard: config.default_shard.clone(),
             missing_key_policy: config.missing_key_policy,
             valid_shards,
@@ -195,6 +307,8 @@ impl ShardRouter {
             .collect();
         Self {
             enabled: config.enabled && !config.rules.is_empty(),
+            allow_multikey_scatter: config.allow_multikey_scatter,
+            mysql: false,
             default_shard: default_shard.to_owned(),
             missing_key_policy: MissingShardKeyPolicy::Reject,
             valid_shards: config
@@ -343,19 +457,28 @@ impl ShardRouter {
         if let Some(plan) = self.plan_top_level_union(query, max_scatter_shards)? {
             return Ok(plan);
         }
-        match self.route_statement(statement) {
+        let route_error = match self.route_statement(statement) {
             Ok(decision) => return Ok(ShardQueryPlan::Single(decision)),
             Err(
-                ShardRoutingError::MissingKey { .. }
+                error @ (ShardRoutingError::MissingKey { .. }
                 | ShardRoutingError::CrossShardValues { .. }
-                | ShardRoutingError::CrossShardQuery,
-            ) => {}
+                | ShardRoutingError::CrossShardQuery),
+            ) => {
+                if let Some(plan) = self.plan_aggregate(query, max_scatter_shards)? {
+                    return Ok(plan);
+                }
+                error
+            }
+            Err(error @ ShardRoutingError::InvalidKey(_)) if self.allow_multikey_scatter => error,
             Err(error) => return Err(error),
-        }
-        if let Some(plan) = self.plan_aggregate(query, max_scatter_shards)? {
+        };
+        if self.allow_multikey_scatter
+            && !matches!(route_error, ShardRoutingError::MissingKey { .. })
+            && let Some(plan) = self.plan_multikey_select(sql, query, max_scatter_shards)?
+        {
             return Ok(plan);
         }
-        self.route_statement(statement).map(ShardQueryPlan::Single)
+        Err(route_error)
     }
 
     fn route_statement(&self, statement: &Statement) -> Result<ShardDecision, ShardRoutingError> {
@@ -490,6 +613,7 @@ impl ShardRouter {
                 shard: decision.shard.clone(),
                 sql: branch_query.to_string(),
                 parameter_indexes: Vec::new(),
+                source_value_indexes: Vec::new(),
             });
             decisions.push(decision);
         }
@@ -524,6 +648,137 @@ impl ShardRouter {
         Ok(Some(ShardQueryPlan::UnionAll(branches)))
     }
 
+    fn plan_multikey_select(
+        &self,
+        sql: &str,
+        query: &Query,
+        max_scatter_shards: usize,
+    ) -> Result<Option<ShardQueryPlan>, ShardRoutingError> {
+        let Some(select) = query.body.as_select() else {
+            return Err(multikey_rejected(MultiKeyScatterRejectReason::MultiTable));
+        };
+        if query.with.is_some() || select.from.len() != 1 || !select.from[0].joins.is_empty() {
+            return Err(multikey_rejected(MultiKeyScatterRejectReason::MultiTable));
+        }
+        let table = table_factor_name(&select.from[0].relation)
+            .ok_or_else(|| multikey_rejected(MultiKeyScatterRejectReason::MultiTable))?;
+        let statement = Statement::Query(Box::new(query.clone()));
+        let table_references = statement_tables(&statement);
+        if table_references.len() != 1 || table_references[0] != table {
+            return Err(multikey_rejected(MultiKeyScatterRejectReason::MultiTable));
+        }
+        let Some(rule) = self.rules.get(&table) else {
+            return Ok(None);
+        };
+        if select.into.is_some() {
+            return Err(multikey_rejected(MultiKeyScatterRejectReason::SelectInto));
+        }
+        if query.order_by.is_some() {
+            return Err(multikey_rejected(MultiKeyScatterRejectReason::HasOrderBy));
+        }
+        if query.limit_clause.is_some() || query.fetch.is_some() {
+            return Err(multikey_rejected(MultiKeyScatterRejectReason::HasLimit));
+        }
+        if !query.locks.is_empty() || query.for_clause.is_some() {
+            return Err(multikey_rejected(MultiKeyScatterRejectReason::LockingRead));
+        }
+        if select.distinct.is_some() {
+            return Err(multikey_rejected(MultiKeyScatterRejectReason::HasDistinct));
+        }
+        if !group_by_is_empty(&select.group_by) {
+            return Err(multikey_rejected(MultiKeyScatterRejectReason::HasGroupBy));
+        }
+        if select.having.is_some() {
+            return Err(multikey_rejected(MultiKeyScatterRejectReason::HasHaving));
+        }
+        if !select.named_window.is_empty() || select.qualify.is_some() {
+            return Err(multikey_rejected(MultiKeyScatterRejectReason::HasWindow));
+        }
+        if let ControlFlow::Break(reason) = query.visit(&mut MultiKeyFunctions) {
+            return Err(multikey_rejected(reason));
+        }
+
+        let qualifier = table_factor_qualifier(&select.from[0].relation, &table)
+            .ok_or_else(|| multikey_rejected(MultiKeyScatterRejectReason::MultiTable))?;
+        let selection = select
+            .selection
+            .as_ref()
+            .ok_or_else(|| multikey_rejected(MultiKeyScatterRejectReason::UnsupportedPredicate))?;
+        let values = multikey_in_values(selection, &rule.column, &qualifier)?;
+        let mysql_source = self.mysql.then(|| MysqlLiteralSource::new(sql));
+        let mut partitions = BTreeMap::<String, Vec<(String, usize, Expr)>>::new();
+        for (index, expression) in values.iter().enumerate() {
+            let value = literal(expression)
+                .ok_or_else(|| multikey_rejected(MultiKeyScatterRejectReason::UnresolvableKey))?;
+            let shard = rule
+                .router
+                .route(Some(&value))
+                .map_err(|_| multikey_rejected(MultiKeyScatterRejectReason::UnresolvableKey))?
+                .ok_or_else(|| multikey_rejected(MultiKeyScatterRejectReason::UnresolvableKey))?;
+            let sql = if let Some(source) = &mysql_source {
+                render_mysql_scatter(expression.clone(), Some(source))
+            } else {
+                expression.to_string()
+            };
+            partitions
+                .entry(shard)
+                .or_default()
+                .push((sql, index, expression.clone()));
+        }
+        if partitions.len() > max_scatter_shards {
+            return Err(multikey_rejected(
+                MultiKeyScatterRejectReason::SpansTooManyShards,
+            ));
+        }
+        if partitions.len() <= 1 {
+            return Ok(None);
+        }
+
+        let mut queries = Vec::with_capacity(partitions.len());
+        let mut key_count = 0;
+        for (shard, mut values) in partitions {
+            values.sort_by(|left, right| left.0.cmp(&right.0));
+            // Keep bound MySQL parameters even when their routing literals look alike.
+            // The server can compare values differently according to their wire types.
+            let mysql_indexes = self
+                .mysql
+                .then(|| values.iter().map(|value| value.1).collect());
+            values.dedup_by(|left, right| left.0 == right.0);
+            key_count += values.len();
+            let source_value_indexes =
+                mysql_indexes.unwrap_or_else(|| values.iter().map(|value| value.1).collect());
+            let narrowed_values = values
+                .into_iter()
+                .map(|(_, _, expression)| expression)
+                .collect::<Vec<_>>();
+            let mut branch_query = query.clone();
+            replace_multikey_in_values(
+                &mut branch_query,
+                &rule.column,
+                &qualifier,
+                narrowed_values,
+            )?;
+            let sql = if let Some(source) = &mysql_source {
+                render_mysql_scatter(branch_query, Some(source))
+            } else {
+                branch_query.to_string()
+            };
+            queries.push(PlannedShardQuery {
+                shard,
+                sql,
+                parameter_indexes: Vec::new(),
+                source_value_indexes,
+            });
+        }
+        Ok(Some(ShardQueryPlan::MultiKey(MultiKeyScatterPlan {
+            queries,
+            table,
+            column: rule.column.clone(),
+            qualifier,
+            key_count,
+        })))
+    }
+
     fn plan_aggregate(
         &self,
         query: &Query,
@@ -532,6 +787,9 @@ impl ShardRouter {
         let Some(select) = query.body.as_select() else {
             return Ok(None);
         };
+        if select.into.is_some() {
+            return Ok(None);
+        }
         let Some(mut aggregates) = aggregate_projection(&select.projection)? else {
             return Ok(None);
         };
@@ -591,6 +849,7 @@ impl ShardRouter {
                 shard,
                 sql: rewritten_sql.clone(),
                 parameter_indexes: Vec::new(),
+                source_value_indexes: Vec::new(),
             })
             .collect();
         Ok(Some(ShardQueryPlan::Aggregate(AggregatePlan {
@@ -627,13 +886,21 @@ pub fn parameterize_mysql_scatter_plan(
     plan: &mut ShardQueryPlan,
     statements: &[Statement],
 ) -> Result<(), ShardRoutingError> {
+    parameterize_mysql_scatter_plan_with_sql(plan, statements, None)
+}
+
+pub(crate) fn parameterize_mysql_scatter_plan_with_sql(
+    plan: &mut ShardQueryPlan,
+    statements: &[Statement],
+    source_sql: Option<&str>,
+) -> Result<(), ShardRoutingError> {
     let [Statement::Query(query)] = statements else {
         return Err(ShardRoutingError::Parse);
     };
     let mut indexed = query.as_ref().clone();
     index_mysql_placeholders(&mut indexed)?;
     let templates = prepared_plan_templates(plan, &indexed)?;
-    apply_prepared_templates(plan, templates, true)
+    apply_prepared_templates(plan, templates, true, source_sql)
 }
 
 pub fn parameterize_postgres_scatter_plan(
@@ -644,7 +911,7 @@ pub fn parameterize_postgres_scatter_plan(
         return Err(ShardRoutingError::Parse);
     };
     let templates = prepared_plan_templates(plan, query)?;
-    apply_prepared_templates(plan, templates, false)
+    apply_prepared_templates(plan, templates, false, None)
 }
 
 fn prepared_plan_templates(
@@ -684,6 +951,20 @@ fn prepared_plan_templates(
             }
             Ok(vec![rewritten; plan.queries.len()])
         }
+        ShardQueryPlan::MultiKey(plan) => plan
+            .queries
+            .iter()
+            .map(|branch| {
+                let mut branch_query = query.clone();
+                narrow_multikey_template(
+                    &mut branch_query,
+                    &plan.column,
+                    &plan.qualifier,
+                    &branch.source_value_indexes,
+                )?;
+                Ok(branch_query)
+            })
+            .collect(),
     }
 }
 
@@ -691,11 +972,14 @@ fn apply_prepared_templates(
     plan: &mut ShardQueryPlan,
     templates: Vec<Query>,
     mysql: bool,
+    source_sql: Option<&str>,
 ) -> Result<(), ShardRoutingError> {
+    let mysql_source = source_sql.map(MysqlLiteralSource::new);
     let queries = match plan {
         ShardQueryPlan::Single(_) => return Ok(()),
         ShardQueryPlan::UnionAll(queries) => queries,
         ShardQueryPlan::Aggregate(plan) => &mut plan.queries,
+        ShardQueryPlan::MultiKey(plan) => &mut plan.queries,
     };
     if queries.len() != templates.len() {
         return Err(ShardRoutingError::Parse);
@@ -706,7 +990,11 @@ fn apply_prepared_templates(
         } else {
             remap_postgres_placeholders(&mut template)?
         };
-        planned.sql = template.to_string();
+        planned.sql = if mysql && !planned.source_value_indexes.is_empty() {
+            render_mysql_scatter(template, mysql_source.as_ref())
+        } else {
+            template.to_string()
+        };
     }
     Ok(())
 }
@@ -1211,6 +1499,271 @@ fn shard_literals(expr: &Expr, column: &str, qualifier: &str) -> Option<Vec<Stri
     }
 }
 
+fn multikey_in_values(
+    expression: &Expr,
+    column: &str,
+    qualifier: &str,
+) -> Result<Vec<Expr>, ShardRoutingError> {
+    fn visit(
+        expression: &Expr,
+        column: &str,
+        qualifier: &str,
+        found: &mut Option<Vec<Expr>>,
+    ) -> Result<(), ShardRoutingError> {
+        match expression {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                visit(left, column, qualifier, found)?;
+                visit(right, column, qualifier, found)
+            }
+            Expr::BinaryOp {
+                op: BinaryOperator::Or,
+                ..
+            } => Err(multikey_rejected(
+                MultiKeyScatterRejectReason::UnsupportedPredicate,
+            )),
+            Expr::Nested(expression) => visit(expression, column, qualifier, found),
+            Expr::InList {
+                expr,
+                list,
+                negated: false,
+            } if is_column(expr, column, qualifier) => {
+                if found.is_some() || list.is_empty() {
+                    return Err(multikey_rejected(
+                        MultiKeyScatterRejectReason::UnsupportedPredicate,
+                    ));
+                }
+                *found = Some(list.clone());
+                Ok(())
+            }
+            _ if expression_references_column(expression, column, qualifier) => Err(
+                multikey_rejected(MultiKeyScatterRejectReason::UnsupportedPredicate),
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    let mut found = None;
+    visit(expression, column, qualifier, &mut found)?;
+    found.ok_or_else(|| multikey_rejected(MultiKeyScatterRejectReason::UnsupportedPredicate))
+}
+
+fn expression_references_column(expression: &Expr, column: &str, qualifier: &str) -> bool {
+    struct ColumnVisitor<'a> {
+        column: &'a str,
+        qualifier: &'a str,
+        found: bool,
+    }
+
+    impl Visitor for ColumnVisitor<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+            if is_column(expression, self.column, self.qualifier) {
+                self.found = true;
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    let mut visitor = ColumnVisitor {
+        column,
+        qualifier,
+        found: false,
+    };
+    let _ = expression.visit(&mut visitor);
+    visitor.found
+}
+
+fn replace_multikey_in_values(
+    query: &mut Query,
+    column: &str,
+    qualifier: &str,
+    values: Vec<Expr>,
+) -> Result<(), ShardRoutingError> {
+    fn replace(
+        expression: &mut Expr,
+        column: &str,
+        qualifier: &str,
+        values: &mut Option<Vec<Expr>>,
+    ) -> bool {
+        match expression {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                replace(left, column, qualifier, values)
+                    || replace(right, column, qualifier, values)
+            }
+            Expr::Nested(expression) => replace(expression, column, qualifier, values),
+            Expr::InList {
+                expr,
+                list,
+                negated: false,
+            } if is_column(expr, column, qualifier) => {
+                *list = values.take().unwrap_or_default();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return Err(ShardRoutingError::Parse);
+    };
+    let selection = select.selection.as_mut().ok_or(ShardRoutingError::Parse)?;
+    let mut values = Some(values);
+    if replace(selection, column, qualifier, &mut values) && values.is_none() {
+        Ok(())
+    } else {
+        Err(ShardRoutingError::Parse)
+    }
+}
+
+fn narrow_multikey_template(
+    query: &mut Query,
+    column: &str,
+    qualifier: &str,
+    source_value_indexes: &[usize],
+) -> Result<(), ShardRoutingError> {
+    let select = query.body.as_select().ok_or(ShardRoutingError::Parse)?;
+    let selection = select.selection.as_ref().ok_or(ShardRoutingError::Parse)?;
+    let values = multikey_in_values(selection, column, qualifier)?;
+    let narrowed = source_value_indexes
+        .iter()
+        .map(|index| values.get(*index).cloned().ok_or(ShardRoutingError::Parse))
+        .collect::<Result<Vec<_>, _>>()?;
+    replace_multikey_in_values(query, column, qualifier, narrowed)
+}
+
+struct MultiKeyFunctions;
+
+impl Visitor for MultiKeyFunctions {
+    type Break = MultiKeyScatterRejectReason;
+
+    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+        let Expr::Function(function) = expression else {
+            return ControlFlow::Continue(());
+        };
+        // A function call alone does not identify scalar, aggregate, or set-returning
+        // behavior. Only the separate aggregate planner knows how to merge its allowlist.
+        ControlFlow::Break(if function.over.is_some() {
+            MultiKeyScatterRejectReason::HasWindow
+        } else {
+            MultiKeyScatterRejectReason::UnsupportedFunction
+        })
+    }
+}
+
+struct MysqlLiteralSource<'a> {
+    sql: &'a str,
+    line_starts: Vec<usize>,
+    unicode_offsets: Vec<usize>,
+}
+
+impl<'a> MysqlLiteralSource<'a> {
+    fn new(sql: &'a str) -> Self {
+        // sqlparser spans count Unicode scalar values, while slicing uses byte offsets.
+        let mut line_starts = vec![0];
+        let mut unicode_offsets = Vec::new();
+        if sql.is_ascii() {
+            line_starts.extend(sql.match_indices('\n').map(|(offset, _)| offset + 1));
+        } else {
+            for (offset, ch) in sql.char_indices() {
+                unicode_offsets.push(offset);
+                if ch == '\n' {
+                    line_starts.push(unicode_offsets.len());
+                }
+            }
+            unicode_offsets.push(sql.len());
+        }
+        Self {
+            sql,
+            line_starts,
+            unicode_offsets,
+        }
+    }
+
+    fn byte_offset(&self, location: Location) -> Option<usize> {
+        let line = location.line.checked_sub(1)? as usize;
+        let column = location.column.checked_sub(1)? as usize;
+        let index = self.line_starts.get(line)?.checked_add(column)?;
+        if self.unicode_offsets.is_empty() {
+            Some(index)
+        } else {
+            self.unicode_offsets.get(index).copied()
+        }
+    }
+
+    fn spelling(&self, value: &ValueWithSpan, quote: char, prefix: &str) -> Option<&'a str> {
+        let start = self.byte_offset(value.span.start)?;
+        let end = self.byte_offset(value.span.end)?;
+        let raw = self.sql.get(start..end)?;
+        let unprefixed = if prefix.is_empty() {
+            raw
+        } else {
+            raw.strip_prefix(['n', 'N'])?
+        };
+        (unprefixed.len() >= 2 && unprefixed.starts_with(quote) && unprefixed.ends_with(quote))
+            .then_some(raw)
+    }
+}
+
+fn render_mysql_scatter(
+    mut node: impl VisitMut + fmt::Display,
+    source: Option<&MysqlLiteralSource<'_>>,
+) -> String {
+    struct RenderLiterals<'a, 'sql>(Option<&'a MysqlLiteralSource<'sql>>);
+
+    impl VisitorMut for RenderLiterals<'_, '_> {
+        type Break = ();
+
+        fn pre_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<()> {
+            let (literal, quote, prefix) = match &value.value {
+                Value::SingleQuotedString(literal) => (literal, '\'', ""),
+                Value::DoubleQuotedString(literal) => (literal, '"', ""),
+                Value::NationalStringLiteral(literal) => (literal, '\'', "N"),
+                _ => return ControlFlow::Continue(()),
+            };
+            if let Some(raw) = self
+                .0
+                .and_then(|source| source.spelling(value, quote, prefix))
+            {
+                value.value = Value::Placeholder(raw.to_owned());
+                return ControlFlow::Continue(());
+            }
+            let mut sql = String::with_capacity(literal.len() + 3);
+            sql.push_str(prefix);
+            sql.push(quote);
+            for ch in literal.chars() {
+                match ch {
+                    '\0' => sql.push_str("\\0"),
+                    '\\' => sql.push_str("\\\\"),
+                    ch if ch == quote => {
+                        sql.push(ch);
+                        sql.push(ch);
+                    }
+                    ch => sql.push(ch),
+                }
+            }
+            sql.push(quote);
+            // The AST formatter writes placeholders verbatim. Here the fragment is a
+            // fully quoted literal, with MySQL escaping applied to the decoded value.
+            value.value = Value::Placeholder(sql);
+            ControlFlow::Continue(())
+        }
+    }
+
+    let _ = node.visit(&mut RenderLiterals(source));
+    node.to_string()
+}
+
 fn flatten_union_all(expr: &SetExpr, branches: &mut Vec<SetExpr>) -> bool {
     let SetExpr::SetOperation {
         left,
@@ -1272,6 +1825,13 @@ fn aggregate_projection(
         let Expr::Function(function) = expression else {
             return Ok(None);
         };
+        let function_name = normalize_identifier(&function.name.to_string());
+        if !matches!(
+            function_name.as_str(),
+            "count" | "sum" | "avg" | "min" | "max"
+        ) {
+            return Ok(None);
+        }
         if !matches!(function.parameters, FunctionArguments::None)
             || function.filter.is_some()
             || function.over.is_some()
@@ -1292,7 +1852,6 @@ fn aggregate_projection(
                 "DISTINCT, clauses, and multi-argument aggregates are not mergeable",
             ));
         }
-        let function_name = normalize_identifier(&function.name.to_string());
         let ordinary_argument = matches!(
             arguments.args.as_slice(),
             [FunctionArg::Unnamed(FunctionArgExpr::Expr(_))]
@@ -1565,9 +2124,22 @@ mod tests {
         router_with(crate::config::ProtocolShardStrategy::Hash, Vec::new())
     }
 
+    fn multikey_router() -> ShardRouter {
+        router_with_options(crate::config::ProtocolShardStrategy::Hash, Vec::new(), true)
+    }
+
     fn postgres_router() -> ShardRouter {
+        postgres_router_with_multikey(false)
+    }
+
+    fn postgres_multikey_router() -> ShardRouter {
+        postgres_router_with_multikey(true)
+    }
+
+    fn postgres_router_with_multikey(allow_multikey_scatter: bool) -> ShardRouter {
         let config = ProtocolShardingConfig {
             enabled: true,
+            allow_multikey_scatter,
             strategy: crate::config::ProtocolShardStrategy::Hash,
             shards: vec![
                 ProtocolShardConfig {
@@ -1592,8 +2164,17 @@ mod tests {
         strategy: crate::config::ProtocolShardStrategy,
         mappings: Vec<crate::config::ProtocolShardConfig>,
     ) -> ShardRouter {
+        router_with_options(strategy, mappings, false)
+    }
+
+    fn router_with_options(
+        strategy: crate::config::ProtocolShardStrategy,
+        mappings: Vec<crate::config::ProtocolShardConfig>,
+        allow_multikey_scatter: bool,
+    ) -> ShardRouter {
         let config = ShardingConfig {
             enabled: true,
+            allow_multikey_scatter,
             default_shard: "s0".to_owned(),
             missing_key_policy: MissingShardKeyPolicy::Reject,
             max_scatter_shards: 16,
@@ -1777,6 +2358,38 @@ mod tests {
     }
 
     #[test]
+    fn postgres_plans_and_parameterizes_multikey_scatter() {
+        let template = Parser::parse_sql(
+            &PostgreSqlDialect {},
+            "SELECT payload FROM user_info WHERE userid IN ($1, $2) AND owner_id = $3",
+        )
+        .unwrap();
+        let mut plan = postgres_multikey_router()
+            .plan_postgres(
+                "SELECT payload FROM user_info WHERE userid IN ('abc', 'xyz') AND owner_id = $3",
+                16,
+            )
+            .unwrap();
+        parameterize_postgres_scatter_plan(&mut plan, &template).unwrap();
+        let ShardQueryPlan::MultiKey(plan) = plan else {
+            panic!("expected PostgreSQL multi-key scatter plan");
+        };
+        assert_eq!(plan.queries.len(), 2);
+        let indexes = plan
+            .queries
+            .iter()
+            .map(|query| query.parameter_indexes.clone())
+            .collect::<Vec<_>>();
+        assert!(indexes.contains(&vec![0, 2]));
+        assert!(indexes.contains(&vec![1, 2]));
+        assert!(
+            plan.queries
+                .iter()
+                .all(|query| query.sql.contains("owner_id = $2"))
+        );
+    }
+
+    #[test]
     fn postgres_plans_root_union_and_decomposable_aggregates() {
         let router = postgres_router();
         assert!(matches!(
@@ -1817,6 +2430,290 @@ mod tests {
             .route("SELECT * FROM orders WHERE tenant_id IN ('abc', 'xyz')")
             .unwrap_err();
         assert!(matches!(error, ShardRoutingError::CrossShardValues { .. }));
+    }
+
+    #[test]
+    fn plans_canonical_multikey_scatter_when_enabled() {
+        let first = multikey_router()
+            .plan(
+                "SELECT payload FROM orders WHERE state = 'ready' AND tenant_id IN ('xyz', 'abc', 'xyz')",
+                16,
+            )
+            .unwrap();
+        let second = multikey_router()
+            .plan(
+                "SELECT payload FROM orders WHERE state = 'ready' AND tenant_id IN ('abc', 'xyz')",
+                16,
+            )
+            .unwrap();
+        let ShardQueryPlan::MultiKey(first) = first else {
+            panic!("expected multi-key scatter plan");
+        };
+        let ShardQueryPlan::MultiKey(second) = second else {
+            panic!("expected multi-key scatter plan");
+        };
+        assert_eq!(first.key_count, 2);
+        assert_eq!(first.queries.len(), 2);
+        assert_eq!(
+            first
+                .queries
+                .iter()
+                .map(|query| (&query.shard, &query.sql))
+                .collect::<Vec<_>>(),
+            second
+                .queries
+                .iter()
+                .map(|query| (&query.shard, &query.sql))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            first
+                .queries
+                .iter()
+                .all(|query| query.sql.contains("state = 'ready'"))
+        );
+    }
+
+    #[test]
+    fn multikey_scatter_keeps_prepared_parameters_per_branch() {
+        let template = Parser::parse_sql(
+            &MySqlDialect {},
+            "SELECT payload FROM orders WHERE state = ? AND tenant_id IN (?, ?)",
+        )
+        .unwrap();
+        let mut plan = multikey_router()
+            .plan(
+                "SELECT payload FROM orders WHERE state = 'ready' AND tenant_id IN ('abc', 'xyz')",
+                16,
+            )
+            .unwrap();
+        parameterize_mysql_scatter_plan(&mut plan, &template).unwrap();
+        let ShardQueryPlan::MultiKey(plan) = plan else {
+            panic!("expected prepared multi-key scatter plan");
+        };
+        assert_eq!(plan.queries.len(), 2);
+        assert!(
+            plan.queries
+                .iter()
+                .all(|query| query.parameter_indexes.len() == 2)
+        );
+        assert!(
+            plan.queries
+                .iter()
+                .all(|query| query.sql.matches('?').count() == 2)
+        );
+        assert!(
+            plan.queries
+                .iter()
+                .all(|query| query.sql.contains("state = ?"))
+        );
+        let routed = plan
+            .queries
+            .iter()
+            .flat_map(|query| query.parameter_indexes.iter().copied())
+            .filter(|index| *index != 0)
+            .collect::<HashSet<_>>();
+        assert_eq!(routed, HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn multikey_scatter_preserves_postgres_aggregate_and_startup_routing() {
+        let router = postgres_multikey_router();
+        for query in [
+            "SELECT COUNT(*) FROM user_info",
+            "SELECT SUM(owner_id) FROM user_info WHERE userid IN ('abc', 'xyz')",
+        ] {
+            assert!(matches!(
+                router.plan_postgres(query, 16).unwrap(),
+                ShardQueryPlan::Aggregate(_)
+            ));
+        }
+        assert!(matches!(
+            router.plan_postgres("SELECT payload FROM user_info WHERE active", 16),
+            Err(ShardRoutingError::MissingKey { .. })
+        ));
+        for (query, reason) in [
+            (
+                "SELECT payload INTO snapshot FROM user_info WHERE userid IN ('abc', 'xyz')",
+                MultiKeyScatterRejectReason::SelectInto,
+            ),
+            (
+                "SELECT BOOL_AND(active) FROM user_info WHERE userid IN ('abc', 'xyz')",
+                MultiKeyScatterRejectReason::UnsupportedFunction,
+            ),
+            (
+                "SELECT custom_aggregate(active) FROM user_info WHERE userid IN ('abc', 'xyz')",
+                MultiKeyScatterRejectReason::UnsupportedFunction,
+            ),
+        ] {
+            assert_eq!(
+                router
+                    .plan_postgres(query, 16)
+                    .unwrap_err()
+                    .multikey_reject_reason(),
+                Some(reason),
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_multikey_scatter_round_trips_mysql_escapes() {
+        let filters = [
+            r"'a\\b'",
+            r"'a''''b'",
+            r"'tail\\'",
+            r#""a\\b""#,
+            r"'λ\a'",
+            "'λ\nβ\\f'",
+        ];
+        for filter in filters {
+            let sql = format!(
+                "SELECT payload FROM orders WHERE tenant_id IN ('abc', 'xyz') AND note = {filter}"
+            );
+            let ShardQueryPlan::MultiKey(plan) = multikey_router().plan(&sql, 16).unwrap() else {
+                panic!("expected multi-key scatter plan");
+            };
+            let read_note = |sql: &str| {
+                let statements = Parser::parse_sql(&MySqlDialect {}, sql).unwrap();
+                let Statement::Query(query) = &statements[0] else {
+                    panic!()
+                };
+                let Some(Expr::BinaryOp { right, .. }) = &query.body.as_select().unwrap().selection
+                else {
+                    panic!()
+                };
+                let Expr::BinaryOp { right, .. } = right.as_ref() else {
+                    panic!()
+                };
+                literal(right).unwrap()
+            };
+            let expected = read_note(&sql);
+            assert!(
+                plan.queries
+                    .iter()
+                    .all(|branch| branch.sql.contains(filter) && read_note(&branch.sql) == expected)
+            );
+
+            let template_sql = [
+                "SELECT payload FROM orders WHERE tenant_id IN (?, ?) AND note = ",
+                filter,
+            ]
+            .concat();
+            let template = Parser::parse_sql(&MySqlDialect {}, &template_sql).unwrap();
+            let mut plan = ShardQueryPlan::MultiKey(plan);
+            parameterize_mysql_scatter_plan_with_sql(&mut plan, &template, Some(&template_sql))
+                .unwrap();
+            let ShardQueryPlan::MultiKey(plan) = plan else {
+                panic!()
+            };
+            assert!(
+                plan.queries
+                    .iter()
+                    .all(|branch| branch.sql.contains(filter) && read_note(&branch.sql) == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn multikey_scatter_is_off_by_default() {
+        let error = router()
+            .plan(
+                "SELECT payload FROM orders WHERE tenant_id IN ('abc', 'xyz')",
+                16,
+            )
+            .unwrap_err();
+        assert!(matches!(error, ShardRoutingError::CrossShardValues { .. }));
+    }
+
+    #[test]
+    fn multikey_scatter_rejections_have_fixed_reasons() {
+        let cases = [
+            (
+                "SELECT payload FROM orders WHERE tenant_id IN ('abc', 'xyz') ORDER BY payload",
+                MultiKeyScatterRejectReason::HasOrderBy,
+            ),
+            (
+                "SELECT payload FROM orders WHERE tenant_id IN ('abc', 'xyz') LIMIT 10",
+                MultiKeyScatterRejectReason::HasLimit,
+            ),
+            (
+                "SELECT DISTINCT payload FROM orders WHERE tenant_id IN ('abc', 'xyz')",
+                MultiKeyScatterRejectReason::HasDistinct,
+            ),
+            (
+                "SELECT state, COUNT(*) FROM orders WHERE tenant_id IN ('abc', 'xyz') GROUP BY state",
+                MultiKeyScatterRejectReason::HasGroupBy,
+            ),
+            (
+                "SELECT GROUP_CONCAT(payload) FROM orders WHERE tenant_id IN ('abc', 'xyz')",
+                MultiKeyScatterRejectReason::UnsupportedFunction,
+            ),
+            (
+                "SELECT payload FROM orders WHERE tenant_id IN ('abc', 'xyz') HAVING payload IS NOT NULL",
+                MultiKeyScatterRejectReason::HasHaving,
+            ),
+            (
+                "SELECT payload FROM orders JOIN filters ON filters.id = orders.id WHERE tenant_id IN ('abc', 'xyz')",
+                MultiKeyScatterRejectReason::MultiTable,
+            ),
+            (
+                "SELECT (SELECT max(id) FROM filters) FROM orders WHERE tenant_id IN ('abc', 'xyz')",
+                MultiKeyScatterRejectReason::MultiTable,
+            ),
+            (
+                "SELECT ROW_NUMBER() OVER (), payload FROM orders WHERE tenant_id IN ('abc', 'xyz')",
+                MultiKeyScatterRejectReason::HasWindow,
+            ),
+            (
+                "SELECT payload FROM orders WHERE tenant_id IN ('abc', 'xyz') OR tenant_id = 'bPv'",
+                MultiKeyScatterRejectReason::UnsupportedPredicate,
+            ),
+            (
+                "SELECT payload FROM orders WHERE tenant_id IN ('abc', 'xyz') FOR UPDATE",
+                MultiKeyScatterRejectReason::LockingRead,
+            ),
+        ];
+        for (sql, expected) in cases {
+            let error = multikey_router().plan(sql, 16).unwrap_err();
+            assert_eq!(error.multikey_reject_reason(), Some(expected), "{sql}");
+        }
+        let error = multikey_router()
+            .plan(
+                "SELECT payload FROM orders WHERE tenant_id IN ('abc', 'xyz')",
+                1,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.multikey_reject_reason(),
+            Some(MultiKeyScatterRejectReason::SpansTooManyShards)
+        );
+
+        let value_router = router_with_options(
+            crate::config::ProtocolShardStrategy::Value,
+            vec![
+                ProtocolShardConfig {
+                    name: "s0".to_owned(),
+                    values: vec!["known-a".to_owned()],
+                    ..ProtocolShardConfig::default()
+                },
+                ProtocolShardConfig {
+                    name: "s1".to_owned(),
+                    values: vec!["known-b".to_owned()],
+                    ..ProtocolShardConfig::default()
+                },
+            ],
+            true,
+        );
+        let error = value_router
+            .plan(
+                "SELECT payload FROM orders WHERE tenant_id IN ('known-a', 'unknown')",
+                16,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.multikey_reject_reason(),
+            Some(MultiKeyScatterRejectReason::UnresolvableKey)
+        );
     }
 
     #[test]

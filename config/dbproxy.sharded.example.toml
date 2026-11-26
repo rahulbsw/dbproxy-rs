@@ -39,6 +39,7 @@ shard_key_parameter = "dbproxy.shard_key"
 
 [postgres.sharding]
 enabled = true
+allow_multikey_scatter = false
 strategy = "hash"
 max_scatter_shards = 16
 scatter_concurrency = 4
@@ -194,6 +195,7 @@ reject_multi_statements = true
 
 [sharding]
 enabled = true
+allow_multikey_scatter = false
 default_shard = "orders-0"
 missing_key_policy = "reject"
 max_scatter_shards = 16

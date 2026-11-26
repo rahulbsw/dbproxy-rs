@@ -101,6 +101,11 @@ pub const CAPABILITIES: &[Capability] = &[
         contract: "bounded MySQL and PostgreSQL/TimescaleDB root UNION ALL concatenation and decomposable aggregate-only merges with compatible metadata; global ordering, grouping, windows, distinctness, and joins remain rejected",
     },
     Capability {
+        name: "multikey_scatter",
+        status: CapabilityStatus::Constrained,
+        contract: "opt-in and default-off; only direct single-table SELECT shard-key IN lists are partitioned per shard, with bounded concurrency, complete-failure semantics, compatible metadata, and shared row/byte budgets; ordering, limits, aggregates, windows, joins, and cross-shard DML remain rejected",
+    },
+    Capability {
         name: "cross_shard_joins",
         status: CapabilityStatus::Planned,
         contract: "requires a distributed query planner and bounded execution engine",

@@ -10,10 +10,12 @@ use crate::classifier::QueryKind;
 use crate::query_registry::{
     CacheOutcome, CacheStatus, QueryIdentity, QueryRegistry, QuerySnapshot,
 };
+use crate::sharding::MultiKeyScatterRejectReason;
 
 const QUERY_BUCKETS_MICROS: [u64; 10] = [
     1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000,
 ];
+const MULTIKEY_SCATTER_BUCKETS: [u64; 7] = [1, 2, 4, 8, 16, 32, 64];
 
 #[derive(Debug, Default)]
 pub struct Metrics {
@@ -53,6 +55,16 @@ pub struct Metrics {
     scatter_failures: AtomicU64,
     scatter_rows: AtomicU64,
     scatter_bytes: AtomicU64,
+    multikey_scatter_executed: AtomicU64,
+    multikey_scatter_rejected: AtomicU64,
+    multikey_scatter_shard_buckets: [AtomicU64; MULTIKEY_SCATTER_BUCKETS.len()],
+    multikey_scatter_shard_sum: AtomicU64,
+    multikey_scatter_shard_count: AtomicU64,
+    multikey_scatter_key_buckets: [AtomicU64; MULTIKEY_SCATTER_BUCKETS.len()],
+    multikey_scatter_key_sum: AtomicU64,
+    multikey_scatter_key_count: AtomicU64,
+    multikey_scatter_rejects: [AtomicU64; MultiKeyScatterRejectReason::COUNT],
+    multikey_scatter_branch_failures: AtomicU64,
     fanout_attempts: AtomicU64,
     fanout_successes: AtomicU64,
     fanout_failures: AtomicU64,
@@ -276,6 +288,36 @@ impl Metrics {
     pub fn scatter_merged(&self, rows: u64, bytes: u64) {
         self.scatter_rows.fetch_add(rows, Ordering::Relaxed);
         self.scatter_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn multikey_scatter_executed(&self, shards: usize, keys: usize) {
+        self.multikey_scatter_executed
+            .fetch_add(1, Ordering::Relaxed);
+        observe_discrete_histogram(
+            shards as u64,
+            &MULTIKEY_SCATTER_BUCKETS,
+            &self.multikey_scatter_shard_buckets,
+            &self.multikey_scatter_shard_sum,
+            &self.multikey_scatter_shard_count,
+        );
+        observe_discrete_histogram(
+            keys as u64,
+            &MULTIKEY_SCATTER_BUCKETS,
+            &self.multikey_scatter_key_buckets,
+            &self.multikey_scatter_key_sum,
+            &self.multikey_scatter_key_count,
+        );
+    }
+
+    pub fn multikey_scatter_rejected(&self, reason: MultiKeyScatterRejectReason) {
+        self.multikey_scatter_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        self.multikey_scatter_rejects[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn multikey_scatter_branch_failed(&self) {
+        self.multikey_scatter_branch_failures
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn fanout_attempted(&self) {
@@ -1064,6 +1106,66 @@ impl Metrics {
             "Result bytes emitted after SQL scatter/gather merging.",
             self.scatter_bytes.load(Ordering::Relaxed),
         );
+        let _ = writeln!(
+            output,
+            "# HELP dbproxy_multikey_scatter_statements_total Multi-key scatter statements by bounded outcome."
+        );
+        let _ = writeln!(
+            output,
+            "# TYPE dbproxy_multikey_scatter_statements_total counter"
+        );
+        let _ = writeln!(
+            output,
+            "dbproxy_multikey_scatter_statements_total{{outcome=\"executed\"}} {}",
+            self.multikey_scatter_executed.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            output,
+            "dbproxy_multikey_scatter_statements_total{{outcome=\"rejected\"}} {}",
+            self.multikey_scatter_rejected.load(Ordering::Relaxed)
+        );
+        discrete_histogram(
+            &mut output,
+            "dbproxy_multikey_scatter_shards",
+            "Distinct shards used by accepted multi-key scatter statements.",
+            &MULTIKEY_SCATTER_BUCKETS,
+            &self.multikey_scatter_shard_buckets,
+            self.multikey_scatter_shard_sum.load(Ordering::Relaxed),
+            self.multikey_scatter_shard_count.load(Ordering::Relaxed),
+        );
+        discrete_histogram(
+            &mut output,
+            "dbproxy_multikey_scatter_keys",
+            "Canonical shard-key values used by accepted multi-key scatter statements.",
+            &MULTIKEY_SCATTER_BUCKETS,
+            &self.multikey_scatter_key_buckets,
+            self.multikey_scatter_key_sum.load(Ordering::Relaxed),
+            self.multikey_scatter_key_count.load(Ordering::Relaxed),
+        );
+        let _ = writeln!(
+            output,
+            "# HELP dbproxy_multikey_scatter_rejects_total Multi-key scatter rejections by bounded reason."
+        );
+        let _ = writeln!(
+            output,
+            "# TYPE dbproxy_multikey_scatter_rejects_total counter"
+        );
+        for reason in MultiKeyScatterRejectReason::all() {
+            let _ = writeln!(
+                output,
+                "dbproxy_multikey_scatter_rejects_total{{reason=\"{}\"}} {}",
+                reason.as_str(),
+                self.multikey_scatter_rejects[reason.index()].load(Ordering::Relaxed)
+            );
+        }
+        metric(
+            &mut output,
+            "dbproxy_multikey_scatter_branch_failures_total",
+            "counter",
+            "Backend or cache branch failures that failed a complete multi-key statement.",
+            self.multikey_scatter_branch_failures
+                .load(Ordering::Relaxed),
+        );
         metric(
             &mut output,
             "dbproxy_write_fanout_attempts_total",
@@ -1536,6 +1638,41 @@ fn histogram(
     let _ = writeln!(output, "{name}_count {count}");
 }
 
+fn observe_discrete_histogram(
+    value: u64,
+    bounds: &[u64],
+    buckets: &[AtomicU64],
+    sum: &AtomicU64,
+    count: &AtomicU64,
+) {
+    if let Some(index) = bounds.iter().position(|bound| value <= *bound) {
+        buckets[index].fetch_add(1, Ordering::Relaxed);
+    }
+    sum.fetch_add(value, Ordering::Relaxed);
+    count.fetch_add(1, Ordering::Relaxed);
+}
+
+fn discrete_histogram(
+    output: &mut String,
+    name: &str,
+    help: &str,
+    bounds: &[u64],
+    buckets: &[AtomicU64],
+    sum: u64,
+    count: u64,
+) {
+    let _ = writeln!(output, "# HELP {name} {help}");
+    let _ = writeln!(output, "# TYPE {name} histogram");
+    let mut cumulative = 0_u64;
+    for (bound, bucket) in bounds.iter().zip(buckets) {
+        cumulative = cumulative.saturating_add(bucket.load(Ordering::Relaxed));
+        let _ = writeln!(output, "{name}_bucket{{le=\"{bound}\"}} {cumulative}");
+    }
+    let _ = writeln!(output, "{name}_bucket{{le=\"+Inf\"}} {count}");
+    let _ = writeln!(output, "{name}_sum {sum}");
+    let _ = writeln!(output, "{name}_count {count}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1562,6 +1699,9 @@ mod tests {
         metrics.scatter_planned(3);
         metrics.scatter_failed();
         metrics.scatter_merged(7, 42);
+        metrics.multikey_scatter_executed(4, 11);
+        metrics.multikey_scatter_rejected(MultiKeyScatterRejectReason::HasLimit);
+        metrics.multikey_scatter_branch_failed();
         metrics.prepared_routing_cache_hit();
         metrics.prepared_routing_cache_miss();
         let output = metrics.encode_prometheus();
@@ -1589,6 +1729,16 @@ mod tests {
         assert!(output.contains("dbproxy_scatter_failures_total 1"));
         assert!(output.contains("dbproxy_scatter_merge_rows_total 7"));
         assert!(output.contains("dbproxy_scatter_merge_bytes_total 42"));
+        assert!(
+            output.contains("dbproxy_multikey_scatter_statements_total{outcome=\"executed\"} 1")
+        );
+        assert!(
+            output.contains("dbproxy_multikey_scatter_statements_total{outcome=\"rejected\"} 1")
+        );
+        assert!(output.contains("dbproxy_multikey_scatter_shards_bucket{le=\"4\"} 1"));
+        assert!(output.contains("dbproxy_multikey_scatter_keys_bucket{le=\"16\"} 1"));
+        assert!(output.contains("dbproxy_multikey_scatter_rejects_total{reason=\"has_limit\"} 1"));
+        assert!(output.contains("dbproxy_multikey_scatter_branch_failures_total 1"));
         assert!(output.contains("dbproxy_prepared_routing_cache_hits_total 1"));
         assert!(output.contains("dbproxy_prepared_routing_cache_misses_total 1"));
     }

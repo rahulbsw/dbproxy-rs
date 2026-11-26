@@ -131,6 +131,7 @@ and key column to an ordered shard list:
 ```toml
 [sharding]
 enabled = true
+allow_multikey_scatter = false
 default_shard = "orders-0"
 missing_key_policy = "reject"
 max_scatter_shards = 16
@@ -145,10 +146,14 @@ strategy = "hash"
 
 DBProxy parses equality and literal `IN` predicates for configured sharded
 tables. It routes all values to one database when they resolve to the same
-shard and rejects an ordinary statement that spans shards. The analysis also
-inspects CTEs, expression subqueries, DML source tables, and multi-row inserts.
-Ambiguous self-joins, shard-key mutations, and unsupported SQL shapes fail
-closed.
+shard and rejects an ordinary statement that spans shards by default. With
+`allow_multikey_scatter = true`, a direct single-table `SELECT` whose shard-key
+`IN` list spans shards is partitioned into one canonical sub-query per shard.
+The multi-key row planner rejects ordering, limits, grouping, function calls,
+joins, ambiguous predicates, and cross-shard DML. Supported aggregates use the
+separate merge path below. The analysis also inspects CTEs,
+expression subqueries, DML source tables, and multi-row inserts. Ambiguous
+self-joins, shard-key mutations, and unsupported SQL shapes fail closed.
 
 Root-level `UNION ALL` branches may target different shards. DBProxy executes
 them with bounded concurrency, metadata checks, and a shared row and byte
@@ -185,6 +190,8 @@ owned XIDs. Read the [XA operations guide](docs/mysql-xa.md) before enabling it.
 The optional MySQL read-through cache stores explicitly configured results in
 Redis/Valkey. It provides bounded values, singleflight fills, refresh-ahead,
 and commit-aware table/shard invalidation for writes routed through DBProxy.
+Eligible multi-key reads use one cache entry per canonical shard sub-query, so
+warm shards do not issue backend queries and invalidation remains shard-local.
 Streaming reads and direct database writes bypass that coherence path; use a
 bounded TTL or the documented external CDC invalidation contract. See the
 [cache guide](docs/cache.md) and [CDC contract](docs/cdc-cache-invalidation.md).
@@ -230,9 +237,11 @@ for names, alert suggestions, and the sensitive-data contract.
 - Streaming cannot resume after a mid-stream backend failure. Once rows have
   reached the client, DBProxy closes the connection because it cannot replace a
   partial result with a clean protocol error.
-- Distributed reads remain limited to root `UNION ALL` and the decomposable
-  aggregates listed above. Cross-shard joins, ordered/grouped merges, automatic
-  table rewriting, and online resharding are not implemented.
+- Distributed reads remain limited to root `UNION ALL`, direct single-table
+  shard-key `IN` decomposition when explicitly enabled, and the decomposable
+  aggregates listed above. Multi-key `LIMIT`/`OFFSET`, ordering, cross-shard
+  DML, joins, grouped merges, automatic table rewriting, and online resharding
+  are not implemented.
 - etcd runtime generations cover scoped MySQL users, routing, sharding, fanout,
   and cache policy. Listener, backend, PostgreSQL, Redis, and XA durability
   changes require a restart. There is no admin SQL interface.

@@ -13,6 +13,7 @@ use dbproxy::{
 fn shard_router() -> ShardRouter {
     let config = ShardingConfig {
         enabled: true,
+        allow_multikey_scatter: false,
         default_shard: "s0".to_owned(),
         missing_key_policy: MissingShardKeyPolicy::Reject,
         max_scatter_shards: 16,

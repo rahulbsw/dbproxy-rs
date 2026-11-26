@@ -139,6 +139,7 @@ impl Default for CacheConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CacheRuleConfig {
     pub table: String,
+    pub batch_decomposition: CacheBatchDecomposition,
     pub ttl_seconds: u64,
     pub negative_ttl_seconds: u64,
     pub ttl_jitter_percent: u8,
@@ -151,6 +152,7 @@ impl Default for CacheRuleConfig {
     fn default() -> Self {
         Self {
             table: String::new(),
+            batch_decomposition: CacheBatchDecomposition::PerShard,
             ttl_seconds: 30,
             negative_ttl_seconds: 5,
             ttl_jitter_percent: 10,
@@ -159,6 +161,14 @@ impl Default for CacheRuleConfig {
             max_bytes: 1_048_576,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheBatchDecomposition {
+    #[default]
+    PerShard,
+    PerKey,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -373,6 +383,7 @@ pub enum ProtocolShardStrategy {
 #[serde(default, deny_unknown_fields)]
 pub struct ProtocolShardingConfig {
     pub enabled: bool,
+    pub allow_multikey_scatter: bool,
     pub strategy: ProtocolShardStrategy,
     pub default_shard: Option<String>,
     pub shards: Vec<ProtocolShardConfig>,
@@ -387,6 +398,7 @@ impl Default for ProtocolShardingConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            allow_multikey_scatter: false,
             strategy: ProtocolShardStrategy::default(),
             default_shard: None,
             shards: Vec::new(),
@@ -707,6 +719,7 @@ pub enum MissingShardKeyPolicy {
 #[serde(default, deny_unknown_fields)]
 pub struct ShardingConfig {
     pub enabled: bool,
+    pub allow_multikey_scatter: bool,
     pub default_shard: String,
     pub missing_key_policy: MissingShardKeyPolicy,
     pub max_scatter_shards: usize,
@@ -718,6 +731,7 @@ impl Default for ShardingConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            allow_multikey_scatter: false,
             default_shard: default_shard(),
             missing_key_policy: MissingShardKeyPolicy::Reject,
             max_scatter_shards: 16,
@@ -1268,6 +1282,12 @@ impl Config {
             if !tables.insert(table) {
                 return Err(ProxyError::Config(format!(
                     "duplicate cache rule for table {:?}",
+                    rule.table
+                )));
+            }
+            if rule.batch_decomposition == CacheBatchDecomposition::PerKey {
+                return Err(ProxyError::Config(format!(
+                    "cache rule for {:?} sets batch_decomposition = \"per_key\", which is not implemented; use \"per_shard\"",
                     rule.table
                 )));
             }
@@ -2268,6 +2288,16 @@ mod tests {
         let config: Config = toml::from_str(raw).unwrap();
         config.validate().unwrap();
 
+        let mut unsupported = config.clone();
+        unsupported.cache.rules[0].batch_decomposition = CacheBatchDecomposition::PerKey;
+        assert!(
+            unsupported
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("batch_decomposition")
+        );
+
         let mut invalid = config.clone();
         invalid.cache.distributed_singleflight = true;
         invalid.cache.fill_wait_milliseconds = invalid.cache.fill_lease_milliseconds + 1;
@@ -2839,8 +2869,14 @@ mod tests {
         assert_eq!(WriteFanoutConfig::default().max_concurrency, 8);
         assert_eq!(ShardingConfig::default().max_scatter_shards, 16);
         assert_eq!(ShardingConfig::default().scatter_concurrency, 4);
+        assert!(!ShardingConfig::default().allow_multikey_scatter);
         assert_eq!(ProtocolShardingConfig::default().max_scatter_shards, 16);
         assert_eq!(ProtocolShardingConfig::default().scatter_concurrency, 4);
+        assert!(!ProtocolShardingConfig::default().allow_multikey_scatter);
+        assert_eq!(
+            CacheRuleConfig::default().batch_decomposition,
+            CacheBatchDecomposition::PerShard
+        );
     }
 
     #[test]
