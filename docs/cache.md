@@ -28,6 +28,7 @@ fill_poll_milliseconds = 10
 
 [[cache.rules]]
 table = "products"
+batch_decomposition = "per_shard"
 ttl_seconds = 30
 negative_ttl_seconds = 5
 ttl_jitter_percent = 10
@@ -42,6 +43,25 @@ metadata and typed values. Both decoded and encoded size limits are enforced.
 An empty result uses `negative_ttl_seconds`; setting it to zero disables
 negative caching. Deterministic TTL jitter spreads expirations without adding
 per-request random-number overhead.
+
+When MySQL `sharding.allow_multikey_scatter = true`, an eligible multi-key read
+uses one cache entry for each canonical shard branch. Text queries sort and
+deduplicate the branch's `IN` values. Prepared queries use a separate key space
+and include each bound argument's type and value. Warm branches are served from
+Redis/Valkey while cold branches each issue one backend `IN` query. All rows
+share the scatter operation's row and byte limits, and cache lookups and fills
+share its deadline. Entries keep their normal table/shard generation, so a
+write invalidates the affected shard's branch entries.
+
+The query observatory records one outcome per statement. A hit means all
+branches hit, a miss means at least one branch attempted a fill, and a bypass
+covers the remaining cases. The global cache counters track individual cache
+operations.
+
+`batch_decomposition = "per_shard"` is the default and only implemented cache
+mode. Configuration validation rejects `"per_key"`; it is reserved for a
+future implementation that can safely coalesce cold-key fetches without
+turning one batch into an unbounded number of backend queries.
 
 On a miss, one task per DBProxy process fills a key while concurrent requests
 wait and recheck Redis. With `distributed_singleflight = true`, the local owner

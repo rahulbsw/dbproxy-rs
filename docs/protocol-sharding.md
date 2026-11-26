@@ -31,6 +31,7 @@ routing_mode = "transaction"
 
 [postgres.sharding]
 enabled = true
+allow_multikey_scatter = false
 strategy = "hash"
 max_scatter_shards = 16
 scatter_concurrency = 4
@@ -45,6 +46,24 @@ and subqueries. All values in an ordinary statement must map to one shard.
 Bounded root `UNION ALL` and decomposable aggregate scatter/gather are supported;
 cross-shard joins and global ordered/grouped merges are rejected. TimescaleDB
 hypertables follow the same rules.
+
+`allow_multikey_scatter = true` additionally permits a direct, single-table
+`SELECT` with exactly one non-negated shard-key `IN` list to span shards. The
+list is partitioned by shard, then each shard's values are sorted and
+deduplicated before SQL is rendered. Other `AND` predicates are copied into
+every branch. Both simple and extended-query executions use the existing
+bounded scatter concurrency, metadata compatibility checks, shared row/byte
+budget, and all-or-error buffering. The multi-key row planner rejects
+`ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`, grouping, function calls, windows,
+joins, CTEs, `OR`, locking reads, `SELECT INTO`, and cross-shard
+`UPDATE`/`DELETE`. Supported aggregates still use the aggregate merge path.
+
+MySQL uses the same option under `[sharding]`. Its optional read-through cache
+stores each canonical shard branch independently. The cache does not create a
+composite multi-shard key, and a cold branch remains one backend `IN` query.
+`cache.rules[].batch_decomposition = "per_shard"` is the only implemented
+mode; `"per_key"` is rejected during configuration validation until cold-key
+fetch coalescing is implemented.
 
 SQL rule names are deliberately unqualified: configure `table = "user_info"`
 and `column = "userid"`, not schema-qualified names. A DBProxy listener must

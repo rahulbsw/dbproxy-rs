@@ -24,7 +24,7 @@ use mysql_async::{
 use opensrv_mysql::{
     AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind, InitWriter,
     IntermediaryOptions, OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter,
-    ValueInner, plain_run_with_options, secure_run_with_options,
+    ToMysqlValue, ValueInner, plain_run_with_options, secure_run_with_options,
 };
 use sha1::{Digest, Sha1};
 use sqlparser::ast::{Value as SqlValue, ValueWithSpan, VisitMut, VisitorMut};
@@ -42,7 +42,7 @@ use crate::{
     admin,
     auth::{verify_caching_sha2_password, verify_native_password},
     backend::{Backend, BackendManager, BackendQueryOutcome},
-    cache::{CacheManager, CacheRead, CacheScope, CachedResult},
+    cache::{CacheManager, CacheRead, CacheScope, CachedResult, CachedValue},
     classifier::{
         MysqlTransactionEvaluation, MysqlTransactionSemantics, QueryKind, SqlAnalysis,
         SqlClassifier,
@@ -58,7 +58,8 @@ use crate::{
     routing::{RouteTarget, SessionState},
     sharding::{
         AggregateKind, AggregatePlan, PlannedShardQuery, ShardDecision, ShardQueryPlan,
-        ShardRouter, parameterize_mysql_scatter_plan,
+        ShardRouter, ShardRoutingError, parameterize_mysql_scatter_plan,
+        parameterize_mysql_scatter_plan_with_sql,
     },
     tls,
     xa::{XaJournal, XaRecord, XaState},
@@ -1176,14 +1177,12 @@ impl ProxySession {
         &self,
         query: &str,
         analysis: &SqlAnalysis,
-    ) -> Result<ShardQueryPlan, ProxyError> {
-        self.shard_router
-            .plan_parsed(
-                query,
-                analysis.statements(),
-                self.config.sharding.max_scatter_shards,
-            )
-            .map_err(|error| ProxyError::Protocol(error.to_string()))
+    ) -> Result<ShardQueryPlan, ShardRoutingError> {
+        self.shard_router.plan_parsed(
+            query,
+            analysis.statements(),
+            self.config.sharding.max_scatter_shards,
+        )
     }
 
     fn fanout_targets(&self, decision: &ShardDecision) -> Vec<String> {
@@ -1687,60 +1686,86 @@ impl ProxySession {
         route: RouteTarget,
         kind: QueryKind,
     ) -> Result<Option<CacheLookup>, ProxyError> {
-        let status = if kind != QueryKind::Read {
-            CacheStatus::NotRead
-        } else if decision.table.is_none() {
-            CacheStatus::MissingTable
-        } else if route != RouteTarget::Replica {
-            CacheStatus::PrimaryOrPinnedRoute
-        } else if self.config.proxy.result_mode != ResultMode::Buffered {
-            CacheStatus::StreamingResultMode
-        } else if decision.table_count != 1 {
-            CacheStatus::MultipleTables
-        } else if !cache_safe_sql(query) {
-            CacheStatus::VolatileOrSessionDependent
-        } else if self.cache.is_none() {
-            CacheStatus::CacheDisabled
-        } else if self.cache.as_ref().is_some_and(|manager| {
-            decision
-                .table
-                .as_deref()
-                .is_some_and(|table| manager.rule(table).is_none())
-        }) {
-            CacheStatus::TableNotConfigured
-        } else {
-            CacheStatus::Eligible
-        };
+        let status = self.cache_status(
+            query,
+            decision.table.as_deref(),
+            decision.table_count,
+            route,
+            kind,
+        );
         if status != CacheStatus::Eligible {
             self.metrics.cache_bypass();
             self.metrics
                 .record_query_cache(query_id, status, CacheOutcome::Bypass);
             return Ok(None);
         }
-        let manager = self.cache.as_ref().expect("eligible cache has a manager");
         let table = decision
             .table
             .as_deref()
             .expect("eligible query has a table");
+        let result = self
+            .lookup_cached_result(query.as_bytes(), table, &decision.shard)
+            .await?;
+        self.metrics
+            .record_query_cache(query_id, status, cache_lookup_outcome(&result));
+        Ok(result)
+    }
+
+    fn cache_status(
+        &self,
+        query: &str,
+        table: Option<&str>,
+        table_count: usize,
+        route: RouteTarget,
+        kind: QueryKind,
+    ) -> CacheStatus {
+        if kind != QueryKind::Read {
+            CacheStatus::NotRead
+        } else if table.is_none() {
+            CacheStatus::MissingTable
+        } else if route != RouteTarget::Replica {
+            CacheStatus::PrimaryOrPinnedRoute
+        } else if self.config.proxy.result_mode != ResultMode::Buffered {
+            CacheStatus::StreamingResultMode
+        } else if table_count != 1 {
+            CacheStatus::MultipleTables
+        } else if !cache_safe_sql(query) {
+            CacheStatus::VolatileOrSessionDependent
+        } else if self.cache.is_none() {
+            CacheStatus::CacheDisabled
+        } else if self
+            .cache
+            .as_ref()
+            .is_some_and(|manager| table.is_some_and(|table| manager.rule(table).is_none()))
+        {
+            CacheStatus::TableNotConfigured
+        } else {
+            CacheStatus::Eligible
+        }
+    }
+
+    async fn lookup_cached_result(
+        &self,
+        identity: &[u8],
+        table: &str,
+        shard: &str,
+    ) -> Result<Option<CacheLookup>, ProxyError> {
+        let manager = self.cache.as_ref().expect("eligible cache has a manager");
         let rule = manager
             .rule(table)
             .cloned()
             .expect("eligible cache has a table rule");
 
-        let scope = CacheScope::new(self.schema.as_deref(), table, &decision.shard);
-        let mut cache_identity = String::with_capacity(query.len() + 64);
-        cache_identity.push_str(query);
+        let scope = CacheScope::new(self.schema.as_deref(), table, shard);
+        let mut cache_identity = Vec::with_capacity(identity.len() + 64);
+        cache_identity.extend_from_slice(identity);
         for command in &self.session_commands {
-            cache_identity.push('\0');
-            cache_identity.push_str(command);
+            cache_identity.push(0);
+            cache_identity.extend_from_slice(command.as_bytes());
         }
-        let key = manager.query_key(&scope, &cache_identity).await?;
+        let key = manager.query_key(&scope, cache_identity).await?;
         let mut stale = match manager.get(&key, rule.refresh_ahead_seconds).await? {
-            CacheRead::Hit(result) => {
-                self.metrics
-                    .record_query_cache(query_id, status, CacheOutcome::Hit);
-                return Ok(Some(CacheLookup::Hit(result)));
-            }
+            CacheRead::Hit(result) => return Ok(Some(CacheLookup::Hit(result))),
             CacheRead::RefreshDue {
                 result,
                 payload_bytes,
@@ -1751,11 +1776,7 @@ impl ProxySession {
         let flight = manager.flight(&key).await;
         let guard = flight.lock_owned().await;
         match manager.get(&key, rule.refresh_ahead_seconds).await? {
-            CacheRead::Hit(result) => {
-                self.metrics
-                    .record_query_cache(query_id, status, CacheOutcome::Hit);
-                return Ok(Some(CacheLookup::Hit(result)));
-            }
+            CacheRead::Hit(result) => return Ok(Some(CacheLookup::Hit(result))),
             CacheRead::RefreshDue {
                 result,
                 payload_bytes,
@@ -1768,26 +1789,18 @@ impl ProxySession {
                 None => {
                     if let Some((result, payload_bytes)) = stale {
                         manager.stale_served(payload_bytes);
-                        self.metrics
-                            .record_query_cache(query_id, status, CacheOutcome::Hit);
                         return Ok(Some(CacheLookup::Hit(result)));
                     }
                     if let Some(result) = manager.wait_for_fill(&key).await? {
-                        self.metrics
-                            .record_query_cache(query_id, status, CacheOutcome::Hit);
                         return Ok(Some(CacheLookup::Hit(result)));
                     }
                     self.metrics.cache_bypass();
-                    self.metrics
-                        .record_query_cache(query_id, status, CacheOutcome::Bypass);
                     return Ok(None);
                 }
             }
         } else {
             None
         };
-        self.metrics
-            .record_query_cache(query_id, status, CacheOutcome::Miss);
         Ok(Some(CacheLookup::Fill(CacheFill {
             manager: manager.clone(),
             rule,
@@ -1852,7 +1865,61 @@ impl ProxySession {
         budget: Arc<tokio::sync::Mutex<ScatterBudget>>,
         deadline: time::Instant,
         prepared_values: Option<Arc<Vec<Value>>>,
+        cache: Option<(&str, &mut CacheOutcome)>,
     ) -> Result<BufferedShardResult, ProxyError> {
+        let values = prepared_values
+            .map(|values| {
+                branch
+                    .parameter_indexes
+                    .iter()
+                    .map(|index| {
+                        values.get(*index).cloned().ok_or_else(|| {
+                            ProxyError::Protocol(
+                                "prepared scatter parameter index is out of bounds".to_owned(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        let mut cache_fill = None;
+        if let Some((table, cache_outcome)) = cache {
+            let identity = scatter_cache_identity(&branch.sql, values.as_deref())?;
+            let lookup = time::timeout_at(
+                deadline,
+                self.lookup_cached_result(&identity, table, &branch.shard),
+            )
+            .await
+            .map_err(|_| ProxyError::Protocol("scatter cache lookup timed out".to_owned()))?;
+            match lookup {
+                Ok(Some(CacheLookup::Hit(cached))) => {
+                    *cache_outcome = CacheOutcome::Hit;
+                    reserve_cached_scatter_budget(
+                        &budget,
+                        cached.rows.len(),
+                        cached.bytes_returned as usize,
+                        self.config.proxy.max_result_rows,
+                        self.config.proxy.max_result_bytes,
+                    )
+                    .await?;
+                    return Ok(BufferedShardResult {
+                        columns: cached.frontend_columns(),
+                        wire_metadata: cached.wire_metadata(),
+                        rows: cached.backend_rows(),
+                    });
+                }
+                Ok(Some(CacheLookup::Fill(fill))) => {
+                    *cache_outcome = CacheOutcome::Miss;
+                    cache_fill = Some(fill);
+                }
+                Ok(None) => {}
+                Err(error) if self.cache.as_ref().is_some_and(|cache| cache.fail_open()) => {
+                    self.metrics.cache_bypass();
+                    warn!(%error, "multi-key branch cache lookup failed; bypassing cache");
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let (mut connection, backend) =
             time::timeout_at(deadline, self.acquire_for_scatter(route, &branch.shard))
                 .await
@@ -1870,18 +1937,7 @@ impl ProxySession {
         let started = Instant::now();
         let timeout = Duration::from_secs(self.config.proxy.backend_query_timeout_seconds);
         let execution = async {
-            if let Some(values) = prepared_values {
-                let values = branch
-                    .parameter_indexes
-                    .iter()
-                    .map(|index| {
-                        values.get(*index).cloned().ok_or_else(|| {
-                            ProxyError::Protocol(
-                                "prepared scatter parameter index is out of bounds".to_owned(),
-                            )
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+            if let Some(values) = values {
                 let result = connection
                     .exec_iter(&branch.sql, Params::Positional(values))
                     .await?;
@@ -1894,6 +1950,26 @@ impl ProxySession {
         match time::timeout_at(deadline, execution).await {
             Ok(Ok(result)) => {
                 backend.record_query(BackendQueryOutcome::Success, started.elapsed());
+                drop(connection);
+                if let Some(fill) = cache_fill
+                    && time::Instant::now() < deadline
+                {
+                    let cached = CachedResult::new_with_wire_metadata(
+                        &result.columns,
+                        &result.rows,
+                        result
+                            .rows
+                            .iter()
+                            .map(|row| values_size(row))
+                            .sum::<usize>() as u64,
+                        result.wire_metadata.clone().unwrap_or_default(),
+                    );
+                    match time::timeout_at(deadline, fill.store(cached)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => warn!(%error, "multi-key branch cache fill failed"),
+                        Err(_) => warn!("multi-key branch cache fill reached the scatter deadline"),
+                    }
+                }
                 Ok(result)
             }
             Ok(Err(error)) => {
@@ -1964,7 +2040,7 @@ impl ProxySession {
         result.drop_result().await?;
         Ok(BufferedShardResult {
             columns,
-            wire_metadata,
+            wire_metadata: Some(wire_metadata),
             rows,
         })
     }
@@ -1976,6 +2052,7 @@ impl ProxySession {
         started: Instant,
         prepared_columns: Option<Vec<Column>>,
         prepared_values: Option<Vec<Value>>,
+        cache_query: Option<(&str, &str)>,
     ) -> Result<(), ProxyError>
     where
         W: AsyncWrite + Send + Unpin,
@@ -1991,11 +2068,19 @@ impl ProxySession {
                 .await?;
             return Ok(());
         }
-        let (queries, aggregate) = match plan {
-            ShardQueryPlan::UnionAll(queries) => (queries, None),
-            ShardQueryPlan::Aggregate(plan) => (plan.queries.clone(), Some(plan)),
+        let (queries, aggregate, multikey) = match plan {
+            ShardQueryPlan::UnionAll(queries) => (queries, None, None),
+            ShardQueryPlan::Aggregate(plan) => (plan.queries.clone(), Some(plan), None),
+            ShardQueryPlan::MultiKey(plan) => {
+                let multikey = Some((plan.table, plan.key_count));
+                (plan.queries, None, multikey)
+            }
             ShardQueryPlan::Single(_) => unreachable!("single-shard plan used as scatter"),
         };
+        if let Some((_, key_count)) = &multikey {
+            self.metrics
+                .multikey_scatter_executed(queries.len(), *key_count);
+        }
         self.metrics.scatter_planned(queries.len());
         let route = self
             .state
@@ -2005,30 +2090,55 @@ impl ProxySession {
             + Duration::from_secs(self.config.proxy.backend_query_timeout_seconds);
         let session: &ProxySession = self;
         let prepared_values = prepared_values.map(Arc::new);
+        let cache_record = multikey
+            .as_ref()
+            .map(|(table, _)| table.as_str())
+            .zip(cache_query)
+            .map(|(table, (query_id, sql))| {
+                let status = self.cache_status(sql, Some(table), 1, route, QueryKind::Read);
+                if status != CacheStatus::Eligible {
+                    self.metrics.cache_bypass();
+                }
+                (
+                    query_id,
+                    status,
+                    (status == CacheStatus::Eligible).then_some(table),
+                )
+            });
+        let cache_table = cache_record.and_then(|(_, _, table)| table);
         let mut results = stream::iter(queries.into_iter().enumerate().map(|(index, branch)| {
             let budget = budget.clone();
             let prepared_values = prepared_values.clone();
             async move {
-                (
-                    index,
-                    session
-                        .execute_buffered_shard_query(
-                            branch,
-                            route,
-                            budget,
-                            deadline,
-                            prepared_values,
-                        )
-                        .await,
-                )
+                let mut cache_outcome = CacheOutcome::Bypass;
+                let result = session
+                    .execute_buffered_shard_query(
+                        branch,
+                        route,
+                        budget,
+                        deadline,
+                        prepared_values,
+                        cache_table.map(|table| (table, &mut cache_outcome)),
+                    )
+                    .await;
+                (index, cache_outcome, result)
             }
         }))
         .buffer_unordered(self.config.sharding.scatter_concurrency)
         .collect::<Vec<_>>()
         .await;
-        results.sort_by_key(|(index, _)| *index);
+        if let Some((query_id, status, _)) = cache_record {
+            let outcome = scatter_cache_outcome(results.iter().map(|(_, outcome, _)| *outcome));
+            self.metrics.record_query_cache(query_id, status, outcome);
+        }
+        results.sort_by_key(|(index, _, _)| *index);
+        if multikey.is_some() {
+            for _ in results.iter().filter(|(_, _, result)| result.is_err()) {
+                self.metrics.multikey_scatter_branch_failed();
+            }
+        }
         let mut gathered = Vec::with_capacity(results.len());
-        for (_, result) in results {
+        for (_, _, result) in results {
             match result {
                 Ok(result) => gathered.push(result),
                 Err(error) => {
@@ -2165,6 +2275,9 @@ impl ProxySession {
         let plan = match self.shard_plan_from_analysis(query, &analysis) {
             Ok(plan) => plan,
             Err(error) => {
+                if let Some(reason) = error.multikey_reject_reason() {
+                    self.metrics.multikey_scatter_rejected(reason);
+                }
                 self.metrics.shard_routing_failed();
                 self.metrics.query_failed();
                 writer
@@ -2193,7 +2306,29 @@ impl ProxySession {
                     return Ok(());
                 }
                 return self
-                    .execute_scatter_plan(plan, writer, started, None, None)
+                    .execute_scatter_plan(plan, writer, started, None, None, None)
+                    .await;
+            }
+            plan @ ShardQueryPlan::MultiKey(_) => {
+                if classification.kind != QueryKind::Read || !scatter_safe_sql(query) {
+                    self.metrics.query_failed();
+                    writer
+                        .error(
+                            ErrorKind::ER_NOT_SUPPORTED_YET,
+                            b"multi-key scatter supports deterministic read-only queries",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                return self
+                    .execute_scatter_plan(
+                        plan,
+                        writer,
+                        started,
+                        None,
+                        None,
+                        Some((&query_id, query)),
+                    )
                     .await;
             }
         };
@@ -2463,7 +2598,7 @@ struct MaterializedResult {
 
 struct BufferedShardResult {
     columns: Vec<Column>,
-    wire_metadata: Vec<(u16, u32, u8)>,
+    wire_metadata: Option<Vec<(u16, u32, u8)>>,
     rows: Vec<Vec<Value>>,
 }
 
@@ -2476,6 +2611,49 @@ struct ScatterBudget {
 enum CacheLookup {
     Hit(CachedResult),
     Fill(CacheFill),
+}
+
+fn cache_lookup_outcome(lookup: &Option<CacheLookup>) -> CacheOutcome {
+    match lookup {
+        Some(CacheLookup::Hit(_)) => CacheOutcome::Hit,
+        Some(CacheLookup::Fill(_)) => CacheOutcome::Miss,
+        None => CacheOutcome::Bypass,
+    }
+}
+
+fn scatter_cache_identity(sql: &str, params: Option<&[Value]>) -> Result<Vec<u8>, ProxyError> {
+    match params {
+        Some(params) => {
+            let mut identity = b"\0mysql-scatter-binary\0".to_vec();
+            let values: Vec<_> = params.iter().map(CachedValue::from).collect();
+            rmp_serde::encode::write(&mut identity, &(sql, values)).map_err(|_| {
+                ProxyError::Protocol("cannot encode scatter cache identity".to_owned())
+            })?;
+            Ok(identity)
+        }
+        None => {
+            let mut identity = b"\0mysql-scatter-text\0".to_vec();
+            identity.extend_from_slice(sql.as_bytes());
+            Ok(identity)
+        }
+    }
+}
+
+fn scatter_cache_outcome(branches: impl IntoIterator<Item = CacheOutcome>) -> CacheOutcome {
+    let mut hit = false;
+    let mut bypass = false;
+    for outcome in branches {
+        match outcome {
+            CacheOutcome::Miss => return CacheOutcome::Miss,
+            CacheOutcome::Hit => hit = true,
+            CacheOutcome::Bypass => bypass = true,
+        }
+    }
+    if hit && !bypass {
+        CacheOutcome::Hit
+    } else {
+        CacheOutcome::Bypass
+    }
 }
 
 struct CacheFill {
@@ -2744,6 +2922,9 @@ where
         ) {
             Ok(plan) => plan,
             Err(error) => {
+                if let Some(reason) = error.multikey_reject_reason() {
+                    self.metrics.multikey_scatter_rejected(reason);
+                }
                 self.metrics.shard_routing_failed();
                 self.metrics.query_failed();
                 results
@@ -2795,6 +2976,48 @@ where
                         started,
                         Some(prepared_columns),
                         Some(values),
+                        None,
+                    )
+                    .await;
+            }
+            ref mut plan @ ShardQueryPlan::MultiKey(_) => {
+                if kind != QueryKind::Read || !scatter_safe_sql(&routing_sql) {
+                    self.metrics.query_failed();
+                    results
+                        .error(
+                            ErrorKind::ER_NOT_SUPPORTED_YET,
+                            b"multi-key scatter supports deterministic read-only queries",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                let Some(routing_statements) = routing_statements.as_deref() else {
+                    self.metrics.query_failed();
+                    results
+                        .error(
+                            ErrorKind::ER_NOT_SUPPORTED_YET,
+                            b"prepared scatter requires a parsed routing template",
+                        )
+                        .await?;
+                    return Ok(());
+                };
+                if let Err(error) =
+                    parameterize_mysql_scatter_plan_with_sql(plan, routing_statements, Some(&query))
+                {
+                    self.metrics.query_failed();
+                    results
+                        .error(ErrorKind::ER_PARSE_ERROR, error.to_string().as_bytes())
+                        .await?;
+                    return Ok(());
+                }
+                return self
+                    .execute_scatter_plan(
+                        plan.clone(),
+                        results,
+                        started,
+                        Some(prepared_columns),
+                        Some(values),
+                        Some((query_id, &routing_sql)),
                     )
                     .await;
             }
@@ -3305,6 +3528,37 @@ fn check_result_limits(
     Ok(())
 }
 
+async fn reserve_cached_scatter_budget(
+    budget: &tokio::sync::Mutex<ScatterBudget>,
+    rows: usize,
+    bytes: usize,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<(), ProxyError> {
+    let mut budget = budget.lock().await;
+    let next_rows = budget
+        .rows
+        .checked_add(rows)
+        .ok_or_else(|| ProxyError::Protocol("scatter row budget overflow".to_owned()))?;
+    let next_bytes = budget
+        .bytes
+        .checked_add(bytes)
+        .ok_or_else(|| ProxyError::Protocol("scatter byte budget overflow".to_owned()))?;
+    if next_rows > max_rows {
+        return Err(ProxyError::Protocol(format!(
+            "result exceeds configured limit of {max_rows} rows"
+        )));
+    }
+    if next_bytes > max_bytes {
+        return Err(ProxyError::Protocol(format!(
+            "result exceeds configured limit of {max_bytes} bytes"
+        )));
+    }
+    budget.rows = next_rows;
+    budget.bytes = next_bytes;
+    Ok(())
+}
+
 fn row_size(row: &mysql_async::Row) -> usize {
     (0..row.len())
         .filter_map(|index| row.as_ref(index))
@@ -3652,8 +3906,8 @@ where
     match value {
         Value::NULL => writer.write_col(None::<String>),
         Value::Bytes(value) => writer.write_col(value),
-        Value::Int(value) => writer.write_col(value),
-        Value::UInt(value) => writer.write_col(value),
+        Value::Int(value) => writer.write_col(MysqlInteger(i128::from(value))),
+        Value::UInt(value) => writer.write_col(MysqlInteger(i128::from(value))),
         Value::Float(value) => writer.write_col(value),
         Value::Double(value) => writer.write_col(value),
         Value::Date(year, month, day, hour, minute, second, micros) => writer.write_col(
@@ -3662,6 +3916,41 @@ where
         Value::Time(negative, days, hours, minutes, seconds, micros) => writer.write_col(
             format_mysql_time(negative, days, hours, minutes, seconds, micros),
         ),
+    }
+}
+
+struct MysqlInteger(i128);
+
+impl ToMysqlValue for MysqlInteger {
+    fn to_mysql_text<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        if let Ok(signed) = i64::try_from(self.0) {
+            signed.to_mysql_text(writer)
+        } else {
+            (self.0 as u64).to_mysql_text(writer)
+        }
+    }
+
+    fn to_mysql_bin<W: io::Write>(&self, writer: &mut W, column: &Column) -> io::Result<()> {
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "integer does not fit MySQL column",
+            )
+        };
+        let unsigned = column.colflags.contains(ColumnFlags::UNSIGNED_FLAG);
+        // mysql_async decodes all integer widths into i64, except large unsigned BIGINTs.
+        let size = match (column.coltype, unsigned) {
+            (ColumnType::MYSQL_TYPE_TINY, false) if i8::try_from(self.0).is_ok() => 1,
+            (ColumnType::MYSQL_TYPE_TINY, true) if u8::try_from(self.0).is_ok() => 1,
+            (ColumnType::MYSQL_TYPE_SHORT, false) if i16::try_from(self.0).is_ok() => 2,
+            (ColumnType::MYSQL_TYPE_SHORT, true) if u16::try_from(self.0).is_ok() => 2,
+            (ColumnType::MYSQL_TYPE_LONG, false) if i32::try_from(self.0).is_ok() => 4,
+            (ColumnType::MYSQL_TYPE_LONG, true) if u32::try_from(self.0).is_ok() => 4,
+            (ColumnType::MYSQL_TYPE_LONGLONG, false) if i64::try_from(self.0).is_ok() => 8,
+            (ColumnType::MYSQL_TYPE_LONGLONG, true) if u64::try_from(self.0).is_ok() => 8,
+            _ => return Err(invalid()),
+        };
+        writer.write_all(&self.0.to_le_bytes()[..size])
     }
 }
 
@@ -4003,6 +4292,115 @@ mod tests {
         assert!(!salt.contains(&b'$'));
     }
 
+    #[tokio::test]
+    async fn cached_scatter_branches_share_one_result_budget() {
+        let budget = tokio::sync::Mutex::new(ScatterBudget::default());
+        reserve_cached_scatter_budget(&budget, 2, 5, 3, 10)
+            .await
+            .unwrap();
+        assert!(
+            reserve_cached_scatter_budget(&budget, 2, 1, 3, 10)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("3 rows")
+        );
+        assert!(
+            reserve_cached_scatter_budget(&budget, 1, 6, 3, 10)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("10 bytes")
+        );
+        let budget = budget.lock().await;
+        assert_eq!(budget.rows, 2);
+        assert_eq!(budget.bytes, 5);
+    }
+
+    #[test]
+    fn scatter_cache_separates_protocols_and_preserves_parameter_types() {
+        let sql = "SELECT id FROM orders WHERE tenant_id IN ('abc')";
+        let text = scatter_cache_identity(sql, None).unwrap();
+        let binary = scatter_cache_identity(sql, Some(&[])).unwrap();
+        assert_ne!(text, binary);
+        assert_ne!(text, sql.as_bytes());
+        let sql = "SELECT id FROM orders WHERE tenant_id IN (?)";
+        let key = |value| scatter_cache_identity(sql, Some(&[value])).unwrap();
+        assert_ne!(key(Value::Int(1)), key(Value::UInt(1)));
+        assert_ne!(key(Value::Int(1)), key(Value::Bytes(b"1".to_vec())));
+        assert_ne!(key(Value::Float(1.0)), key(Value::Double(1.0)));
+        assert_ne!(key(Value::Bytes(vec![0xff])), key(Value::Bytes(vec![0xfe])));
+    }
+
+    #[test]
+    fn mysql_binary_integer_respects_result_column_width_and_sign() {
+        for (value, coltype, colflags, expected) in [
+            (
+                -5,
+                ColumnType::MYSQL_TYPE_TINY,
+                ColumnFlags::empty(),
+                vec![251],
+            ),
+            (
+                300,
+                ColumnType::MYSQL_TYPE_SHORT,
+                ColumnFlags::empty(),
+                vec![44, 1],
+            ),
+            (
+                70_000,
+                ColumnType::MYSQL_TYPE_LONG,
+                ColumnFlags::UNSIGNED_FLAG,
+                70_000_u32.to_le_bytes().to_vec(),
+            ),
+            (
+                u64::MAX as i128,
+                ColumnType::MYSQL_TYPE_LONGLONG,
+                ColumnFlags::UNSIGNED_FLAG,
+                vec![255; 8],
+            ),
+        ] {
+            let column = Column {
+                table: "orders".to_owned(),
+                column: "id".to_owned(),
+                coltype,
+                colflags,
+            };
+            let mut encoded = Vec::new();
+            MysqlInteger(value)
+                .to_mysql_bin(&mut encoded, &column)
+                .unwrap();
+            assert_eq!(encoded, expected);
+        }
+    }
+
+    #[test]
+    fn scatter_cache_records_a_single_client_outcome() {
+        let metrics = Metrics::default();
+        let sql = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::MySqlDialect {},
+            "SELECT payload FROM orders WHERE tenant_id IN (1, 2)",
+        )
+        .unwrap();
+        let record = |branches| {
+            let query_id = metrics.begin_query_shape("mysql", "read", Some(&sql));
+            metrics.record_query_cache(
+                &query_id,
+                CacheStatus::Eligible,
+                scatter_cache_outcome(branches),
+            );
+        };
+        use CacheOutcome::{Bypass, Hit, Miss};
+        record([Hit, Hit]);
+        record([Hit, Miss]);
+        record([Hit, Bypass]);
+        let snapshot = metrics.query_registry_snapshot();
+        assert_eq!(snapshot[0].calls, 3);
+        assert_eq!(snapshot[0].cache_hits, 1);
+        assert_eq!(snapshot[0].cache_misses, 1);
+        assert_eq!(snapshot[0].cache_bypasses, 1);
+    }
+
     #[test]
     fn fanout_log_metadata_omits_mysql_server_messages() {
         let error = ProxyError::Backend(mysql_async::Error::Server(mysql_async::ServerError {
@@ -4034,7 +4432,7 @@ mod tests {
         let results = vec![
             BufferedShardResult {
                 columns: Vec::new(),
-                wire_metadata: Vec::new(),
+                wire_metadata: Some(Vec::new()),
                 rows: vec![vec![
                     Value::UInt(2),
                     Value::Bytes(b"10.5".to_vec()),
@@ -4047,7 +4445,7 @@ mod tests {
             },
             BufferedShardResult {
                 columns: Vec::new(),
-                wire_metadata: Vec::new(),
+                wire_metadata: Some(Vec::new()),
                 rows: vec![vec![
                     Value::UInt(3),
                     Value::Bytes(b"4.5".to_vec()),
@@ -4091,7 +4489,7 @@ mod tests {
         };
         let result = |value: &[u8]| BufferedShardResult {
             columns: Vec::new(),
-            wire_metadata: Vec::new(),
+            wire_metadata: Some(Vec::new()),
             rows: vec![vec![Value::Bytes(value.to_vec())]],
         };
         let merged = merge_aggregate_rows(

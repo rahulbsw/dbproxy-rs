@@ -113,12 +113,26 @@ equality/`IN` keys from `SELECT`, `INSERT`, `UPDATE`, and `DELETE`, then use the
 configured hash, half-open numeric range, or exact-value mapping. Hash mode maps
 integers by modulo and strings by stable FNV-1a plus modulo. Signed numeric
 range keys are accepted; shard-key tuple assignments and unsupported statement
-families fail closed. MySQL binary and
+families fail closed. When explicitly enabled, a direct single-table `SELECT`
+with exactly one shard-key `IN` predicate can become a bounded multi-shard
+plan. The planner sorts values per shard and deduplicates literals. MySQL
+prepared branches retain the original typed arguments even when their routing
+literals look identical. The planner copies all other conjunctive filters and
+rejects global ordering, limiting, grouping, function calls, joins, locking,
+and ambiguous predicates. Supported aggregates use their existing merge path.
+MySQL binary and
 PostgreSQL extended-query prepared statements retain a parsed routing template;
 each execution binds typed parameters into a short-lived cloned AST. The proxy
 therefore avoids repeated parsing while the original statement and typed values
 remain unchanged for backend execution. PostgreSQL caches backend-inferred
 parameter types with the frontend prepared statement.
+
+Multi-key branches use the existing scatter executor: concurrency and total
+rows/bytes are bounded across the whole operation, branch metadata must agree,
+and no client rows are emitted until every branch succeeds. Eligible MySQL
+branches pass independently through the read-through cache using canonical
+per-shard SQL and the existing table/shard generation. The shared deadline
+bounds cache work, and backend connections are returned before the cache fill.
 
 ## Backend selection
 

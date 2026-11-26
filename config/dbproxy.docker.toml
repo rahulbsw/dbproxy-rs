@@ -40,6 +40,7 @@ shard_key_parameter = "dbproxy.shard_key"
 
 [postgres.sharding]
 enabled = false
+allow_multikey_scatter = false
 
 [[postgres_backends]]
 name = "timescale-primary"
@@ -101,6 +102,7 @@ fill_poll_milliseconds = 20
 
 [[cache.rules]]
 table = "backend_identity"
+batch_decomposition = "per_shard"
 ttl_seconds = 30
 negative_ttl_seconds = 5
 ttl_jitter_percent = 0
@@ -110,6 +112,7 @@ max_bytes = 65536
 
 [[cache.rules]]
 table = "proxy_write_test"
+batch_decomposition = "per_shard"
 ttl_seconds = 30
 negative_ttl_seconds = 5
 ttl_jitter_percent = 0

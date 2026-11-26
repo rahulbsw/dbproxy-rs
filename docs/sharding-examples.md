@@ -88,6 +88,7 @@ database = "app"
 ```toml
 [sharding]
 enabled = true
+allow_multikey_scatter = false
 default_shard = "orders-0"
 missing_key_policy = "reject"
 max_scatter_shards = 16
@@ -130,9 +131,31 @@ Literal equality and `IN` predicates are evaluated before routing:
 -- Allowed when both values hash to orders-1.
 SELECT name, email FROM user_info WHERE userid IN ('apw', 'bPv');
 
--- Rejected when the values resolve to different shards.
+-- Rejected when the values resolve to different shards and
+-- allow_multikey_scatter remains false.
 SELECT name, email FROM user_info WHERE userid IN ('abc', 'xyz');
 ```
+
+For bounded lookup-style reads, opt in with
+`sharding.allow_multikey_scatter = true`. A direct single-table query with
+exactly one shard-key `IN` predicate is partitioned into one backend query per
+participating shard:
+
+```sql
+SELECT name, email
+FROM user_info
+WHERE active = 1 AND userid IN ('xyz', 'abc', 'abc');
+```
+
+Text-query values are sorted and deduplicated within each branch, making
+reordered or duplicate input lists produce the same per-shard SQL. DBProxy copies
+the other `AND` predicates into every branch, executes branches with bounded
+concurrency, checks result metadata, and buffers against one shared row/byte
+budget before returning any rows. MySQL prepared statements retain the
+matching typed parameters for each branch. The multi-key row planner rejects
+`ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`, grouping, function calls, windows,
+joins, CTEs, `OR`, locking reads, and cross-shard DML. Supported aggregates use
+the separate merge path.
 
 Qualified shard predicates must name the configured table reference or its
 alias. In a join, `f.userid = ...` cannot be used to route `u.userid` merely
@@ -259,6 +282,7 @@ shard_key_parameter = "dbproxy.shard_key"
 
 [postgres.sharding]
 enabled = true
+allow_multikey_scatter = false
 strategy = "hash"
 max_scatter_shards = 16
 scatter_concurrency = 4
@@ -336,7 +360,12 @@ SELECT logins.last_login, u.name, u.email
 FROM logins JOIN u ON logins.userid = u.userid;
 ```
 
-An ordinary query whose literal values map to multiple databases is rejected.
+An ordinary query whose literal values map to multiple databases is rejected
+by default. Set `postgres.sharding.allow_multikey_scatter = true` to permit the
+same constrained direct-table shard-key `IN` lookup described in the MySQL
+example. Simple and extended-query execution are both supported; extended
+queries renumber each branch's placeholders and retain only the matching bound
+values and formats.
 A root-level `UNION ALL` may fan out because concatenation is explicit, while a
 cross-shard union inside a derived table or beneath global `ORDER BY`, `LIMIT`,
 grouping, distinctness, or a window is rejected. Aggregate-only reads support

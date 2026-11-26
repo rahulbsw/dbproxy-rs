@@ -658,7 +658,12 @@ impl TerminatingQueryHandler {
                     mutating: false,
                 })
             }
-            Err(error) => return Err(user_error("0A000", &error.to_string())),
+            Err(error) => {
+                if let Some(reason) = error.multikey_reject_reason() {
+                    self.metrics.multikey_scatter_rejected(reason);
+                }
+                return Err(user_error("0A000", &error.to_string()));
+            }
         };
         match &mut plan {
             ShardQueryPlan::Single(decision) => {
@@ -696,6 +701,17 @@ impl TerminatingQueryHandler {
                     return Err(user_error(
                         "22023",
                         "an explicit PostgreSQL startup shard cannot be combined with a distributed aggregate",
+                    ));
+                }
+                for query in &plan.queries {
+                    self.validate_database_for_shard(client, &query.shard)?;
+                }
+            }
+            ShardQueryPlan::MultiKey(plan) => {
+                if explicit.is_some() {
+                    return Err(user_error(
+                        "22023",
+                        "an explicit PostgreSQL startup shard cannot be combined with multi-key scatter",
                     ));
                 }
                 for query in &plan.queries {
@@ -767,11 +783,15 @@ impl TerminatingQueryHandler {
         plan: ShardQueryPlan,
         route: PostgresEndpoint,
     ) -> PgWireResult<Response> {
-        let (queries, aggregate) = match plan {
-            ShardQueryPlan::UnionAll(queries) => (queries, None),
-            ShardQueryPlan::Aggregate(plan) => (plan.queries.clone(), Some(plan)),
+        let (queries, aggregate, multikey_keys) = match plan {
+            ShardQueryPlan::UnionAll(queries) => (queries, None, None),
+            ShardQueryPlan::Aggregate(plan) => (plan.queries.clone(), Some(plan), None),
+            ShardQueryPlan::MultiKey(plan) => (plan.queries, None, Some(plan.key_count)),
             ShardQueryPlan::Single(_) => unreachable!("single-shard plan used as scatter"),
         };
+        if let Some(keys) = multikey_keys {
+            self.metrics.multikey_scatter_executed(queries.len(), keys);
+        }
         self.metrics.scatter_planned(queries.len());
         let deadline =
             time::Instant::now() + Duration::from_secs(self.config.query_timeout_seconds);
@@ -790,6 +810,11 @@ impl TerminatingQueryHandler {
         .collect::<Vec<_>>()
         .await;
         results.sort_by_key(|(index, _)| *index);
+        if multikey_keys.is_some() {
+            for _ in results.iter().filter(|(_, result)| result.is_err()) {
+                self.metrics.multikey_scatter_branch_failed();
+            }
+        }
         let gathered = results
             .into_iter()
             .map(|(_, result)| result)
@@ -863,11 +888,15 @@ impl TerminatingQueryHandler {
         parameter_types: &[Type],
         route: PostgresEndpoint,
     ) -> PgWireResult<Response> {
-        let (queries, aggregate) = match plan {
-            ShardQueryPlan::UnionAll(queries) => (queries, None),
-            ShardQueryPlan::Aggregate(plan) => (plan.queries.clone(), Some(plan)),
+        let (queries, aggregate, multikey_keys) = match plan {
+            ShardQueryPlan::UnionAll(queries) => (queries, None, None),
+            ShardQueryPlan::Aggregate(plan) => (plan.queries.clone(), Some(plan), None),
+            ShardQueryPlan::MultiKey(plan) => (plan.queries, None, Some(plan.key_count)),
             ShardQueryPlan::Single(_) => unreachable!("single-shard plan used as scatter"),
         };
+        if let Some(keys) = multikey_keys {
+            self.metrics.multikey_scatter_executed(queries.len(), keys);
+        }
         self.metrics.scatter_planned(queries.len());
         let deadline =
             time::Instant::now() + Duration::from_secs(self.config.query_timeout_seconds);
@@ -897,6 +926,11 @@ impl TerminatingQueryHandler {
         .collect::<Vec<_>>()
         .await;
         results.sort_by_key(|(index, _)| *index);
+        if multikey_keys.is_some() {
+            for _ in results.iter().filter(|(_, result)| result.is_err()) {
+                self.metrics.multikey_scatter_branch_failed();
+            }
+        }
         let gathered = results
             .into_iter()
             .map(|(_, result)| result)
@@ -1431,6 +1465,11 @@ impl TerminatingQueryHandler {
                     .map(|query| query.shard.clone())
                     .ok_or_else(|| user_error("XX000", "scatter plan has no branches"))?,
                 ShardQueryPlan::Aggregate(plan) => plan
+                    .queries
+                    .first()
+                    .map(|query| query.shard.clone())
+                    .ok_or_else(|| user_error("XX000", "scatter plan has no branches"))?,
+                ShardQueryPlan::MultiKey(plan) => plan
                     .queries
                     .first()
                     .map(|query| query.shard.clone())
@@ -2065,6 +2104,15 @@ fn parse_postgres_statement(query: &str) -> PgWireResult<(Vec<Statement>, Statem
         ));
     }
     let kind = match statement {
+        Statement::Query(query)
+            if query
+                .body
+                .as_select()
+                .and_then(|select| select.into.as_ref())
+                .is_some_and(|into| !into.temporary) =>
+        {
+            StatementKind::Write
+        }
         Statement::Query(query) if query_contains_data_modification(query) => StatementKind::Write,
         Statement::Query(_)
             if normalized.contains("NEXTVAL(") || normalized.contains("SETVAL(") =>
@@ -3057,6 +3105,10 @@ mod tests {
         assert!(classify_statement("LISTEN events").is_err());
         assert!(classify_statement("COPY events TO STDOUT").is_err());
         assert!(classify_statement("SELECT 1; SELECT 2").is_err());
+        assert_eq!(
+            classify_statement("SELECT marker INTO snapshot FROM user_info").unwrap(),
+            StatementKind::Write
+        );
     }
 
     #[test]
@@ -3606,7 +3658,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminated_protocol_routes_sql_keys_and_root_union_across_shards() {
+    async fn terminated_protocol_routes_sql_keys_and_scatters_across_shards() {
         let (shard_zero_address, shard_zero_task) = spawn_test_backend("s0").await;
         let (shard_one_address, shard_one_task) = spawn_test_backend("s1").await;
         let mut config = PostgresConfig::default();
@@ -3616,6 +3668,7 @@ mod tests {
         config.fallback_to_primary = true;
         config.sharding = crate::config::ProtocolShardingConfig {
             enabled: true,
+            allow_multikey_scatter: true,
             strategy: crate::config::ProtocolShardStrategy::Hash,
             shards: vec![
                 crate::config::ProtocolShardConfig {
@@ -3695,12 +3748,58 @@ mod tests {
             .unwrap();
         assert_eq!(prepared.get::<_, String>(0), "s1");
         assert_eq!(prepared.get::<_, i32>(1), 11);
-        assert!(
-            client
-                .simple_query("SELECT marker FROM user_info WHERE userid IN ('abc', 'xyz')")
-                .await
-                .is_err()
+        let batch = client
+            .simple_query("SELECT marker FROM user_info WHERE userid IN ('abc', 'xyz')")
+            .await
+            .unwrap();
+        let markers = batch
+            .iter()
+            .filter_map(|message| match message {
+                SimpleQueryMessage::Row(row) => row.get(0),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(markers, vec!["s0", "s1"]);
+        let batch = client
+            .query(
+                "SELECT marker FROM user_info WHERE userid IN ('abc', 'xyz') AND marker_value = $1",
+                &[&73_i32],
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+        assert!(batch.iter().all(|row| row.get::<_, i32>(1) == 73));
+        let error = client
+            .simple_query(
+                "SELECT marker INTO snapshot FROM user_info WHERE userid IN ('abc', 'xyz')",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_db_error().unwrap().message(),
+            "multi-key scatter rejected: select_into"
         );
+
+        let (explicit, explicit_connection) = tokio_postgres::Config::new()
+            .host("127.0.0.1")
+            .port(proxy_address.port())
+            .user("app")
+            .password("app-secret")
+            .dbname("app")
+            .options("-c dbproxy.shard_key=abc")
+            .connect(NoTls)
+            .await
+            .unwrap();
+        let explicit_driver = tokio::spawn(explicit_connection);
+        let messages = explicit
+            .simple_query("SELECT marker FROM user_info")
+            .await
+            .unwrap();
+        assert!(messages.iter().any(|message| matches!(
+            message, SimpleQueryMessage::Row(row) if row.get(0) == Some("s1")
+        )));
+        drop(explicit);
+        explicit_driver.abort();
         let union = client
             .simple_query(
                 "SELECT marker FROM user_info WHERE userid = 'abc' \
@@ -3738,7 +3837,7 @@ mod tests {
         assert!(
             metrics
                 .encode_prometheus()
-                .contains("dbproxy_scatter_plans_total 2")
+                .contains("dbproxy_scatter_plans_total 4")
         );
 
         drop(client);

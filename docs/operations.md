@@ -86,6 +86,7 @@ or measure replica lag.
 | Backend | `dbproxy_backend_healthy`, `dbproxy_backend_consecutive_failures`, `dbproxy_backend_health_checks_total{outcome}`, `dbproxy_backend_last_health_check_timestamp_seconds`, `dbproxy_backend_last_success_timestamp_seconds`, backend connection/query totals and duration sums |
 | Pools | shared pool connection/idle/in-use/waiter/pressure metrics, `dbproxy_backend_reserved_pool_enabled`, reserved connection/idle/in-use/waiter metrics, and shared pool failure/reset/discard counters |
 | SQL scatter/gather | `dbproxy_scatter_plans_total`, participating `dbproxy_scatter_shards_total`, failures, and merged row/byte totals for MySQL and PostgreSQL/TimescaleDB |
+| Multi-key SQL scatter | `dbproxy_multikey_scatter_statements_total{outcome}`, `dbproxy_multikey_scatter_shards`, `dbproxy_multikey_scatter_keys`, `dbproxy_multikey_scatter_rejects_total{reason}`, and `dbproxy_multikey_scatter_branch_failures_total` |
 | Admin/shutdown | `dbproxy_admin_active_connections`, `dbproxy_admin_requests_total`, `dbproxy_admin_rejected_connections_total`, `dbproxy_forced_shutdowns_total` |
 | Capabilities | `dbproxy_capability_info{capability,status}`; the same contracts are available from `/capabilities` |
 | PostgreSQL clients | active/accepted/rejected/error totals, transparent wire bytes, terminated queries, primary/replica routes, transaction/session pins, read-only rejections, cancellations, and statement/shard-routing failures |
@@ -96,6 +97,12 @@ or measure replica lag.
 Per-backend metrics use bounded `backend`, `shard`, and `role` labels sourced
 only from static configuration. SQL text, usernames, client addresses, and
 database values are never used as labels.
+
+Multi-key rejection reasons are a fixed bounded set (`has_distinct`,
+`has_group_by`, `has_having`, `has_limit`, `has_order_by`, `has_window`,
+`locking_read`, `multi_table`, `select_into`, `spans_too_many_shards`,
+`unresolvable_key`, `unsupported_function`, and `unsupported_predicate`).
+Neither shard-key values nor SQL are labels.
 
 ## Initial alerts
 
@@ -112,6 +119,12 @@ database values are never used as labels.
   `dbproxy_write_fanout_timeouts_total`: possible cross-database divergence.
 - Any increase in `dbproxy_scatter_failures_total`: a participating shard
   failed, exceeded the shared result budget, or returned incompatible metadata.
+- Any increase in `dbproxy_multikey_scatter_branch_failures_total`: an opted-in
+  multi-key branch failed before the all-or-error result could be returned.
+  Review backend health and the surrounding scatter failure metrics.
+- A rise in `dbproxy_multikey_scatter_statements_total{outcome="rejected"}` or
+  `dbproxy_multikey_scatter_rejects_total`: clients are submitting shapes that
+  require unsupported global semantics or exceed the configured scatter bound.
 - `dbproxy_xa_in_doubt_transactions > 0`: a durable commit or abort decision
   is not resolved everywhere. Do not replay the application write; preserve
   the journal volume and restore participant connectivity.
